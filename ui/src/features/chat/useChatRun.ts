@@ -1,0 +1,187 @@
+import { useEffect, useRef, useState } from 'react';
+import { answerFromChatResult, api, createRunId, type ChatAttachment, type ProgressEntry, type RunProgress, type SessionTurn, type ToolActivityItem } from '../../app/api';
+import type { Agent, SavedProvider } from '../../app/types';
+import { streamChat } from './chatStream';
+import { appendThoughtDelta, finalizeThoughtProgress } from './chatThoughtProgress';
+
+import { projectLiveStage, type LiveStageProjection, type ChatLiveStage } from './chatLiveStage';
+
+type ActiveRun = { runId: string; agentId: string; sessionId: string; stage?: ChatLiveStage; projection?: LiveStageProjection };
+type StreamToolEvent = { tool?: unknown; rawTool?: unknown; activityId?: unknown; ok?: unknown; status?: unknown; label?: unknown; detail?: unknown; provider?: unknown; mcpToolName?: unknown; command?: unknown; cwd?: unknown; filePath?: unknown; dirPath?: unknown; query?: unknown; reason?: unknown; result?: unknown; output?: unknown; error?: unknown };
+
+type ChatRunSession = {
+  attached: ChatAttachment[];
+  clearAttachment: () => void;
+  sessionId: string;
+  draft: string;
+  setDraft: (value: string) => void;
+  clearError: () => void;
+  reportError: (message: string) => void;
+  leaveNewSessionForMessage: () => void;
+  appendTurn: (agentId: string, sessionId: string, turn: SessionTurn) => void;
+  storeToolActivity: (activity: { runId: string; items: ToolActivityItem[]; status: 'running' | 'ok' | 'warn' }) => void;
+  toolActivityForRun: (runId: string) => { items?: ToolActivityItem[] } | undefined;
+  refreshSessions: (agentId?: string) => Promise<void>;
+  refreshConversation: (agentId?: string, sessionId?: string) => Promise<void>;
+};
+
+type UseChatRunOptions = {
+  selectedAgentId: string;
+  selected: Agent | undefined;
+  savedProviders: SavedProvider[];
+  session: ChatRunSession;
+  setAgentActivity: (agentId: string, status: string) => void;
+};
+
+const runKey = (agentId: string, sessionId: string) => `${agentId}:${sessionId}`;
+const minimumStreamOverlap = 16;
+
+/**
+ * Preserve only stream text that does not reappear at the beginning of the
+ * terminal answer. Whitespace is normalized for the comparison so harmless
+ * stream chunking differences do not leave a duplicated tail behind.
+ */
+export function trimStreamedAnswer(streamedAnswer: string, finalAnswer: string) {
+  const stream = streamedAnswer.trim().replace(/\s+/g, ' ');
+  const final = finalAnswer.trim().replace(/\s+/g, ' ');
+  const maxOverlap = Math.min(stream.length, final.length);
+  for (let length = maxOverlap; length >= minimumStreamOverlap; length -= 1) {
+    if (stream.slice(-length) === final.slice(0, length)) return stream.slice(0, -length).trim();
+  }
+  return streamedAnswer.trim();
+}
+
+/** Owns one-to-one chat run state, stream lifecycle, and cancellation. */
+export function useChatRun({ selectedAgentId, selected, savedProviders, session, setAgentActivity }: UseChatRunOptions) {
+  const [activeRuns, setActiveRuns] = useState<Record<string, ActiveRun>>({});
+  const [liveProgressByRun, setLiveProgressByRun] = useState<Record<string, ProgressEntry[]>>({});
+  const [liveAnswerByRun, setLiveAnswerByRun] = useState<Record<string, string>>({});
+  const streamAbortRef = useRef<Record<string, AbortController>>({});
+  const activeRunForSelection = selectedAgentId && session.sessionId ? activeRuns[runKey(selectedAgentId, session.sessionId)] ?? null : null;
+
+  useEffect(() => {
+    const runId = activeRunForSelection?.runId;
+    if (!runId || !(liveAnswerByRun[runKey(selectedAgentId, session.sessionId)] || liveProgressByRun[runKey(selectedAgentId, session.sessionId)]?.some((item) => item.text))) return;
+    if (!performance.getEntriesByName(`chat:${runId}:first-useful`).length || performance.getEntriesByName(`chat:${runId}:react-commit-observed`).length) return;
+    performance.mark(`chat:${runId}:react-commit-observed`);
+    performance.measure(`chat:${runId}:first-useful-to-react-commit-observed`, `chat:${runId}:first-useful`, `chat:${runId}:react-commit-observed`);
+  }, [activeRunForSelection, liveAnswerByRun, liveProgressByRun, selectedAgentId, session.sessionId]);
+
+  // Acceptance is synchronous; the returned promise still tracks run completion.
+  const sendMessage = async (draftOverride?: string, onAccepted?: () => void) => {
+    const message = (draftOverride ?? session.draft).trim() || (session.attached.length ? 'Please analyze the attached files.' : '');
+    if (!message || !selectedAgentId || !session.sessionId || activeRunForSelection || streamAbortRef.current[runKey(selectedAgentId, session.sessionId)]) return;
+    const target = { agentId: selectedAgentId, resourceAgentId: selected?.resourceId ?? selectedAgentId, sessionId: session.sessionId };
+    const sentAt = performance.now();
+    const runId = createRunId(target.sessionId);
+    const provider = savedProviders.find((item) => item.provider === selected?.provider) ?? savedProviders[0];
+    const model = selected?.model || provider?.models[0];
+    const attachments = session.attached;
+    const requestBody = { agentId: target.resourceAgentId, sessionId: target.sessionId, runId, message, ...(attachments.length ? { attachments } : {}), reasoningEffort: selected?.effort, temperature: selected?.temperature, ...(model && provider ? { model, modelConnectionId: provider.id } : {}) };
+    const abortController = new AbortController();
+    const targetKey = runKey(target.agentId, target.sessionId);
+    streamAbortRef.current[targetKey] = abortController;
+    setActiveRuns((current) => ({ ...current, [targetKey]: { runId, ...target, stage: 'accepted' } }));
+    setLiveProgressByRun((current) => ({ ...current, [targetKey]: [] }));
+    setLiveAnswerByRun((current) => ({ ...current, [targetKey]: '' }));
+    setAgentActivity(target.agentId, 'thinking'); session.clearError(); session.setDraft(''); onAccepted?.(); session.clearAttachment(); session.leaveNewSessionForMessage();
+    session.appendTurn(target.agentId, target.sessionId, { type: 'message', role: 'user', content: message, ts: new Date().toISOString(), runId, ...(attachments.length ? { metadata: { attachments: attachments.map(({ name, type, size }, index) => ({ index, name, type, size, encoding: 'data-url', ...(type.startsWith('image/') ? { preview: attachments[index].content } : {}) })) } } : {}) });
+    performance.mark(`chat:${runId}:send`, { startTime: sentAt });
+    let firstUseful = false;
+    let streamedAnswer = ''; let progressEntries: ProgressEntry[] = []; let toolSequence = 0; let frame = 0;
+    const flushLiveText = () => { frame = 0; setLiveProgressByRun((current) => ({ ...current, [targetKey]: progressEntries })); setLiveAnswerByRun((current) => ({ ...current, [targetKey]: streamedAnswer })); };
+    const scheduleLiveFlush = () => { if (!frame) frame = requestAnimationFrame(flushLiveText); };
+    try {
+      const handleEvent = (event: unknown) => {
+        if (streamAbortRef.current[targetKey] !== abortController || abortController.signal.aborted || !event || typeof event !== 'object') return;
+        const envelope = event as { type?: string; runId?: unknown; sessionId?: unknown; ts?: unknown; data?: { delta?: unknown; response?: unknown; message?: unknown; status?: unknown; modelCall?: unknown } & StreamToolEvent };
+        if ((envelope.runId !== undefined && envelope.runId !== runId) || (envelope.sessionId !== undefined && envelope.sessionId !== target.sessionId)) return;
+        const useful = ((envelope.type === 'assistant.delta' || envelope.type === 'assistant.thought') && typeof envelope.data?.delta === 'string' && envelope.data.delta.length > 0) || ((envelope.type === 'tool.started' || envelope.type === 'tool.completed') && typeof envelope.data?.tool === 'string' && Boolean(envelope.data.tool.trim()));
+        if (useful && !firstUseful) { firstUseful = true; performance.mark(`chat:${runId}:first-useful`); performance.measure(`chat:${runId}:send-to-first-useful`, `chat:${runId}:send`, `chat:${runId}:first-useful`); }
+        setActiveRuns((current) => {
+          const owner = current[targetKey];
+          if (owner?.runId !== runId) return current;
+          const projection = projectLiveStage(owner.projection ?? { stage: owner.stage }, envelope);
+          return { ...current, [targetKey]: { ...owner, stage: projection.stage, projection } };
+        });
+        if (envelope.type === 'assistant.thought' && typeof envelope.data?.delta === 'string') {
+          progressEntries = appendThoughtDelta(progressEntries, envelope, runId);
+          scheduleLiveFlush();
+        } else if (envelope.type === 'assistant.delta' && typeof envelope.data?.delta === 'string') {
+          streamedAnswer += envelope.data.delta; scheduleLiveFlush();
+        } else if (envelope.type === 'tool.started' || envelope.type === 'tool.completed') {
+          const data = envelope.data ?? {}; const tool = typeof data.tool === 'string' ? data.tool.trim() : '';
+          if (!tool) return;
+          const isMcpCall = tool === 'mcp_call';
+          const provider = typeof data.provider === 'string' ? data.provider.trim() : '';
+          const mcpToolName = typeof data.mcpToolName === 'string' ? data.mcpToolName.trim() : '';
+          const label = isMcpCall && mcpToolName
+            ? 'MCP tool'
+            : typeof data.label === 'string' && data.label.trim() ? data.label.trim() : tool.replace(/[-_]/g, ' ');
+          const activityId = typeof data.activityId === 'string' && data.activityId ? data.activityId : `${runId}:tool:${++toolSequence}`;
+          const previous = session.toolActivityForRun(runId); const items = [...(previous?.items ?? [])];
+          const index = items.findIndex((item) => item.id === activityId);
+          const status: ToolActivityItem['status'] = envelope.type === 'tool.started' ? 'pending' : data.ok === false || data.status === 'failed' ? 'error' : 'ok';
+          // MCP arguments and output can contain credentials or other protected
+          // values. The provider and discovered tool name are the only MCP data
+          // suitable for the transcript.
+          const mcpDetail = [provider, mcpToolName].filter(Boolean).join(' · ');
+          const detailSource = isMcpCall ? mcpDetail : data.detail ?? data.command ?? data.filePath ?? data.dirPath ?? data.query ?? data.result ?? data.output ?? data.error;
+          const detail = typeof detailSource === 'string' ? detailSource : detailSource == null ? undefined : JSON.stringify(detailSource, null, 2);
+          const item: ToolActivityItem = { id: activityId, label, status, ...(detail === undefined ? {} : { detail }) };
+          if (index >= 0) items[index] = { ...items[index], ...item }; else items.push(item);
+          const hasError = items.some((entry) => entry.status === 'error'); const hasPending = items.some((entry) => entry.status === 'pending');
+          session.storeToolActivity({ runId, items, status: hasError ? 'warn' : hasPending ? 'running' : 'ok' });
+        }
+      };
+      const { terminalType, finalResult } = await streamChat({ requestBody, signal: abortController.signal, onEvent: handleEvent });
+      if (frame) { cancelAnimationFrame(frame); flushLiveText(); }
+      const runStatus: NonNullable<RunProgress['status']> = terminalType === 'run.failed' ? 'failed' : terminalType === 'run.cancelled' ? 'cancelled' : terminalType === 'run.superseded' ? 'superseded' : 'complete';
+      const terminalError = runStatus === 'complete' ? '' : answerFromChatResult(finalResult);
+      const failedMessage = terminalError.replace(/^Request failed:\s*/, '').trim() || 'The runtime could not complete the message.';
+      const answer = runStatus === 'complete' ? answerFromChatResult(finalResult) || streamedAnswer : `[model_error: ${failedMessage}]`;
+      const activity = session.toolActivityForRun(runId);
+      const progress = finalizeThoughtProgress(progressEntries, runStatus, answer);
+      // The streamed visible response is a separate, secondary record. Keep it
+      // out of the authoritative final answer, even when a provider's terminal
+      // answer differs from the text it streamed along the way.
+      const retainedStream = runStatus === 'complete' && streamedAnswer.trim()
+        ? trimStreamedAnswer(streamedAnswer, answer) || undefined
+        : streamedAnswer.trim() || undefined;
+      const metadata = activity?.items?.length || progress || retainedStream
+        ? { ...(activity?.items?.length ? { toolActivity: activity } : {}), ...(progress ? { progress } : {}), ...(retainedStream ? { streamedAnswer: retainedStream } : {}) }
+        : undefined;
+      session.appendTurn(target.agentId, target.sessionId, { type: 'message', role: 'assistant', content: answer, ts: new Date().toISOString(), runId, metadata });
+      setLiveProgressByRun((current) => { const next = { ...current }; delete next[targetKey]; return next; });
+      setLiveAnswerByRun((current) => { const next = { ...current }; delete next[targetKey]; return next; });
+      setActiveRuns((current) => { const next = { ...current }; if (next[targetKey]?.runId === runId) delete next[targetKey]; return next; });
+      void Promise.all([
+        session.refreshSessions(target.agentId),
+        session.refreshConversation(target.agentId, target.sessionId),
+      ]).catch((error) => session.reportError(error instanceof Error ? `Could not refresh chat: ${error.message}` : 'Could not refresh chat.'));
+      if (runStatus !== 'complete') throw new Error(runStatus === 'cancelled' ? 'Run cancelled.' : runStatus === 'superseded' ? 'Run superseded by a newer message.' : terminalError.replace(/^Request failed:\s*/, '') || 'Run failed.');
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === 'AbortError')) session.reportError(error instanceof Error ? `Message failed: ${error.message}` : 'Message failed.');
+    } finally {
+      if (frame) cancelAnimationFrame(frame);
+      if (streamAbortRef.current[targetKey] === abortController) delete streamAbortRef.current[targetKey];
+      setLiveProgressByRun((current) => { const next = { ...current }; delete next[targetKey]; return next; });
+      setLiveAnswerByRun((current) => { const next = { ...current }; delete next[targetKey]; return next; });
+      setAgentActivity(target.agentId, 'idle'); setActiveRuns((current) => { const next = { ...current }; if (next[targetKey]?.runId === runId) delete next[targetKey]; return next; });
+    }
+  };
+
+  const cancelController = useRef<AbortController | null>(null);
+  useEffect(() => () => { cancelController.current?.abort(); }, [selected?.id, session.sessionId]);
+  const cancelRun = async () => {
+    if (!activeRunForSelection) return;
+    const targetKey = runKey(activeRunForSelection.agentId, activeRunForSelection.sessionId);
+    streamAbortRef.current[targetKey]?.abort();
+    cancelController.current?.abort();
+    const controller = new AbortController(); cancelController.current = controller;
+    try { await api(`/api/chat/${encodeURIComponent(activeRunForSelection.runId)}/cancel`, { signal: controller.signal, method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agentId: selected?.resourceId ?? activeRunForSelection.agentId, reason: 'Stopped by operator' }) }); }
+    catch (error) { if (controller.signal.aborted) return; session.reportError(error instanceof Error ? `Could not stop run: ${error.message}` : 'Could not stop run.'); }
+  };
+
+  return { liveStage: activeRunForSelection?.stage, activeRunForSelection, activeRunId: activeRunForSelection?.runId ?? '', sendMessage, cancelRun, liveProgress: activeRunForSelection ? liveProgressByRun[runKey(activeRunForSelection.agentId, activeRunForSelection.sessionId)] ?? [] : [], liveAnswer: activeRunForSelection ? liveAnswerByRun[runKey(activeRunForSelection.agentId, activeRunForSelection.sessionId)] ?? '' : '' };
+}

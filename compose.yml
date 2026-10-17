@@ -1,0 +1,20 @@
+services:
+  burrow:
+    image: ghcr.io/goblinking-burrow/burrow:latest
+    pull_policy: always
+    init: true
+    user: "4226:4226"
+    environment:
+      HOME: /home/burrow
+    ports:
+      # Publish Burrow on the host so remote clients and network reverse proxies
+      # can reach it. Control exposure with the host firewall or proxy policy.
+      - "42817:42817"
+      # Authenticated outbound Host Gateways connect to this controller port.
+      # Restrict it with host/network firewalling to intended execution nodes.
+      - "7443:7443"
+    volumes:
+      - burrow-data:/data
+
+volumes:
+  burrow-data:

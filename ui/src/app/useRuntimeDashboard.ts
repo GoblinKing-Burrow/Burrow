@@ -1,0 +1,194 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { api, type AnthropicUsage, type ModelConnection, type OpenAiUsage } from './api';
+import { readAccountOrder, writeAccountOrder } from './accountOrderStorage';
+import type { Account, AccountMeter, Agent, SavedProvider } from './types';
+import { mergeVisibleOrder } from './useAgentRailPreferences';
+import { usePolling } from './usePolling';
+
+export type OperatorProfile = { name: string; avatar: string };
+export type ProviderConnectionStatus = 'checking' | 'connected' | 'disconnected';
+
+type CodexLbQuotaWindow = { kind?: string; label?: string; percent?: number | null; resetAt?: string | null };
+type CodexLbAccount = {
+  id?: string;
+  name?: string;
+  type?: string;
+  status?: string;
+  usagePercent?: number | null;
+  resetAt?: string | null;
+  quotaWindows?: { primary?: CodexLbQuotaWindow; secondary?: CodexLbQuotaWindow };
+  availableResetCredits?: number | null;
+  resetCreditNearestExpiresAt?: string | null;
+};
+
+type RuntimeDashboardOptions = {
+  selectedProvider?: string;
+  setAgents: React.Dispatch<React.SetStateAction<Agent[]>>;
+  runtimeProviders: React.MutableRefObject<SavedProvider[]>;
+  reportError: (message: string) => void;
+};
+
+export const codexAccountOrderKey = 'hc.codexLbAccountOrder';
+
+function formatReset(resetAt?: string | null) {
+  if (!resetAt) return 'reset time unavailable';
+  const timestamp = new Date(resetAt).getTime();
+  if (!Number.isFinite(timestamp)) return `resets ${resetAt}`;
+  const minutes = Math.max(0, Math.ceil((timestamp - Date.now()) / 60_000));
+  const days = Math.floor(minutes / 1_440);
+  const hours = Math.floor((minutes % 1_440) / 60);
+  const remainingMinutes = minutes % 60;
+  const duration = days > 0 ? `${days}d ${hours}h` : hours > 0 ? `${hours}h ${remainingMinutes}m` : `${remainingMinutes}m`;
+  return `resets in ${duration}`;
+}
+
+export function formatUsageReset(resetAt?: string | null) {
+  if (!resetAt) return '—';
+  const timestamp = new Date(resetAt).getTime();
+  if (!Number.isFinite(timestamp)) return '—';
+  const minutes = Math.max(0, Math.ceil((timestamp - Date.now()) / 60_000));
+  const days = Math.floor(minutes / 1_440);
+  const hours = Math.floor((minutes % 1_440) / 60);
+  const remainingMinutes = minutes % 60;
+  return days > 0 ? `${days}d ${hours}h` : hours > 0 ? `${hours}h ${remainingMinutes}m` : `${remainingMinutes}m`;
+}
+
+function formatResetCredit(count?: number | null, nearestEndAt?: string | null) {
+  const available = Number(count);
+  if (!Number.isFinite(available) || available <= 0) return undefined;
+  const credits = Math.floor(available);
+  const creditLabel = `${credits} reset${credits === 1 ? '' : 's'}`;
+  if (!nearestEndAt) return creditLabel;
+  const timestamp = new Date(nearestEndAt).getTime();
+  if (!Number.isFinite(timestamp)) return creditLabel;
+  const days = Math.max(0, Math.ceil((timestamp - Date.now()) / 86_400_000));
+  return `${creditLabel} · ${days} day${days === 1 ? '' : 's'} left`;
+}
+
+function quotaMeter(window: CodexLbQuotaWindow | undefined, key: string): AccountMeter | null {
+  if (!window) return null;
+  const percent = window.percent;
+  // Codex-LB names this field RemainingPercent; it is already the amount left,
+  // unlike the OAuth usage APIs which report utilization/used percent.
+  return { key, label: window.label ?? key, remainingPercent: typeof percent === 'number' && Number.isFinite(percent) ? Math.max(0, Math.min(100, Math.round(percent))) : null, resetAt: window.resetAt ?? null };
+}
+
+export function asCodexAccount(account: CodexLbAccount, index: number): Account {
+  const usagePercent = account.usagePercent;
+  const remaining = typeof usagePercent === 'number' && Number.isFinite(usagePercent) ? Math.max(0, Math.min(100, Math.round(usagePercent))) : null;
+  const meters = [quotaMeter(account.quotaWindows?.primary, 'primary'), quotaMeter(account.quotaWindows?.secondary, 'secondary')].filter((meter): meter is NonNullable<typeof meter> => meter !== null);
+  return { id: account.id ?? `account-${index + 1}`, name: account.name ?? `Account ${index + 1}`, plan: account.type ?? 'Unknown plan', used: remaining === null ? null : 100 - remaining, reset: formatReset(account.resetAt), status: account.status ?? 'Unknown', resetCredit: formatResetCredit(account.availableResetCredits, account.resetCreditNearestExpiresAt), meters };
+}
+
+export const isOpenAiOAuthConnection = (provider?: Pick<SavedProvider, 'auth' | 'authSource' | 'oauthConfigured'>) =>
+  provider?.auth?.provider?.toLowerCase() === 'openai' ||
+  provider?.auth?.type === 'oauth' ||
+  provider?.auth?.source === 'oauth' ||
+  provider?.auth?.source === 'openai-oauth' ||
+  provider?.authSource === 'oauth' ||
+  provider?.authSource === 'openai-oauth' ||
+  provider?.oauthConfigured === true;
+
+const asSavedProvider = (connection: ModelConnection): SavedProvider => ({
+  id: connection.id, provider: connection.provider, apiType: connection.apiType, url: connection.baseUrl, apiKey: '', apiKeyConfigured: connection.apiKeyConfigured,
+  auth: connection.auth, oauthConfigured: connection.auth?.type === 'oauth' || connection.auth?.source === 'oauth' || connection.auth?.source === 'openai-oauth', authSource: connection.auth?.source, expiresAt: connection.auth?.expiresAt,
+  connectionModels: connection.models,
+  models: connection.models.filter((model) => model.selected !== false).map((model) => model.id),
+  manualModels: Object.fromEntries(connection.models.map((model) => [model.id, model.manual === true])),
+  modelLabels: Object.fromEntries(connection.models.map((model) => [model.id, model.displayName ?? model.id])),
+  modelEfforts: Object.fromEntries(connection.models.map((model) => [model.id, model.reasoningEfforts ?? []])),
+  defaultEfforts: Object.fromEntries(connection.models.flatMap((model) => model.defaultReasoningEffort ? [[model.id, model.defaultReasoningEffort]] : [])),
+  modelContextWindows: Object.fromEntries(connection.models.flatMap((model) => Number.isFinite(model.contextWindow) && Number(model.contextWindow) > 0 ? [[model.id, Number(model.contextWindow)]] : [])),
+  modelDiscoveredInputs: Object.fromEntries(connection.models.flatMap((model) => model.discoveredInput ? [[model.id, model.discoveredInput]] : [])),
+  modelInputOverrides: Object.fromEntries(connection.models.flatMap((model) => model.acceptedInputOverride ? [[model.id, model.acceptedInputOverride]] : [])),
+  modelDiscoveredOutputs: Object.fromEntries(connection.models.flatMap((model) => model.discoveredOutput ? [[model.id, model.discoveredOutput]] : [])),
+  modelOutputOverrides: Object.fromEntries(connection.models.flatMap((model) => model.acceptedOutputOverride ? [[model.id, model.acceptedOutputOverride]] : [])),
+});
+
+export function useRuntimeDashboard({ selectedProvider, setAgents, runtimeProviders, reportError }: RuntimeDashboardOptions) {
+  const [savedProviders, setSavedProviders] = useState<SavedProvider[]>([]);
+  const [modelConnectionsLoaded, setModelConnectionsLoaded] = useState(false);
+  const [providerConnectionStatus, setProviderConnectionStatus] = useState<ProviderConnectionStatus>('checking');
+  const [anthropicUsage, setAnthropicUsage] = useState<AnthropicUsage | null>(null);
+  const [openAiUsage, setOpenAiUsage] = useState<OpenAiUsage | null>(null);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [operatorProfile, setOperatorProfile] = useState<OperatorProfile>({ name: 'Operator', avatar: 'OP' });
+  const codexAccountOrder = useRef(readAccountOrder(codexAccountOrderKey));
+  const scope = useRef({ generation: 0 });
+  const generation = scope.current.generation;
+
+  const reorderAccounts = useCallback((draggedId: string, targetId: string) => {
+    setAccounts((current) => {
+      const sourceIndex = current.findIndex((account) => account.id === draggedId);
+      const targetIndex = current.findIndex((account) => account.id === targetId);
+      if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return current;
+      const next = [...current]; const [dragged] = next.splice(sourceIndex, 1); next.splice(targetIndex, 0, dragged);
+      codexAccountOrder.current = mergeVisibleOrder(codexAccountOrder.current, next.map((account) => account.id));
+      writeAccountOrder(codexAccountOrderKey, codexAccountOrder.current);
+      return next;
+    });
+  }, []);
+
+  const refreshModelConnections = useCallback(async () => {
+    if (scope.current.generation !== generation) return;
+    const { connections } = await api<{ connections: ModelConnection[] }>( '/api/settings/model-connections');
+    if (scope.current.generation !== generation) return;
+    const providers = connections.map(asSavedProvider).filter((provider) => provider.models.length);
+    runtimeProviders.current = providers;
+    setSavedProviders(providers); setModelConnectionsLoaded(true);
+    if (!providers.length) return;
+    const fallbackProvider = providers[0];
+    setAgents((all) => all.map((agent) => {
+      const provider = providers.find((item) => item.provider === agent.provider) ?? fallbackProvider;
+      const model = provider.models.includes(agent.model) ? agent.model : provider.models[0];
+      const efforts = ['off', ...(provider.modelEfforts?.[model] ?? []).filter((item) => item !== 'off')];
+      return { ...agent, provider: provider.provider, model, effort: efforts.includes(agent.effort) ? agent.effort : provider.defaultEfforts?.[model] ?? 'off' };
+    }));
+  }, [setAgents, generation]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setOperatorProfile({ name: 'Operator', avatar: 'OP' });
+    api<{ operator: OperatorProfile }>( '/api/settings/identities')
+      .then(({ operator }) => { if (!cancelled && scope.current.generation === generation) setOperatorProfile(operator); })
+      .catch((error: Error) => { if (!cancelled && scope.current.generation === generation) reportError(`Could not load operator profile: ${error.message}`); });
+    return () => { cancelled = true; };
+  }, [reportError, generation]);
+  useEffect(() => { let cancelled = false; setModelConnectionsLoaded(false); setSavedProviders([]); runtimeProviders.current = []; refreshModelConnections().catch((error: Error) => !cancelled && reportError(`Could not load model connections: ${error.message}`)); return () => { cancelled = true; }; }, [refreshModelConnections, reportError]);
+
+  usePolling(async (isCancelled, signal) => {
+    try {
+      const { accounts: nextAccounts } = await api<{ accounts: CodexLbAccount[] }>( '/api/codex-lb/accounts', { signal });
+      if (isCancelled()) return;
+      setAccounts(() => {
+        const next = (nextAccounts ?? []).map(asCodexAccount);
+        const orderedIds = codexAccountOrder.current; const orderedIdSet = new Set(orderedIds);
+        codexAccountOrder.current = [...orderedIds, ...next.map((account) => account.id).filter((id) => !orderedIdSet.has(id))];
+        return next.sort((a, b) => codexAccountOrder.current.indexOf(a.id) - codexAccountOrder.current.indexOf(b.id));
+      });
+    } catch { if (!isCancelled()) setAccounts([]); }
+  }, 15_000, true, 'local');
+
+  const selectedConnection = savedProviders.find((provider) => provider.provider === selectedProvider) ?? savedProviders[0];
+  usePolling(async (isCancelled, signal) => {
+    const provider = selectedConnection; const isAnthropicMessages = provider?.apiType === 'anthropic-messages';
+    // OpenAI OAuth connections can have operator-defined display names. Auth
+    // metadata, not the label, identifies the usage endpoint they support.
+    const isOpenAiOAuth = provider?.apiType !== 'anthropic-messages' && isOpenAiOAuthConnection(provider);
+    if (!isAnthropicMessages && !isOpenAiOAuth) { setAnthropicUsage(null); setOpenAiUsage(null); return; }
+    setAnthropicUsage(null); setOpenAiUsage(null);
+    try {
+      if (isAnthropicMessages) { const result = await api<{ usage?: AnthropicUsage }>( `/api/anthropic/oauth/usage?connectionId=${encodeURIComponent(provider.id)}`, { signal }); if (!isCancelled()) setAnthropicUsage(result.usage ?? null); }
+      else { const result = await api<{ usage?: OpenAiUsage }>( `/api/openai/oauth/usage?connectionId=${encodeURIComponent(provider.id)}`, { signal }); if (!isCancelled()) setOpenAiUsage(result.usage ?? null); }
+    } catch { if (!isCancelled()) { setAnthropicUsage(null); setOpenAiUsage(null); } }
+  }, 300_000, true, `${'local'}:${selectedConnection?.id ?? ''}`);
+
+  usePolling(async (isCancelled, signal) => {
+    const provider = selectedConnection;
+    if (!provider?.apiKeyConfigured) { if (!isCancelled()) setProviderConnectionStatus('disconnected'); return; }
+    try { await api( '/api/settings/model-connections/discover', { signal, method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: provider.id, apiType: provider.apiType, baseUrl: provider.url }) }); if (!isCancelled()) setProviderConnectionStatus('connected'); }
+    catch { if (!isCancelled()) setProviderConnectionStatus('disconnected'); }
+  }, 30_000, modelConnectionsLoaded, `${'local'}:${selectedConnection?.id ?? ''}`);
+
+  return { accounts, anthropicUsage, modelConnectionsLoaded, openAiUsage, operatorProfile, providerConnectionStatus, refreshModelConnections, reorderAccounts, runtimeProviders, savedProviders, setOperatorProfile };
+}

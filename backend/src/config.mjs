@@ -1,0 +1,286 @@
+import path from 'node:path';
+import { normalizeContextCompressionConfig } from './context-compression.mjs';
+import { anthropicSupportsTemperature, isAnthropicMessagesConnection } from './anthropic-model-capabilities.mjs';
+
+export const MODEL_REASONING_EFFORT_VALUES = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const MODEL_REASONING_EFFORTS = new Set(MODEL_REASONING_EFFORT_VALUES);
+export const DEFAULT_RUNTIME_ROOT = '/mnt/local/burrow';
+export const DEFAULT_WORKSPACE_ID = 'workspace';
+export const DEFAULT_AGENT_ID = 'hatchet';
+
+const text = (value) => String(value ?? '').trim();
+const absolute = (value, fallback) => path.resolve(text(value) || fallback);
+const env = (name, fallback = undefined) => process.env[name] === undefined ? fallback : process.env[name];
+
+export const PROVIDER_DEFAULT_CONTEXT_TOKENS = Object.freeze({ openai: 292_000, anthropic: 1_000_000 });
+export const DEFAULT_MODEL_OUTPUT_TOKENS = 32_768;
+
+function positiveInteger(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+export function resolveEffectiveModelOutputTokens({ explicit = null, outputTokens = null, maxOutputTokens = null, maxTokens = null } = {}) {
+  const explicitTokens = positiveInteger(explicit);
+  if (explicitTokens) return explicitTokens;
+  for (const value of [outputTokens, maxOutputTokens, maxTokens]) {
+    const parsed = positiveInteger(value);
+    if (parsed) return parsed;
+  }
+  return DEFAULT_MODEL_OUTPUT_TOKENS;
+}
+
+export function resolveEffectiveModelContextTokens({ contextTokens = null, contextWindow = null, provider = '', api = '' } = {}) {
+  for (const value of [contextTokens, contextWindow]) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  const family = `${text(provider)} ${text(api)}`.toLowerCase();
+  if (family.includes('anthropic')) return PROVIDER_DEFAULT_CONTEXT_TOKENS.anthropic;
+  if (family.includes('openai') || family.includes('responses') || family.includes('chat-completions')) return PROVIDER_DEFAULT_CONTEXT_TOKENS.openai;
+  return null;
+}
+
+export function normalizeModelReasoningEffort(value) {
+  if (value === undefined || value === null) return null;
+  const normalized = text(value).toLowerCase();
+  if (!MODEL_REASONING_EFFORTS.has(normalized)) throw new Error(`invalid reasoning effort: ${value}`);
+  return normalized;
+}
+
+/**
+ * Configuration ownership is PostgreSQL plus service environment. This retained
+ * loader is intentionally an inert compatibility seam: it never reads or
+ * writes burrow.json (or any other application JSON configuration).
+ */
+export async function loadBurrowConfig() {
+  return { path: null, exists: false, config: {}, validation: { ok: true, errors: [], warnings: [] } };
+}
+export function validateConfig() { return { ok: true, errors: [], warnings: [] }; }
+export function configDefaults() { return {}; }
+
+function selectedModels(connection) {
+  return (Array.isArray(connection?.models) ? connection.models : []).filter((model) => model && model.selected !== false && text(model.id));
+}
+
+function modelSupportsTemperature({ provider = '', api = '', model = '', declared = undefined } = {}) {
+  if (declared === false) return false;
+  if (isAnthropicMessagesConnection({ provider, apiType: api })) return anthropicSupportsTemperature(model);
+  return true;
+}
+async function resolveInjectedModel(connectionId, modelId, args = {}) {
+  const store = args.modelSettings || args.stores?.models || args.runtimeStores?.models;
+  if (!store) throw new Error('model_settings_store_required');
+  const connection = await store.get(connectionId);
+  if (!connection) throw new Error('model_connection_not_found');
+  const model = selectedModels(connection).find((item) => item.id === modelId);
+  if (!model) throw new Error('model_not_enabled_for_connection');
+  const auth = await store.resolveAuth(connection.id, { fetchImpl: args.fetchImpl ?? fetch, signal: args.abort_signal ?? args.abortSignal });
+  const token = auth?.token ?? auth?.apiKey ?? auth?.accessToken;
+  return { connection, model, auth: { ...auth, token } };
+}
+
+function hasInjectedModelStore(args = {}) {
+  return Boolean(args.modelSettings || args.stores?.models || args.runtimeStores?.models);
+}
+
+async function resolveModelSelection(args, agentId) {
+  const injected = args.modelSettings || args.stores?.models || args.runtimeStores?.models;
+  if (!injected || !agentId) return null;
+  return injected.modelSelection(agentId);
+}
+
+/** Models are selected only by an enabled authoritative connection/model pair. */
+export async function resolveModelConfig(args = {}) {
+  if (!hasInjectedModelStore(args)) throw new Error('model_settings_store_required');
+  let connectionId = text(args.model_connection_id ?? args.modelConnectionId);
+  let modelId = text(args.model ?? args.model_id ?? args.modelId);
+  let agentSelection = null;
+  if (text(args.agent_id ?? args.agentId)) {
+    agentSelection = await resolveModelSelection(args, text(args.agent_id ?? args.agentId));
+    connectionId = connectionId || agentSelection?.connectionId || '';
+    modelId = modelId || agentSelection?.model || '';
+  }
+  if (!connectionId || !modelId) return null;
+  const { connection, model, auth } = await resolveInjectedModel(connectionId, modelId, args);
+  const reasoningEffort = normalizeModelReasoningEffort(args.model_reasoning_effort ?? args.reasoning_effort ?? agentSelection?.reasoningEffort ?? 'off');
+  const suppliedTemperature = args.temperature ?? args.model_temperature;
+  const temperature = suppliedTemperature === undefined || suppliedTemperature === null || suppliedTemperature === '' ? (agentSelection?.temperature ?? 0.2) : Number(suppliedTemperature);
+  if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) throw new Error(`invalid model temperature: ${suppliedTemperature}`);
+  const extra = reasoningEffort === 'off' ? undefined : { reasoning: { effort: reasoningEffort } };
+  const result = {
+    provider: connection.provider,
+    providerName: connection.provider,
+    api: connection.apiType,
+    baseUrl: connection.baseUrl,
+    // Deployment-owned explicit connection allowlist; never inferred from API host.
+    trustProviderImageUrls: splitCsv(process.env.BURROW_TRUSTED_IMAGE_URL_CONNECTION_IDS).includes(connection.id),
+    apiKey: auth.token,
+    auth,
+    model: model.id,
+    temperature,
+    contextWindow: model.contextWindow ?? undefined,
+    contextTokens: resolveEffectiveModelContextTokens({ contextTokens: model.contextTokens, contextWindow: model.contextWindow, provider: connection.provider, api: connection.apiType }) ?? undefined,
+    // Catalog capacity is metadata, not a requested generation limit.
+    ...(positiveInteger(model.outputTokens ?? model.maxOutputTokens) ? {
+      outputTokens: positiveInteger(model.outputTokens ?? model.maxOutputTokens),
+    } : {}),
+    ...(positiveInteger(args.max_tokens ?? args.maxTokens ?? args.output_tokens ?? args.outputTokens ?? model.maxTokens) ? {
+      maxTokens: positiveInteger(args.max_tokens ?? args.maxTokens ?? args.output_tokens ?? args.outputTokens ?? model.maxTokens),
+    } : {}),
+    reasoningEfforts: model.reasoningEfforts ?? undefined,
+    defaultReasoningEffort: model.defaultReasoningEffort ?? undefined,
+    supportsTemperature: modelSupportsTemperature({ provider: connection.provider, api: connection.apiType, model: model.id, declared: model.supportsTemperature }),
+    // Per-model capabilities take precedence. The connection-level value remains
+    // a backward-compatible fallback for models saved before this setting.
+    supportsVision: (model.acceptedInput ?? connection.acceptedInput ?? []).includes('image'),
+    vision: (model.acceptedInput ?? connection.acceptedInput ?? []).includes('image'),
+    multimodal: (model.acceptedInput ?? connection.acceptedInput ?? []).includes('image'),
+    ...(Array.isArray(model.supportedGenerationMethods) ? { supportedGenerationMethods: model.supportedGenerationMethods } : {}),
+    // Unknown outputs remain absent so exact native contracts can supply their
+    // defaults; an explicit empty array is a deliberate disable.
+    capabilities: { images: (model.acceptedInput ?? connection.acceptedInput ?? []).includes('image'), vision: (model.acceptedInput ?? connection.acceptedInput ?? []).includes('image'), ...((model.acceptedOutput ?? model.discoveredOutput) !== undefined ? { outputs: model.acceptedOutput ?? model.discoveredOutput } : {}) },
+    extra,
+    connectionId: connection.id,
+    availableModels: selectedModels(connection),
+    selectedModel: model.id,
+    // All model connections use the direct API runtime.
+    runtimeId: 'direct-api',
+    selectionSource: agentSelection ? 'agent-default' : 'turn-override',
+  };
+  Object.defineProperty(result, 'resolveChildModel', { enumerable: false, value: async (childId = null) => {
+    if (childId) return resolveModelConfig({ ...args, model_connection_id: connection.id, modelConnectionId: connection.id, model: childId });
+    const configured = args.modelSettings || args.stores?.models || args.runtimeStores?.models;
+    const selection = configured?.modelSelection ? await configured.modelSelection(text(args.agent_id ?? args.agentId), { minion: true }) : null;
+    if (!selection?.connectionId || !selection?.model) return result;
+    return resolveModelConfig({ ...args, model_connection_id: selection.connectionId, modelConnectionId: selection.connectionId, model: selection.model, model_reasoning_effort: selection.reasoningEffort, reasoning_effort: selection.reasoningEffort, temperature: selection.temperature });
+  } });
+  return result;
+}
+export function redactModelConfig(modelConfig) {
+  if (!modelConfig) return null;
+  return { provider: modelConfig.provider, providerName: modelConfig.providerName, api: modelConfig.api, baseUrl: modelConfig.baseUrl, model: modelConfig.model, temperature: modelConfig.temperature ?? 0.2, hasApiKey: Boolean(modelConfig.apiKey), contextWindow: modelConfig.contextWindow || null, contextTokens: modelConfig.contextTokens || null, outputTokens: modelConfig.outputTokens || null, maxTokens: modelConfig.maxTokens || null, connectionId: modelConfig.connectionId || null, selectedModel: modelConfig.selectedModel || null };
+}
+
+
+export function resolveExecutionConfig(args = {}) { return { profile: text(args.autonomy_profile) || 'local-dev', executeProposals: args.execute_proposals === true, allowReviewRequiredProposals: args.allow_review_required_proposals === true, allowMutationProposals: args.allow_mutation_proposals === true, commitChanges: args.commit_changes === true, commitMessage: args.commit_message || null }; }
+function splitCsv(value) {
+  return text(value).split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+export async function resolveUiConfig(args = {}) {
+  const metadata = args.settingsMetadata || args.stores?.metadata || args.runtimeStores?.metadata;
+  const secrets = args.uiAuthSecrets || args.stores?.uiAuthSecrets || args.runtimeStores?.uiAuthSecrets;
+  if (!metadata?.get) throw new Error('ui_auth_metadata_store_required');
+  const settings = { ...((await metadata.get('ui_auth')) || {}) };
+  if (settings.oidc && typeof settings.oidc === 'object' && !settings.oidc.clientSecret && secrets) {
+    settings.oidc = { ...settings.oidc, clientSecret: await secrets.get() };
+  }
+  const envMode = env('BURROW_UI_AUTH_MODE');
+  const mode = text(args.ui_auth_mode ?? envMode ?? settings.mode ?? 'none').toLowerCase();
+  const allowedModes = new Set(['none', 'trusted-proxy', 'basic', 'oidc']);
+  if (!allowedModes.has(mode)) throw new Error(`invalid ui auth mode: ${mode}`);
+  return {
+    host: args.ui_host ?? env('BURROW_UI_HOST', '127.0.0.1'),
+    port: args.ui_port ?? env('BURROW_UI_PORT', '42817'),
+    authMode: mode,
+    authEnabled: mode !== 'none',
+    authSource: args.ui_auth_mode || envMode ? 'environment' : (settings.mode ? 'database' : 'default'),
+    trustedProxy: {
+      allowedProxies: splitCsv(args.ui_auth_allowed_proxies ?? env('BURROW_UI_AUTH_ALLOWED_PROXIES') ?? settings.trustedProxy?.allowedProxies?.join?.(',') ?? settings.trustedProxy?.allowedProxy ?? '127.0.0.1,::1'),
+      userHeader: text(args.ui_auth_user_header ?? env('BURROW_UI_AUTH_USER_HEADER') ?? settings.trustedProxy?.userHeader ?? 'x-forwarded-user').toLowerCase() || 'x-forwarded-user',
+    },
+    basic: {
+      username: text(args.ui_auth_basic_username ?? env('BURROW_UI_AUTH_BASIC_USERNAME') ?? settings.basic?.username) || null,
+      passwordHash: text(args.ui_auth_basic_password_hash ?? env('BURROW_UI_AUTH_BASIC_PASSWORD_HASH') ?? settings.basic?.passwordHash) || null,
+      insecureCookies: String(args.ui_auth_basic_insecure_cookies ?? env('BURROW_UI_AUTH_BASIC_INSECURE_COOKIES') ?? settings.basic?.insecureCookies ?? '').toLowerCase() === 'true',
+      sessionTtlSeconds: Math.max(60, Number(args.ui_auth_basic_session_ttl_seconds ?? env('BURROW_UI_AUTH_BASIC_SESSION_TTL_SECONDS') ?? settings.basic?.sessionTtlSeconds ?? 12 * 60 * 60) || 12 * 60 * 60),
+    },
+    oidc: {
+      issuer: text(args.ui_auth_oidc_issuer ?? env('BURROW_UI_AUTH_OIDC_ISSUER') ?? settings.oidc?.issuer) || null,
+      clientId: text(args.ui_auth_oidc_client_id ?? env('BURROW_UI_AUTH_OIDC_CLIENT_ID') ?? settings.oidc?.clientId) || null,
+      clientSecret: text(args.ui_auth_oidc_client_secret ?? env('BURROW_UI_AUTH_OIDC_CLIENT_SECRET') ?? settings.oidc?.clientSecret) || null,
+      redirectUri: text(args.ui_auth_oidc_redirect_uri ?? env('BURROW_UI_AUTH_OIDC_REDIRECT_URI') ?? settings.oidc?.redirectUri) || null,
+      scopes: splitCsv(args.ui_auth_oidc_scopes ?? env('BURROW_UI_AUTH_OIDC_SCOPES') ?? settings.oidc?.scopes?.join?.(',') ?? 'openid,email,profile'),
+      allowedEmails: splitCsv(args.ui_auth_oidc_allowed_emails ?? env('BURROW_UI_AUTH_OIDC_ALLOWED_EMAILS') ?? settings.oidc?.allowedEmails?.join?.(',') ?? ''),
+      allowedDomains: splitCsv(args.ui_auth_oidc_allowed_domains ?? env('BURROW_UI_AUTH_OIDC_ALLOWED_DOMAINS') ?? settings.oidc?.allowedDomains?.join?.(',') ?? ''),
+      insecureCookies: String(args.ui_auth_oidc_insecure_cookies ?? env('BURROW_UI_AUTH_OIDC_INSECURE_COOKIES') ?? settings.oidc?.insecureCookies ?? '').toLowerCase() === 'true',
+    },
+  };
+}
+
+export function defaultRuntimeRoot() { return env('BURROW_RUNTIME_ROOT', DEFAULT_RUNTIME_ROOT); }
+export function defaultRuntimeWorkspaceRoot() { return path.join(defaultRuntimeRoot(), DEFAULT_WORKSPACE_ID); }
+export function defaultRuntimeAgentWorkspaceRoot() { return path.join(defaultRuntimeWorkspaceRoot(), DEFAULT_AGENT_ID); }
+export function defaultRuntimeAgentDataRoot() { return defaultRuntimeAgentWorkspaceRoot(); }
+export function defaultRuntimeDataRoot() { return defaultRuntimeAgentDataRoot(); }
+export function defaultRuntimeCacheRoot() { return path.join(defaultRuntimeRoot(), 'cache'); }
+export function defaultRuntimeArchiveRoot() { return path.join(defaultRuntimeRoot(), 'archive'); }
+export function defaultRuntimeSourceRoot() { return env('BURROW_SOURCE_ROOT', process.cwd()); }
+
+/** Deployment paths are service-environment owned; CLI flags are explicit one-shot overrides. */
+export function resolveRuntimeStateConfig({ rootDir, args = {} } = {}) {
+  const agentId = text(args.agent_id ?? env('BURROW_AGENT_ID', DEFAULT_AGENT_ID)) || DEFAULT_AGENT_ID;
+  const runtimeRoot = absolute(args.runtime_root ?? env('BURROW_RUNTIME_ROOT'), DEFAULT_RUNTIME_ROOT);
+  const sourceRoot = absolute(args.source_root ?? env('BURROW_SOURCE_ROOT'), rootDir || process.cwd());
+  const workspaceRoot = absolute(args.workspace_root ?? env('BURROW_WORKSPACE_ROOT'), path.join(runtimeRoot, DEFAULT_WORKSPACE_ID));
+  // An explicit workspace root defines the complete per-agent tree for this
+  // invocation. Do not let an ambient service-level agent path redirect it.
+  const configuredAgentWorkspaceRoot = args.agent_workspace_root ?? (args.workspace_root === undefined ? env('BURROW_AGENT_WORKSPACE_ROOT') : undefined);
+  const agentWorkspaceRoot = absolute(configuredAgentWorkspaceRoot, path.join(workspaceRoot, agentId));
+  const agentDataRoot = agentWorkspaceRoot;
+  const dataRoot = agentWorkspaceRoot;
+  const cacheRoot = absolute(args.cache_root ?? env('BURROW_CACHE_ROOT'), path.join(runtimeRoot, 'cache'));
+  const archiveRoot = absolute(args.archive_root ?? env('BURROW_ARCHIVE_ROOT'), path.join(runtimeRoot, 'archive'));
+  return { runtimeRoot, sourceRoot, workspaceRoot, workspaceRootSource: 'environment', agentId, agentWorkspaceRoot, agentWorkspaceRootSource: 'environment', agentDataRoot, agentDataRootSource: 'workspace', filesystemBoundaries: [], sourceCopyRoot: sourceRoot, skillsRoot: absolute(args.skills_root ?? env('BURROW_SKILLS_ROOT'), path.join(agentWorkspaceRoot, 'skills')), skillsRootSource: 'environment', dataRoot, dataRootSource: 'workspace', cacheRoot, cacheRootSource: 'environment', archiveRoot, archiveRootSource: 'environment' };
+}
+function safe(value, fallback) { return text(value || fallback).replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 120) || fallback; }
+export function resolveRuntimeTracePath({ cacheRoot, workspaceRoot, agentId = DEFAULT_AGENT_ID, sessionId = 'default', runId = null, testIsolation = null } = {}) { const resolvedCacheRoot = path.resolve(cacheRoot); const tracedWorkspace = safe(path.basename(path.resolve(workspaceRoot || DEFAULT_WORKSPACE_ID)), DEFAULT_WORKSPACE_ID); const parts = [resolvedCacheRoot, testIsolation ? 'test-traces' : 'traces', tracedWorkspace, safe(agentId, DEFAULT_AGENT_ID), safe(sessionId, 'default')]; if (runId) parts.push(safe(runId, 'run')); return path.join(...parts); }
+function runtimeTestIsolation(args = {}) { const explicit = args.test_isolation ?? args.testIsolation ?? env('BURROW_TRACE_ISOLATION'); return explicit === undefined || explicit === null ? Boolean(process.env.NODE_V8_COVERAGE || process.env.TEST || process.env.NODE_TEST_CONTEXT || process.env.npm_lifecycle_event === 'test' || process.execArgv.includes('--test')) : /^(?:1|true|yes)$/i.test(String(explicit)); }
+export async function resolveRuntimeTraceRoot(rootDir, args = {}) { return resolveRuntimeTracePath({ ...resolveRuntimeStateConfig({ rootDir, args }), sessionId: 'default', testIsolation: runtimeTestIsolation(args) }); }
+export function resolveSubjectScopes() { return []; }
+export function resolveDreamSchedulerConfig() { return { enabled: false }; }
+export function resolveRetentionConfig() {
+  const positive = (value, fallback = null) => {
+    const resolved = value === undefined ? fallback : value;
+    return Number.isFinite(Number(resolved)) && Number(resolved) > 0 ? Number(resolved) : null;
+  };
+  return {
+    sessionsMax: null,
+    tracesMax: null,
+    maxAgeDays: null,
+    mainMaxAgeDays: positive(env('BURROW_MAIN_SESSION_MAX_AGE_DAYS'), 60),
+    taskMaxAgeDays: positive(env('BURROW_TASK_SESSION_MAX_AGE_DAYS'), 30),
+    subagentMaxAgeDays: positive(env('BURROW_SUBAGENT_SESSION_MAX_AGE_DAYS'), 7),
+    traceMaxAgeDays: positive(env('BURROW_TRACE_MAX_AGE_DAYS')),
+    traceMaxBytes: positive(env('BURROW_TRACE_MAX_BYTES')),
+  };
+}
+export function resolveChatToolLoopConfig() { return { stopOnNoProgress: false, loopWarningThreshold: 2, loopBlockThreshold: 3 }; }
+export function resolveContextConfig(args = {}) {
+  return normalizeContextCompressionConfig({
+    // Chat HTTP requests intentionally do not accept runtime compression policy.
+    // The service environment owns that default; explicit CLI args remain a
+    // one-shot override for non-server commands.
+    contextThreshold: args.context_threshold ?? env('BURROW_CONTEXT_THRESHOLD'),
+    freshTailCount: args.fresh_tail_count ?? env('BURROW_CONTEXT_FRESH_TAIL_COUNT'),
+    freshTailMaxTokens: args.fresh_tail_max_tokens ?? env('BURROW_CONTEXT_FRESH_TAIL_MAX_TOKENS'),
+    leafChunkTokens: args.leaf_chunk_tokens ?? env('BURROW_CONTEXT_LEAF_CHUNK_TOKENS'),
+    summaryTargetTokens: args.summary_target_tokens ?? env('BURROW_CONTEXT_SUMMARY_TARGET_TOKENS'),
+    summaryModel: args.summary_model ?? env('BURROW_CONTEXT_SUMMARY_MODEL'),
+    maxSweepIterations: args.max_sweep_iterations ?? env('BURROW_CONTEXT_MAX_SWEEP_ITERATIONS'),
+    sweepDeadlineMs: args.sweep_deadline_ms ?? env('BURROW_CONTEXT_SWEEP_DEADLINE_MS'),
+  });
+}
+export function resolveSkillsConfig() { return { disabledSkillIds: [], experimentalSkillIds: [], deprecatedSkillIds: [], memoryIndex: { enabled: false, namespace: 'skills', storesBody: false } }; }
+export const __test__ = {};
+
+// Bounds protect provider context and per-request database/response work; not retention limits.
+export function resolveAlbdruckConfig() {
+  const positiveInteger = (name, fallback) => {
+    const value = Number(env(name, fallback));
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Invalid ${name}: expected a positive safe integer`);
+    return value;
+  };
+  return { promptMaxChars: positiveInteger('BURROW_ALBDRUCK_PROMPT_MAX_CHARS', 4000), maxPageSize: positiveInteger('BURROW_ALBDRUCK_MAX_PAGE_SIZE', 200), historyBudgetMs: positiveInteger('BURROW_HISTORY_QUERY_BUDGET_MS', 15000), historyLockTimeoutMs: positiveInteger('BURROW_HISTORY_LOCK_TIMEOUT_MS', 1000) };
+}

@@ -1,0 +1,22 @@
+import { ConfirmProvider } from '../../app/ConfirmDialog';
+import { afterEach, expect, it, vi } from 'vitest';
+import { cleanup, render as baseRender, waitFor } from '@testing-library/react';
+import { ModSettingsHost } from './ModSettingsHost';
+
+const { mountSettings } = vi.hoisted(() => ({ mountSettings: vi.fn() }));
+vi.mock('./ModSettingsHostFixture', () => ({ settingsSections: [{ id: 'vault', label: 'Vault' }], mountSettings, settingsContribution: undefined, createSettingsContribution: undefined }));
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); mountSettings.mockReset(); });
+it('mounts locally scoped Settings API regardless of selected remote target', async () => {
+  const fetch = vi.fn().mockResolvedValue(new Response('{}', { headers: { 'content-type': 'application/json' } }));
+  vi.stubGlobal('fetch', fetch);
+
+  render(<ModSettingsHost modId="example" settingsUrl="./ModSettingsHostFixture" agents={[]} onAgentsChanged={async () => {}} navigationTarget={null} overflowTarget={null} />);
+  await waitFor(() => expect(mountSettings).toHaveBeenCalled());
+  const context = mountSettings.mock.calls[0][0];
+  expect(context.runtimeScope).toBe('local'); expect(context.modId).toBe('example');
+  await context.api('/status');
+  expect(fetch.mock.calls[0][0]).toBe('/api/mods/example/status');
+  expect(fetch.mock.calls[0][0]).not.toContain('remote.example');
+});
+
+function render(ui: Parameters<typeof baseRender>[0]) { return baseRender(ui, { wrapper: ConfirmProvider }); }

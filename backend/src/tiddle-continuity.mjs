@@ -1,0 +1,389 @@
+import { createBackgroundLifecycle } from './background-lifecycle.mjs';
+import { withTiddleOccurrence, runAsync, tiddlePersistence } from './tiddle-persistence.mjs';
+import { rollingCardActive } from './postgres-rolling-continuity-store.mjs';
+import { randomUUID } from 'node:crypto';
+import { completeCurator, curatorRoot, readCuratorSelection } from './curator-runtime.mjs';
+import { appendPreferenceSignal, appendPreferenceSignalAsync, normalizePreferenceSignal } from './preference-learning.mjs';
+
+const PASS_INTERVAL_MS = 4 * 60 * 60 * 1_000;
+const LOOKBACK_MS = 24 * 60 * 60 * 1_000;
+const SYNTHESIS_WINDOW_MS = 21 * 24 * 60 * 60 * 1_000;
+const MAX_SYNTHESIS_CANDIDATES = 120;
+const GLOBAL_SCOPE = 'global';
+
+
+
+export const TIDDLE_HISTORY_RETENTION_DAYS = 180;
+const HISTORY_RETENTION_MS = TIDDLE_HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1_000;
+
+const text = (value) => String(value ?? '').trim();
+const bounded = (value, limit) => { const source = text(value); return source.length <= limit ? source : source.slice(0, limit).trim(); };
+const parse = (value, fallback = null) => { try { return JSON.parse(value); } catch { return fallback; } };
+const iso = (value = Date.now()) => new Date(value).toISOString();
+const residueKey = (agentId) => ({ agentId, kind: 'tiddle-residue' });
+const passKey = (agentId) => ({ agentId, kind: 'tiddle-pass' });
+const scopePassKey = (agentId, scope) => ({ agentId, kind: 'tiddle-pass-scope', scope });
+const receiptKey = (agentId, runId) => ({ agentId, kind: 'tiddle-pass-receipt', scope: runId });
+const cardKey = (agentId, scope) => `rolling-continuity:${agentId}:${scope}`;
+const historyKey = (agentId) => ({ agentId, kind: 'tiddle-history' });
+const synthesisKey = (agentId) => ({ agentId, kind: 'tiddle-synthesis' });
+const globalCardKey = (agentId) => cardKey(agentId, GLOBAL_SCOPE);
+
+function* meta(db, key, fallback = null) { return (yield () => db.get(key)) ?? fallback; }
+function* setMeta(db, key, value, at) { return yield () => db.set(key, value, at); }
+function* activeCards(db, agentId, scope, at) {
+  const value = yield* meta(db, cardKey(agentId, scope), { cards: [] });
+  return (Array.isArray(value?.cards) ? value.cards : []).filter((card) => rollingCardActive(card, at));
+}
+function* appendHistory(db, { agentId, entry, at }) {
+  const cutoff = iso(new Date(at).getTime() - HISTORY_RETENTION_MS);
+  yield () => db.append(historyKey(agentId), entry, { version: 1, agentId, updatedAt: at }, at, cutoff);
+  return entry;
+}
+async function commitScopePass(db, { agentId, scope, at, entry, cardUpdate = null, assertActive = null }) {
+  return db.transaction(agentId, function* (tx) {
+    const update = cardUpdate ? yield* upsertCard(tx, cardUpdate) : null;
+    yield* appendHistory(tx, { agentId, at, entry: entry(update) });
+    yield* setMeta(tx, scopePassKey(agentId, scope), { version: 1, agentId, scope, lastSuccessAt: at, updatedAt: at }, at);
+    return update;
+  }, assertActive);
+}
+function selectionIdentity(selection) { return selection ? { kind: selection.kind, connectionId: selection.connectionId || null, model: selection.model || selection.modelPath || null, temperature: selection.temperature ?? 0 } : null; }
+export function parseTiddleProposal(value) {
+  const source = text(value);
+  const candidates = [source, ...[...source.matchAll(/```(?:json)?\s*([\s\S]*?)```/giu)].map((match) => typeof match === 'string' ? match : match[1])];
+  for (const candidate of candidates) {
+    const proposal = parse(candidate);
+    const action = text(proposal?.action).toUpperCase();
+    if (action === 'NOOP') return { action, reason: bounded(proposal.reason, 240) || 'no_warm_continuity', preferenceSignal: normalizePreferenceSignal(proposal.preferenceSignal) };
+    if (action === 'UPSERT' && text(proposal.title) && text(proposal.summary) && (proposal.targetId === null || text(proposal.targetId))) return { action, targetId: text(proposal.targetId) || null, title: bounded(proposal.title, 240), summary: bounded(proposal.summary, 2400), reason: bounded(proposal.reason, 240) || 'persistence across the window', preferenceSignal: normalizePreferenceSignal(proposal.preferenceSignal) };
+  }
+  return null;
+}
+
+function residueUpdate(current, { agentId, scope, sessionId, conversationId, runId, message, answerText, toolResults = [], at }) {
+    const item = {
+      ref: `session:${sessionId}:run:${runId}`,
+      scope: text(scope), sessionId: text(sessionId), conversationId: text(conversationId) || text(sessionId), runId: text(runId), at,
+      // Residue is a bounded conversation projection, so preserve the user's and
+      // assistant's words exactly. Credential material must enter through typed
+      // protected tool fields rather than heuristic rewriting of ordinary prose.
+      message: bounded(message, 1200), answer: bounded(answerText, 1800),
+      tools: (Array.isArray(toolResults) ? toolResults : []).filter((tool) => tool?.ok === true).slice(0, 8).map((tool) => ({ tool: bounded(tool.tool, 120), path: bounded(tool.filePath || tool.path, 240) || null, command: bounded(tool.command, 240) || null })),
+    };
+    const cutoff = iso(new Date(at).getTime() - LOOKBACK_MS);
+    const items = [item, ...(Array.isArray(current?.items) ? current.items : []).filter((entry) => entry?.at >= cutoff && entry?.ref !== item.ref)];
+    return { item, value: { version: 1, agentId: text(agentId), items, updatedAt: at } };
+}
+
+export async function appendTiddleResidueAsync({ metadataStore, ...input } = {}) {
+  metadataStore ||= input.stores?.metadata;
+  if (!metadataStore) throw new Error('tiddle_postgres_store_required');
+  const { agentId, scope, sessionId, runId, answerText } = input;
+  if (!text(agentId) || !text(scope) || !text(sessionId) || !text(runId) || !text(answerText)) return null;
+  const at = input.at || iso();
+  return runAsync(appendTiddleResidueOperation({ ...input, at, stores: { ...input.stores, metadata: metadataStore } }));
+}
+
+/** Cheap terminal residue only: no model call, no warm-card mutation. */
+function* appendTiddleResidueOperation({ stores = null, agentId, scope, sessionId, conversationId, runId, message, answerText, toolResults = [], at = iso() } = {}) {
+  if (!text(agentId) || !text(scope) || !text(sessionId) || !text(runId) || !text(answerText)) return null;
+  const db = tiddlePersistence({ stores });
+  try {
+    const { item } = residueUpdate(null, { agentId, scope, sessionId, conversationId, runId, message, answerText, toolResults, at });
+    yield () => db.transaction(agentId, function* (tx) { yield () => tx.append(residueKey(agentId), item, { version: 1, agentId, updatedAt: at }, at, iso(new Date(at).getTime() - LOOKBACK_MS)); });
+    return item;
+  } finally { db.close(); }
+}
+
+// The scope checkpoint covers this entire window: never truncate its evidence.
+// Provider failure leaves the scope uncommitted and retryable.
+function prompt({ agentId, scope, residue, cards }) {
+  return [
+    'You are Tiddle. You reconcile rolling conversational continuity on a four-hour cadence. Return JSON only; never address the user.',
+    'Warm continuity means a concept persisted, resumed, or recurred across the window. A single vivid turn is not warmth. Default to NOOP.',
+    'Do not create tasks, decisions, emotional/therapy notes, transcript summaries, raw tool dumps, verified external state, or instructions for the agent. This is recall metadata only.',
+    'Separately, notice only a clear operator behavioral correction (especially an explicit correction). You may emit at most one preferenceSignal when grounded in this residue. It is an observation, never a profile edit. Do not infer a preference from mood, one-off task instructions, or generic conversation. Use {kind:reinforce|contradict|replace,scope,guidance,reason}.',
+    'Return JSON with the normal action fields and optional preferenceSignal. Use UPSERT only when the supplied residue demonstrates a compact future-turn-relevant thread that persisted or recurred. If it is an existing concept, set targetId to that exact existing card id even if you improve its title. Set targetId:null only for a genuinely new concept. Output either {"action":"NOOP","reason":"..."} or {"action":"UPSERT","targetId":"existing-card-id-or-null","title":"...","summary":"...","reason":"..."}.',
+    `Agent: ${agentId}; continuity scope: ${scope}`,
+    `Existing warm cards: ${JSON.stringify(cards.map((card) => ({ id: card.id, title: card.title, summary: card.summary, recurrence: card.recurrence, lastSeen: card.lastSeen })).slice(0, 24))}`,
+    `24-hour context residue (newSinceLastPass marks what arrived after the prior successful pass): ${JSON.stringify(residue.map((item) => ({ ref: item.ref, at: item.at, newSinceLastPass: item.newSinceLastPass === true, sessionId: item.sessionId, message: item.message, answer: item.answer, tools: item.tools })))}`,
+  ].join('\n\n');
+}
+function schema() { return { oneOf: [
+  { type: 'object', additionalProperties: false, required: ['action', 'reason'], properties: { action: { const: 'NOOP' }, reason: { type: 'string', minLength: 8, maxLength: 240 }, preferenceSignal: { type: 'object', additionalProperties: false, required: ['kind','scope','guidance','reason'], properties: { kind: { enum: ['reinforce','contradict','replace'] }, scope: { type: 'string', minLength: 1, maxLength: 120 }, guidance: { type: 'string', minLength: 1, maxLength: 600 }, reason: { type: 'string', minLength: 1, maxLength: 240 } } } } },
+  { type: 'object', additionalProperties: false, required: ['action', 'targetId', 'title', 'summary', 'reason'], properties: { action: { const: 'UPSERT' }, targetId: { anyOf: [{ type: 'null' }, { type: 'string', minLength: 1, maxLength: 120 }] }, title: { type: 'string', minLength: 1, maxLength: 240 }, summary: { type: 'string', minLength: 1, maxLength: 2400 }, reason: { type: 'string', minLength: 8, maxLength: 240 }, preferenceSignal: { type: 'object', additionalProperties: false, required: ['kind','scope','guidance','reason'], properties: { kind: { enum: ['reinforce','contradict','replace'] }, scope: { type: 'string', minLength: 1, maxLength: 120 }, guidance: { type: 'string', minLength: 1, maxLength: 600 }, reason: { type: 'string', minLength: 1, maxLength: 240 } } } } },
+] }; }
+
+function* synthesisCandidates(db, agentId, at) {
+  const cutoff = new Date(new Date(at).getTime() - SYNTHESIS_WINDOW_MS).toISOString();
+  const rows = (yield () => db.rows(`rolling-continuity:${agentId}:`)).filter(row => row.key !== globalCardKey(agentId)).sort((a,b) => a.key.localeCompare(b.key));
+  return rows.flatMap(({ key, value_json }) => (parse(value_json, { cards: [] })?.cards || []).map((card) => ({ ...card, sourceScope: card.project || key.split(':').slice(2).join(':') })))
+    .filter((card) => card.lastSeen >= cutoff && card.expiresAt >= at)
+    .sort((a, b) => String(a.lastSeen).localeCompare(String(b.lastSeen)) || String(a.id).localeCompare(String(b.id)))
+    .slice(-MAX_SYNTHESIS_CANDIDATES);
+}
+
+function synthesisPrompt({ agentId, at, candidates, globalCards }) {
+  return [
+    'You are Tiddle performing nightly cross-scope continuity synthesis. Return JSON only; never address the user.',
+    'Propose semantic clusters only when the evidence describes the same future-turn-relevant concept across at least two distinct continuity scopes within the supplied 21-day window. Do not summarize transcripts or promote one-off residue.',
+    'The runtime will validate every source card id, scope, and window before mutation. Confidence is metadata, not an admission rule. Return NOOP when no supported cluster exists.',
+    'Output either {"action":"NOOP","reason":"..."} or {"action":"UPSERT_CLUSTERS","clusters":[{"targetId":null,"title":"...","summary":"...","sourceCardIds":["..."],"confidence":0.0,"reason":"..."}]}. Use targetId only for an existing global card id.',
+    `Agent: ${agentId}; synthesis window ends: ${at}; candidates: ${JSON.stringify(candidates.map((card) => ({ id: card.id, scope: card.sourceScope, title: card.title, summary: card.summary, recurrence: card.recurrence, firstSeen: card.firstSeen, lastSeen: card.lastSeen })))}`,
+    `Existing global warm cards: ${JSON.stringify(globalCards.map((card) => ({ id: card.id, title: card.title, summary: card.summary, sourceCardIds: card.sourceCardIds, scopes: card.scopes })))}`,
+  ].join('\\n\\n');
+}
+function synthesisSchema() { return { oneOf: [
+  { type: 'object', additionalProperties: false, required: ['action', 'reason'], properties: { action: { const: 'NOOP' }, reason: { type: 'string', minLength: 1, maxLength: 240 } } },
+  { type: 'object', additionalProperties: false, required: ['action', 'clusters'], properties: { action: { const: 'UPSERT_CLUSTERS' }, clusters: { type: 'array', maxItems: 20, items: { type: 'object', additionalProperties: false, required: ['targetId', 'title', 'summary', 'sourceCardIds', 'confidence', 'reason'], properties: { targetId: { anyOf: [{ type: 'null' }, { type: 'string', minLength: 1, maxLength: 120 }] }, title: { type: 'string', minLength: 1, maxLength: 240 }, summary: { type: 'string', minLength: 1, maxLength: 2400 }, sourceCardIds: { type: 'array', minItems: 2, maxItems: 50, items: { type: 'string' } }, confidence: { type: 'number', minimum: 0, maximum: 1 }, reason: { type: 'string', minLength: 1, maxLength: 240 } } } } } },
+] }; }
+export function parseTiddleSynthesis(value) {
+  const source = text(value);
+  const candidates = [source, ...[...source.matchAll(/```(?:json)?\s*([\s\S]*?)```/giu)].map((match) => match[1])];
+  for (const candidate of candidates) {
+    const proposal = parse(candidate);
+    const action = text(proposal?.action).toUpperCase();
+    if (action === 'NOOP') return { action, reason: bounded(proposal.reason, 240) || 'no_supported_cross_scope_cluster' };
+    if (action === 'UPSERT_CLUSTERS' && Array.isArray(proposal.clusters)) return { action, clusters: proposal.clusters, reason: 'cross_scope_synthesis' };
+  }
+  return null;
+}
+function validateSynthesisClusters(proposal, candidates, globalCards, at) {
+  if (!proposal || proposal.action !== 'UPSERT_CLUSTERS') return [];
+  const byId = new Map(candidates.map((card) => [card.id, card]));
+  const globalById = new Set(globalCards.map((card) => card.id));
+  const validated = proposal.clusters.flatMap((cluster) => {
+    const sources = [...new Set(Array.isArray(cluster.sourceCardIds) ? cluster.sourceCardIds.map(text) : [])].map((id) => byId.get(id)).filter(Boolean);
+    const scopes = [...new Set(sources.map((card) => card.sourceScope))];
+    if (!text(cluster.title) || !text(cluster.summary) || sources.length < 2 || scopes.length < 2) return [];
+    if (cluster.targetId !== null && (!text(cluster.targetId) || !globalById.has(text(cluster.targetId)))) return [];
+    return [{ ...cluster, targetId: text(cluster.targetId) || null, title: bounded(cluster.title, 240), summary: bounded(cluster.summary, 2400), sourceCardIds: sources.map((card) => card.id), scopes, confidence: Number.isFinite(Number(cluster.confidence)) ? Math.max(0, Math.min(1, Number(cluster.confidence))) : null, sourceCards: sources, at }];
+  });
+  return validated.length === proposal.clusters.length ? validated : [];
+}
+function* upsertGlobalCluster(db, { agentId, cluster, at }) {
+  const cards = (yield* activeCards(db, agentId, GLOBAL_SCOPE, at));
+  const existing = cluster.targetId ? cards.find((card) => card.id === cluster.targetId) : null;
+  if (cluster.targetId && !existing) throw new Error('tiddle_global_target_invalid');
+  const id = existing?.id || `warm-global:${randomUUID()}`;
+  const sourceCardIds = [...new Set([...(existing?.sourceCardIds || []), ...cluster.sourceCardIds])];
+  const scopes = [...new Set([...(existing?.scopes || []), ...cluster.scopes])];
+  const card = { id, agentId, project: GLOBAL_SCOPE, title: cluster.title, summary: cluster.summary, firstSeen: existing?.firstSeen || at, lastSeen: at, recurrence: Number(existing?.recurrence || 0) + 1, sourceCardIds, scopes, confidence: cluster.confidence, evidence: 'cross-scope-synthesis', reason: bounded(cluster.reason, 240), expiresAt: iso(new Date(new Date(at).getTime() + (yield () => db.rollingTtlDays()) * 24 * 60 * 60 * 1000)) };
+  yield* setMeta(db, globalCardKey(agentId), { version: 1, agentId, project: GLOBAL_SCOPE, cards: [card, ...cards.filter((entry) => entry.id !== id)], updatedAt: at }, at);
+  return { card, prior: existing || null };
+}
+
+async function runTiddleSynthesisOwned({ assertOwner, ownerClient, signal = null, agentId, stores = null, runtimeRoot = null, settingsKey = undefined, temperature = undefined, at = iso(), traceLogger = null } = {}) {
+  const id = text(agentId); if (!id) throw new Error('tiddle_agent_required');
+  const raw = tiddlePersistence({ stores, ownerClient });
+  let publishing = true;
+  const assertActive = async () => { await assertOwner(); signal?.throwIfAborted(); };
+  const db = new Proxy(raw, { get(target, key) { const value = target[key]; if (typeof value !== 'function' || key === 'close') return value; return async (...args) => { await assertOwner(); if (publishing) signal?.throwIfAborted(); return value(...args); }; } });
+  const runId = `tiddle-synthesis-${randomUUID()}`;
+  try {
+    signal?.throwIfAborted();
+    const candidates = (await runAsync(synthesisCandidates(db, id, at))); const globals = (await runAsync(activeCards(db, id, GLOBAL_SCOPE, at)));
+    signal?.throwIfAborted();
+    if (candidates.length < 2) { const receipt = { version: 1, ok: true, runId, agentId: id, generatedAt: at, windowDays: 21, candidateCount: candidates.length, disposition: 'noop', reason: 'insufficient_candidates' }; await runAsync(setMeta(db, synthesisKey(id), { ...receipt, lastSuccessAt: at }, at)); await runAsync(setMeta(db, receiptKey(id, runId), receipt, at)); return receipt; }
+    const configuredSelection = await readCuratorSelection({ stores, root: curatorRoot({ runtimeRoot: runtimeRoot || undefined }) }); if (!configuredSelection) throw new Error('curator_selection_required');
+    const selection = temperature === undefined ? configuredSelection : { ...configuredSelection, temperature };
+    signal?.throwIfAborted();
+    await assertOwner();
+    const completion = await completeCurator({ selection, stores, settingsKey, root: curatorRoot({ runtimeRoot: runtimeRoot || undefined }), prompt: synthesisPrompt({ agentId: id, at, candidates, globalCards: globals }), jsonSchema: synthesisSchema(), traceLogger, signal });
+    signal?.throwIfAborted();
+    const proposal = parseTiddleSynthesis(completion?.choice?.text); const clusters = validateSynthesisClusters(proposal, candidates, globals, at);
+    if (!proposal || (proposal.action === 'UPSERT_CLUSTERS' && clusters.length !== proposal.clusters.length)) throw new Error('tiddle_synthesis_invalid');
+    const updates = await db.transaction(id, function* (tx) {
+      const results = [];
+      for (const cluster of clusters) results.push(yield* upsertGlobalCluster(tx, { agentId: id, cluster, at }));
+      return results;
+    }, assertActive);
+    const receipt = { version: 1, ok: true, runId, agentId: id, generatedAt: at, windowDays: 21, candidateCount: candidates.length, clusterCount: updates.length, disposition: updates.length ? 'upserted' : 'noop', model: selectionIdentity(selection) };
+    await runAsync(setMeta(db, synthesisKey(id), { ...receipt, lastSuccessAt: at }, at)); await runAsync(setMeta(db, receiptKey(id, runId), receipt, at)); await traceLogger?.event?.('tiddle-synthesis', receipt); return receipt;
+  } catch (error) { publishing = false; const receipt = { version: 1, ok: false, runId, agentId: id, generatedAt: at, error: String(error?.message || error) }; await runAsync(setMeta(db, receiptKey(id, runId), receipt, at)); await traceLogger?.event?.('tiddle-synthesis', receipt); return receipt; }
+  finally { db.close(); }
+}
+
+function* upsertCard(db, { agentId, scope, proposal, residue, at }) {
+  const cards = (yield* activeCards(db, agentId, scope, at));
+  const existing = proposal.targetId ? cards.find((card) => card.id === proposal.targetId) : null;
+  if (proposal.targetId && !existing) throw new Error('tiddle_card_target_invalid');
+  const id = existing?.id || `warm:${randomUUID()}`;
+  const refs = [...new Set([...(existing?.recentRefs || []), ...residue.map((item) => item.ref)])];
+  const card = { id, agentId, project: scope, title: proposal.title, summary: proposal.summary, firstSeen: existing?.firstSeen || at, lastSeen: at, recurrence: Number(existing?.recurrence || 0) + 1, recentRefs: refs, evidence: 'windowed-conversation', reason: proposal.reason, expiresAt: iso(new Date(at).getTime() + (yield () => db.rollingTtlDays()) * 24 * 60 * 60 * 1000) };
+  yield* setMeta(db, cardKey(agentId, scope), { version: 1, agentId, project: scope, cards: [card, ...cards.filter((entry) => entry.id !== id)], updatedAt: at }, at);
+  return { card, prior: existing || null };
+}
+
+async function runTiddlePassOwned({ assertOwner, ownerClient, signal = null, agentId, stores = null, runtimeRoot = null, settingsKey = undefined, temperature = undefined, at = iso(), traceLogger = null } = {}) {
+  const id = text(agentId);
+  if (!id) throw new Error('tiddle_agent_required');
+  const raw = tiddlePersistence({ stores, ownerClient });
+  let publishing = true;
+  const assertActive = async () => { await assertOwner(); signal?.throwIfAborted(); };
+  const db = new Proxy(raw, { get(target, key) { const value = target[key]; if (typeof value !== 'function' || key === 'close') return value; return async (...args) => { await assertOwner(); if (publishing) signal?.throwIfAborted(); return value(...args); }; } });
+  const runId = `tiddle-pass-${randomUUID()}`;
+  try {
+    signal?.throwIfAborted();
+    const lookbackStart = new Date(at).getTime() - LOOKBACK_MS;
+    const contextStart = iso(lookbackStart);
+    const allResidue = ((await runAsync(meta(db, residueKey(id), { items: [] })))?.items || []).filter((item) => item?.at >= contextStart && item?.at <= at);
+    const groups = new Map();
+    for (const item of allResidue) { const group = groups.get(item.scope) || { context: [] }; group.context.push(item); groups.set(item.scope, group); }
+    const scopeGroups = await Promise.all([...groups].map(async ([scope, group]) => {
+      const priorSuccess = Date.parse((await runAsync(meta(db, scopePassKey(id, scope), {})))?.lastSuccessAt || '');
+      const newResidueStart = iso(Number.isFinite(priorSuccess) ? priorSuccess : lookbackStart);
+      return [scope, { ...group, newRefs: new Set(group.context.filter((item) => item.at >= newResidueStart).map((item) => item.ref)) }];
+    }));
+    const newResidueCount = scopeGroups.reduce((count, [, group]) => count + group.newRefs.size, 0);
+    const outcomes = [];
+    signal?.throwIfAborted();
+    if (!newResidueCount) {
+      const receipt = { version: 1, ok: true, runId, agentId: id, generatedAt: at, contextWindowStart: contextStart, windowHours: 24, passHours: 4, scopes: outcomes, residueCount: 0, disposition: 'no_residue', nextRunAt: iso(new Date(at).getTime() + PASS_INTERVAL_MS) };
+      await runAsync(appendHistory(db, { agentId: id, at, entry: { version: 1, id: `tiddle-history-${randomUUID()}`, at, runId, agentId: id, scope: null, disposition: 'no_residue', model: null, contextResidueCount: 0, newResidueCount: 0, cardId: null, recurrenceBefore: 0, recurrenceAfter: 0, titleBefore: null, titleAfter: null, summaryBefore: null, summaryAfter: null, reason: 'no_new_residue', sourceRefs: [] } }));
+      await runAsync(setMeta(db, passKey(id), { version: 1, agentId: id, lastSuccessAt: at, nextRunAt: receipt.nextRunAt, updatedAt: at }, at));
+      await runAsync(setMeta(db, receiptKey(id, runId), receipt, at));
+      await traceLogger?.event?.('tiddle-pass', receipt);
+      return receipt;
+    }
+    const configuredSelection = await readCuratorSelection({ stores, root: curatorRoot({ runtimeRoot: runtimeRoot || undefined }) });
+    if (!configuredSelection) throw new Error('curator_selection_required');
+    const selection = temperature === undefined ? configuredSelection : { ...configuredSelection, temperature };
+    for (const [scope, group] of scopeGroups) {
+      const { context: items, newRefs } = group;
+      if (!newRefs.size) continue;
+      const cards = (await runAsync(activeCards(db, id, scope, at)));
+      signal?.throwIfAborted();
+      await assertOwner();
+      const completion = await completeCurator({ selection, stores, settingsKey, root: curatorRoot({ runtimeRoot: runtimeRoot || undefined }), prompt: prompt({ agentId: id, scope, residue: items.map((item) => ({ ...item, newSinceLastPass: newRefs.has(item.ref) })), cards }), jsonSchema: schema(), traceLogger, signal });
+      signal?.throwIfAborted();
+      const proposal = parseTiddleProposal(completion?.choice?.text);
+      if (!proposal) throw new Error('tiddle_proposal_invalid');
+      await assertOwner();
+      const observedPreference = proposal?.preferenceSignal ? await appendPreferenceSignalAsync({ metadataStore: db, agentId: id, signal: { ...proposal.preferenceSignal, sourceRefs: [...newRefs] }, at }) : null;
+      const cardUpdate = proposal?.action === 'UPSERT' ? { agentId: id, scope, proposal, residue: items, at } : null;
+      const update = await commitScopePass(db, { agentId: id, scope, at, cardUpdate, entry: (cardUpdateResult) => {
+        const card = cardUpdateResult?.card || null;
+        const prior = cardUpdateResult?.prior || null;
+        const disposition = card ? (prior ? 'updated' : 'created') : 'noop';
+        return { version: 1, id: `tiddle-history-${randomUUID()}`, at, runId, agentId: id, scope, disposition, model: selectionIdentity(selection), contextResidueCount: items.length, newResidueCount: newRefs.size, cardId: card?.id || null, recurrenceBefore: prior?.recurrence || 0, recurrenceAfter: card?.recurrence || 0, titleBefore: prior?.title || null, titleAfter: card?.title || null, summaryBefore: prior?.summary || null, summaryAfter: card?.summary || null, reason: proposal?.reason || null, sourceRefs: card ? card.recentRefs : [...newRefs].slice(-20) };
+      }, assertActive });
+      const card = update?.card || null;
+      const disposition = card ? (update.prior ? 'updated' : 'created') : 'noop';
+      outcomes.push({ scope, contextResidueCount: items.length, newResidueCount: newRefs.size, disposition, preferenceSignal: observedPreference ? { id: observedPreference.id, scope: observedPreference.scope } : null, card: card ? { id: card.id, title: card.title, recurrence: card.recurrence } : null });
+    }
+    signal?.throwIfAborted();
+    const receipt = { version: 1, ok: true, runId, agentId: id, generatedAt: at, contextWindowStart: contextStart, windowHours: 24, passHours: 4, model: selectionIdentity(selection), scopes: outcomes, residueCount: newResidueCount, nextRunAt: iso(new Date(at).getTime() + PASS_INTERVAL_MS) };
+    await runAsync(setMeta(db, passKey(id), { version: 1, agentId: id, lastSuccessAt: at, nextRunAt: receipt.nextRunAt, updatedAt: at }, at));
+    await runAsync(setMeta(db, receiptKey(id, runId), receipt, at));
+    await traceLogger?.event?.('tiddle-pass', receipt);
+    return receipt;
+  } catch (error) {
+    publishing = false;
+    const receipt = { version: 1, ok: false, runId, agentId: id, generatedAt: at, error: String(error?.message || error) };
+    await runAsync(appendHistory(db, { agentId: id, at, entry: { version: 1, id: `tiddle-history-${randomUUID()}`, at, runId, agentId: id, scope: null, disposition: 'failed', model: null, contextResidueCount: 0, newResidueCount: 0, cardId: null, recurrenceBefore: 0, recurrenceAfter: 0, titleBefore: null, titleAfter: null, summaryBefore: null, summaryAfter: null, reason: receipt.error, sourceRefs: [] } }));
+    await runAsync(setMeta(db, receiptKey(id, runId), receipt, at));
+    await traceLogger?.event?.('tiddle-pass', receipt);
+    return receipt;
+  } finally { db.close(); }
+}
+
+function* listTiddleCardsOperation({ agentId, scope = null, stores = null, limit = 100, at = iso() } = {}) {
+  const id = text(agentId);
+  if (!id) throw new Error('tiddle_agent_required');
+  const db = tiddlePersistence({ stores });
+  try {
+    const keys = scope ? [cardKey(id, text(scope))] : (yield () => db.rows(`rolling-continuity:${id}:`)).map((row) => row.key);
+    const allCards = []; for (const key of keys) allCards.push(...((yield* meta(db, key, { cards: [] }))?.cards || []));
+    const cards = allCards.filter((card) => rollingCardActive(card, at)).sort((a, b) => String(b.lastSeen).localeCompare(String(a.lastSeen))).slice(0, limit === null ? undefined : Math.max(1, Math.min(500, Number(limit) || 100)));
+    return { ok: true, agentId: id, scope: text(scope) || null, cards };
+  } finally { db.close(); }
+}
+
+function* tiddleHistoryOperation({ agentId, cardId = null, since = null, limit = 100, stores = null } = {}) {
+  const id = text(agentId);
+  if (!id) throw new Error('tiddle_agent_required');
+  const db = tiddlePersistence({ stores });
+  try {
+    const entries = ((yield* meta(db, historyKey(id), { entries: [] }))?.entries || []).filter((entry) => (!text(cardId) || entry.cardId === text(cardId)) && (!text(since) || entry.at >= text(since))).slice(0, limit === null ? undefined : Math.max(1, Math.min(500, Number(limit) || 100)));
+    return { ok: true, agentId: id, cardId: text(cardId) || null, entries };
+  } finally { db.close(); }
+}
+
+function* tiddleStatusOperation({ agentId, stores = null, limit = 10 } = {}) {
+  const id = text(agentId);
+  const db = tiddlePersistence({ stores });
+  try {
+    const state = id ? (yield* meta(db, passKey(id), null)) : null;
+    const rows = (yield () => db.rows({ agentId: id || null, kind: 'tiddle-pass-receipt' })).slice(0, Math.max(1, Math.min(100, Number(limit) || 10)));
+    const selection = yield () => readCuratorSelection({ stores, root: curatorRoot() });
+    return { ok: true, agentId: id || null, cadenceHours: 4, lookbackHours: 24, cardTtlDays: yield () => db.rollingTtlDays(), temperature: selection?.temperature ?? 0, state, receipts: rows.map((row) => parse(row.value_json, {})) };
+  } finally { db.close(); }
+}
+
+function* listDueTiddlePassesOperation({ stores = null, at = iso() } = {}) {
+  if (!stores?.agents) throw new Error('tiddle_agent_store_required');
+  const agents = stores.agents;
+  const db = tiddlePersistence({ stores });
+  try { const ids = new Set(yield () => db.dueIds(at)); return (yield () => agents.list({ includeDisabled: false })).filter(agent => ids.has(agent.id)); }
+  finally { db.close(); if (!stores?.agents) agents.close(); }
+}
+
+export function createTiddleScheduler({ stores = null, intervalMs = 60_000, clock = iso, runtimeRoot = null } = {}) {
+  const lifecycle = createBackgroundLifecycle({ name: 'tiddle_scheduler', clock });
+  let timer = null; let ticking = false;
+  function tick() { return lifecycle.stopped ? Promise.resolve([]) : lifecycle.track(runTick); }
+  async function runTick() {
+    if (ticking || lifecycle.stopped) return [];
+    ticking = true;
+    try {
+      const at = clock();
+      const due = await listDueTiddlePasses({ stores, at });
+      // Await the batch so the reentrancy guard remains held through synthesis.
+      return await Promise.all(due.map(agent => lifecycle.track(async () => {
+        if (lifecycle.stopped) return null;
+        const options = { agentId: agent.id, stores, runtimeRoot, at, scheduled: true, signal: lifecycle.signal };
+        const pass = await runTiddlePass(options);
+        if (pass.ok === false) lifecycle.reportFailure(new Error(pass.error || 'tiddle_pass_failed'), 'pass');
+        if (lifecycle.stopped || pass.disposition === 'occurrence_busy') return pass;
+        const db = tiddlePersistence({ stores });
+        let last;
+        try { last = (await runAsync(meta(db, synthesisKey(agent.id), {})))?.lastSuccessAt; }
+        finally { db.close(); }
+        const nightly = !last || new Date(last).toISOString().slice(0, 10) !== new Date(at).toISOString().slice(0, 10);
+        if (nightly && !lifecycle.stopped) {
+          const synthesis = await runTiddleSynthesis(options);
+          if (synthesis.ok === false) lifecycle.reportFailure(new Error(synthesis.error || 'tiddle_synthesis_failed'), 'synthesis');
+        }
+        return pass;
+      }, 'pass')));
+    } finally { ticking = false; }
+  }
+  function start() { if (lifecycle.stopped) return Promise.resolve([]); if (!timer) { timer = setInterval(() => { void tick().catch(() => {}); }, intervalMs); timer.unref?.(); } return tick(); }
+  function stop() { lifecycle.stop(); if (timer) clearInterval(timer); timer = null; }
+  function close() { stop(); return lifecycle.close(); }
+  return { start, stop, close, tick, health: lifecycle.health };
+}
+
+export function appendTiddleResidue(options = {}) { return appendTiddleResidueAsync(options); }
+
+export function listTiddleCards(options = {}) { return runAsync(listTiddleCardsOperation(options)); }
+
+export function tiddleHistory(options = {}) { return runAsync(tiddleHistoryOperation(options)); }
+
+export function tiddleStatus(options = {}) { return runAsync(tiddleStatusOperation(options)); }
+
+export function listDueTiddlePasses(options = {}) { return runAsync(listDueTiddlePassesOperation(options)); }
+
+export function runTiddlePass(options = {}) {
+  const at = options.at || iso();
+  return withTiddleOccurrence({ stores: options.stores, agentId: text(options.agentId), kind: 'pass', at, scheduled: options.scheduled === true,
+    signal: options.signal, operation: (assertOwner, ownerClient) => runTiddlePassOwned({ ...options, at, assertOwner, ownerClient }) });
+}
+
+export function runTiddleSynthesis(options = {}) {
+  const at = options.at || iso();
+  return withTiddleOccurrence({ stores: options.stores, agentId: text(options.agentId), kind: 'synthesis', at, scheduled: options.scheduled === true,
+    signal: options.signal, operation: (assertOwner, ownerClient) => runTiddleSynthesisOwned({ ...options, at, assertOwner, ownerClient }) });
+}

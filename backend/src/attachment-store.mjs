@@ -1,0 +1,211 @@
+import { constants as fsConstants, promises as fs } from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { validateArtifactRoot } from './artifact-root-validation.mjs';
+
+export const ATTACHMENT_RETENTION_DAYS = 30;
+export const MODEL_VISIBLE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const MAX_NAME_LENGTH = 160;
+
+function text(value) { return String(value ?? '').trim(); }
+function safeName(value, fallback = 'attachment') {
+  const base = path.basename(text(value) || fallback).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, MAX_NAME_LENGTH);
+  return base || fallback;
+}
+function dataBytes(content) {
+  const value = String(content || '');
+  if (!value.startsWith('data:')) return Buffer.from(value, 'utf8');
+  const comma = value.indexOf(',');
+  if (comma < 0) return Buffer.from(value, 'utf8');
+  const header = value.slice(0, comma).toLowerCase();
+  const payload = value.slice(comma + 1);
+  return header.includes(';base64') ? Buffer.from(payload, 'base64') : Buffer.from(decodeURIComponent(payload), 'utf8');
+}
+function attachmentRoot(agentWorkspaceRoot) { return path.resolve(agentWorkspaceRoot, 'artifacts', 'attachments'); }
+function contained(root, candidate) { const relative = path.relative(root, candidate); return relative && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative); }
+async function resolveRegularFileWithoutSymlinks(root, filePath) {
+  if (!await validateArtifactRoot(root, attachmentRoot(root))) return null;
+  const parts = path.relative(root, filePath).split(path.sep);
+  let current = root;
+  try {
+    for (let index = 0; index < parts.length; index += 1) {
+      current = path.join(current, parts[index]);
+      const stat = await fs.lstat(current);
+      if (stat.isSymbolicLink()) return null;
+      if (index < parts.length - 1 && !stat.isDirectory()) return null;
+      if (index === parts.length - 1) return stat.isFile() ? { filePath, stat } : null;
+    }
+  } catch (error) {
+    if (['ENOENT', 'ENOTDIR', 'ELOOP'].includes(error?.code)) return null;
+    throw error;
+  }
+  return null;
+}
+
+export async function listSessionAttachments({ agentWorkspaceRoot, sessionTurns = [], sessionId = null, limit = 200 } = {}) {
+  if (!agentWorkspaceRoot) throw new Error('attachment_workspace_required');
+  const root = path.resolve(agentWorkspaceRoot);
+  const seen = new Set();
+  const attachments = [];
+  for (const turn of sessionTurns) for (const item of turn?.metadata?.attachments || []) {
+    const artifactPath = text(item?.artifactPath);
+    if (!artifactPath || seen.has(artifactPath)) continue;
+    const filePath = path.resolve(root, artifactPath);
+    if (!contained(root, filePath) || !filePath.startsWith(`${attachmentRoot(root)}${path.sep}`)) continue;
+    seen.add(artifactPath);
+    const resolved = await resolveRegularFileWithoutSymlinks(root, filePath);
+    if (!resolved) continue;
+    const { stat } = resolved;
+    attachments.push({ id: artifactPath, name: safeName(item.name), type: text(item.type || item.mimeType) || 'application/octet-stream', size: stat.size, storedAt: item.storedAt || stat.mtime.toISOString(), sessionId: sessionId || turn.sessionId || null, artifactPath });
+  }
+  return attachments.slice(-Math.max(1, Math.min(Number(limit) || 200, 500)));
+}
+
+export async function resolveAttachmentArtifact({ agentWorkspaceRoot, artifactPath } = {}) {
+  if (!agentWorkspaceRoot || !artifactPath) return null;
+  const root = path.resolve(agentWorkspaceRoot);
+  const filePath = path.resolve(root, String(artifactPath));
+  if (!contained(root, filePath) || !filePath.startsWith(`${attachmentRoot(root)}${path.sep}`)) return null;
+  return resolveRegularFileWithoutSymlinks(root, filePath);
+}
+
+function mimeFromAttachment(attachment = {}, filePath = '') {
+  const explicit = text(attachment.type || attachment.mimeType);
+  if (explicit) return explicit;
+  const ext = path.extname(filePath || attachment.name || '').toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.svg') return 'image/svg+xml';
+  if (ext === '.txt' || ext === '.md') return 'text/plain';
+  if (ext === '.json') return 'application/json';
+  return 'application/octet-stream';
+}
+
+// Read at most the configured budget even if a file grows after resolution.
+async function boundedAttachmentBytes(filePath, limit) {
+  const budget = Number.isSafeInteger(limit) && limit >= 0 ? limit : 0;
+  const handle = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > budget) return null;
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    return bytes.subarray(0, offset);
+  } finally { await handle.close(); }
+}
+
+export async function readAttachmentArtifact({ agentWorkspaceRoot, artifactPath, attachment = {}, maxTextBytes = 256 * 1024, maxImageBytes = 20 * 1024 * 1024 } = {}) {
+  const resolved = await resolveAttachmentArtifact({ agentWorkspaceRoot, artifactPath });
+  if (!resolved) return null;
+  const type = mimeFromAttachment(attachment, resolved.filePath);
+  const base = {
+    id: String(artifactPath),
+    artifactPath: String(artifactPath),
+    name: safeName(attachment.name || path.basename(resolved.filePath)),
+    type,
+    size: resolved.stat.size,
+    storedAt: attachment.storedAt || resolved.stat.mtime.toISOString(),
+  };
+  if (type.toLowerCase().startsWith('image/')) {
+    const normalizedType = type.toLowerCase();
+    if (MODEL_VISIBLE_IMAGE_TYPES.has(normalizedType)) {
+      const bytes = await boundedAttachmentBytes(resolved.filePath, maxImageBytes);
+      if (!bytes) return { ...base, kind: 'binary', unsupportedReason: 'attachment_too_large' };
+      return { ...base, type: normalizedType, kind: 'image', dataUrl: `data:${normalizedType};base64,${bytes.toString('base64')}` };
+    }
+    return { ...base, kind: 'binary', unsupportedReason: 'image_type_not_model_visible', supportedImageTypes: [...MODEL_VISIBLE_IMAGE_TYPES] };
+  }
+  if (/^(text\/|application\/(json|xml|javascript)|application\/x-ndjson)/i.test(type) && resolved.stat.size <= maxTextBytes) {
+    const bytes = await boundedAttachmentBytes(resolved.filePath, maxTextBytes);
+    if (bytes) return { ...base, kind: 'text', text: bytes.toString('utf8') };
+  }
+  return { ...base, kind: 'binary' };
+}
+
+export async function deleteAttachmentArtifact({ agentWorkspaceRoot, artifactPath } = {}) {
+  const resolved = await resolveAttachmentArtifact({ agentWorkspaceRoot, artifactPath });
+  if (!resolved) return { ok: false, error: 'attachment_not_found' };
+  await fs.rm(resolved.filePath, { force: true });
+  return { ok: true, artifactPath };
+}
+
+export async function cleanupExpiredAttachments({ agentWorkspaceRoot, now = new Date(), retentionDays = ATTACHMENT_RETENTION_DAYS } = {}) {
+  if (!agentWorkspaceRoot) throw new Error('attachment_workspace_required');
+  const root = attachmentRoot(agentWorkspaceRoot);
+  if (!await validateArtifactRoot(agentWorkspaceRoot, root, { missing: true })) throw new Error('attachment_root_invalid');
+  if (retentionDays === null) return { root, deleted: [] };
+  const cutoff = new Date(now).getTime() - Number(retentionDays) * 86400000;
+  let entries = [];
+  try { entries = await fs.readdir(root, { withFileTypes: true }); } catch (error) { if (error?.code === 'ENOENT') return { root, deleted: [] }; throw error; }
+  const deleted = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || entry.isSymbolicLink()) continue;
+    const filePath = path.join(root, entry.name);
+    const stat = await fs.lstat(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) continue;
+    if (stat.mtimeMs > cutoff) continue;
+    await fs.rm(filePath, { force: true });
+    deleted.push(path.relative(agentWorkspaceRoot, filePath));
+  }
+  return { root, deleted };
+}
+
+/** Persist current-turn attachment bytes into the owning agent's artifact workspace. */
+export async function cleanupAgentAttachments({ agentStore = null, resolveAgentWorkspaceRoot, retentionDays = ATTACHMENT_RETENTION_DAYS, now = new Date() } = {}) {
+  if (typeof resolveAgentWorkspaceRoot !== 'function') throw new Error('attachment_workspace_resolver_required');
+  if (!agentStore) throw new Error('postgres_required');
+  const agents = agentStore;
+  const results = await Promise.all((await agents.list({ includeDisabled: true })).map(async (agent) => {
+    const agentWorkspaceRoot = await resolveAgentWorkspaceRoot(agent.id);
+    if (!agentWorkspaceRoot) return { agentId: agent.id, deleted: [], skipped: true };
+    const result = await cleanupExpiredAttachments({ agentWorkspaceRoot, now, retentionDays });
+    return { agentId: agent.id, deleted: result.deleted, skipped: false };
+  }));
+  return { ok: true, retentionDays, agents: results, deleted: results.flatMap((result) => result.deleted.map((artifactPath) => ({ agentId: result.agentId, artifactPath }))) };
+}
+
+export function createAttachmentCleanupScheduler({ agentStore = null, resolveAgentWorkspaceRoot, intervalMs = 24 * 60 * 60 * 1_000, clock = () => new Date() } = {}) {
+  let timer = null;
+  const tick = () => cleanupAgentAttachments({ agentStore, resolveAgentWorkspaceRoot, now: clock() });
+  return {
+    start() { if (!timer) { timer = setInterval(() => { void tick(); }, intervalMs); timer.unref?.(); } return tick(); },
+    stop() { if (timer) clearInterval(timer); timer = null; },
+    tick,
+  };
+}
+
+export async function persistChatAttachments({ agentWorkspaceRoot, attachments = [], retentionDays = ATTACHMENT_RETENTION_DAYS, now = new Date() } = {}) {
+  if (!Array.isArray(attachments) || !attachments.length) return [];
+  if (!agentWorkspaceRoot) throw new Error('attachment_workspace_required');
+  const root = attachmentRoot(agentWorkspaceRoot);
+  if (!await validateArtifactRoot(agentWorkspaceRoot, root, { missing: true })) throw new Error('attachment_root_invalid');
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  if (!await validateArtifactRoot(agentWorkspaceRoot, root)) throw new Error('attachment_root_invalid');
+  await cleanupExpiredAttachments({ agentWorkspaceRoot, now, retentionDays });
+  const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+  const persisted = [];
+  for (let index = 0; index < attachments.length; index += 1) {
+    const attachment = attachments[index] || {};
+    if (!String(attachment.content || '')) continue;
+    const filename = `${stamp}-${randomUUID()}-${index + 1}-${safeName(attachment.name)}`;
+    const filePath = path.resolve(root, filename);
+    if (!contained(root, filePath)) throw new Error('attachment_path_invalid');
+    const bytes = dataBytes(attachment.content);
+    const handle = await fs.open(filePath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    try { await handle.writeFile(bytes); } finally { await handle.close(); }
+    persisted.push({
+      ...attachment,
+      artifactPath: path.relative(agentWorkspaceRoot, filePath),
+      storedAt: new Date(now).toISOString(),
+      size: bytes.length,
+    });
+  }
+  return persisted;
+}

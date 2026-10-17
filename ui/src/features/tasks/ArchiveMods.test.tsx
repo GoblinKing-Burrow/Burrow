@@ -1,0 +1,23 @@
+import { archiveRepository } from './archiveRepository';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, expect, it, vi } from 'vitest';
+import { Archive } from './ArchivePage';
+import { loadModArchives, modsChangedEvent } from '../../app/modPanels';
+vi.mock('../../app/modPanels', () => ({ loadModArchives: vi.fn(), modsChangedEvent: 'burrow:mods-changed' }));
+vi.mock('../mods/ModArchiveHost', () => ({ ModArchiveHost: ({ date }: { date: string }) => <div data-testid="mod-date">{date || 'all dates'}</div> }));
+const emptyPage = { items: [], nextCursor: null, hasMore: false };
+vi.mock('./archiveRepository', () => ({ archiveRepository: { listContinuityCards: async () => emptyPage, listCalendarAvailability: async (kind: 'sessions' | 'dreams', month: string) => ({ ok: true as const, kind, month, dates: [] }), listDreams: async () => emptyPage, listSessions: async () => emptyPage } }));
+afterEach(() => { cleanup(); vi.clearAllMocks(); });
+it('discovers Archive contributions, passes calendar date and removes disabled destinations', async () => {
+  vi.mocked(loadModArchives).mockResolvedValue([{ modId: 'fixture', name: 'Fixture archive', archiveUrl: '/api/mods/fixture/ui/archive.js' }]);
+  render(<Archive repository={archiveRepository} agents={[]} />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Fixture archive' }));
+  expect(screen.getByTestId('mod-date').textContent).toBe('all dates');
+  fireEvent.click(screen.getByRole('button', { name: 'Next month' }));
+  const day = screen.getAllByRole('button').find(button => /^Select \d{4}-\d{2}-01$/.test(button.getAttribute('aria-label') || ''))!;
+  fireEvent.click(day); expect(screen.getByTestId('mod-date').textContent).toBe(day.getAttribute('aria-label')?.replace('Select ', ''));
+  fireEvent.click(screen.getByRole('button', { name: 'All dates' })); expect(screen.getByTestId('mod-date').textContent).toBe('all dates');
+  vi.mocked(loadModArchives).mockResolvedValue([]); window.dispatchEvent(new Event(modsChangedEvent));
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Fixture archive' })).toBeNull());
+  expect(screen.queryByTestId('mod-date')).toBeNull();
+});
