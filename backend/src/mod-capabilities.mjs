@@ -68,7 +68,7 @@ function summarizedRun(run) {
 }
 
 // Only this core-side service has access to PostgreSQL secrets and provider credentials.
-export function createModCapabilities({ resolveAgentRuntime, resolveAgentWorkspaceRoot, fetchImpl = fetch, ownerModId, scheduledJobScheduler = null, stores = null } = {}) {
+export function createModCapabilities({ resolveAgentRuntime, resolveAgentWorkspaceRoot, fetchImpl = fetch, ownerModId, scheduledJobScheduler = null, stores = null, modStore = null, runtimeDiagnostics = null, modManagement = null, modAuthority = null } = {}) {
   if (typeof resolveAgentRuntime !== 'function') throw new Error('mod_agent_resolver_required');
   const injected = stores || {};
   for (const key of ['agents','models','scheduledJobs','conversations']) if (!injected[key]) throw new Error(`mod_${key}_store_required`);
@@ -76,6 +76,24 @@ export function createModCapabilities({ resolveAgentRuntime, resolveAgentWorkspa
   const withJobs = (fn) => withStore('scheduledJobs', fn);
   const conversationStore = injected.conversations;
   const schedulerOwner = () => { if (typeof ownerModId !== 'string' || !ownerModId) throw new Error('mod_scheduler_owner_unavailable'); return ownerModId; };
+  async function readRuntimeDiagnostics(input, { caller, signal } = {}) {
+    if (!runtimeDiagnostics?.read || !modAuthority || !caller?.agentId) throw new Error('mod_diagnostic_caller_required');
+    const value = plain(input);
+    const global = await modAuthority.allowed(ownerModId, 'diagnostics-global', caller.agentId);
+    try {
+      return await runtimeDiagnostics.read(value, { caller: Object.freeze({ agentId: caller.agentId, sessionId: caller.sessionId || 'default', conversationId: caller.conversationId || null, runId: caller.runId || null }), global, signal });
+    } catch (error) {
+      if (!global && ['diagnostic_scope_forbidden', 'diagnostic_global_scope_required'].includes(error?.message)) await modAuthority.deny(ownerModId, 'diagnostics-global', caller.agentId);
+      throw error;
+    }
+  }
+  async function manage(method, input, { caller, assertCallerActive, waitForCaller } = {}) {
+    if (!modManagement || !modAuthority || !caller?.agentId || typeof assertCallerActive !== 'function') throw new Error('mod_management_caller_required');
+    assertCallerActive();
+    await modAuthority.assertAllowed(ownerModId, 'mod-management-v1', caller.agentId);
+    assertCallerActive();
+    return modManagement[method](input, { ownerModId, caller: Object.freeze({ agentId: caller.agentId, sessionId: caller.sessionId || null, conversationId: caller.conversationId || null, runId: caller.runId || null }), waitForCaller, assertCallerActive });
+  }
   const ownedJob = (store, jobId) => store.getOwnedJob(schedulerOwner(), bounded(jobId, 96));
   function page(input = {}, max = 100) { const value = plain(input); const limit = count(value.limit, 50, max); let offset = 0; if (value.cursor !== undefined && value.cursor !== null) { let cursor; try { cursor = JSON.parse(Buffer.from(bounded(value.cursor, 512), 'base64url').toString('utf8')); } catch { invalid(); } if (cursor?.ownerModId !== schedulerOwner() || !Number.isSafeInteger(cursor.offset) || cursor.offset < 1) invalid(); offset = cursor.offset; } return { value, limit, offset }; }
   const cursor = (offset) => Buffer.from(JSON.stringify({ ownerModId: schedulerOwner(), offset })).toString('base64url');
@@ -108,6 +126,10 @@ export function createModCapabilities({ resolveAgentRuntime, resolveAgentWorkspa
   const dispose = () => { disposed = true; for (const item of inventories.values()) clearTimeout(item.timer); inventories.clear(); };
   return Object.freeze({
     dispose,
+    readRuntimeDiagnostics,
+    managementInventory: (input, options) => manage('inventory', input, options),
+    managementSubmit: (input, options) => manage('submit', input, options),
+    managementOperation: (input, options) => manage('operation', input, options),
     async getOperatorTimezone() { return { timezone: await injected.scheduledJobs.effective(null) }; },
     async listScheduledJobs(input) {
       const { value, limit, offset } = page(input);

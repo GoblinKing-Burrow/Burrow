@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createModAuthority, createModAuthorityRoute } from '../src/mod-authority.mjs';
 import { createProviderUsageService } from '../src/provider-usage-service.mjs';
 import { createBackgroundLifecycle, createCoordinatedShutdown } from '../src/background-lifecycle.mjs';
 import { SkillGitSync } from '../src/skill-git-sync.mjs';
@@ -23,6 +24,8 @@ import { publishModTools } from '../src/mod-agent-tools.mjs';
 import { diagnosticMods, modJobs, pendingModOperations } from '../src/mod-diagnostics.mjs';
 import { forgeDiagnosticJobs, forgeDiagnosticJob, postgresDiagnostic } from '../src/forge-diagnostic-summary.mjs';
 import { brainDiagnosticSummary, brainDiagnosticMemories, brainDiagnosticEmbeddingJobs } from '../src/brain-diagnostic-summary.mjs';
+import { runtimeDiagnosticSessionSummaries } from '../src/runtime-diagnostic-sessions.mjs';
+import { runtimeDiagnosticSessionDetail, runtimeDiagnosticContextSummary, runtimeDiagnosticActiveRuns, runtimeDiagnosticTraces } from '../src/runtime-diagnostic-details.mjs';
 import { releaseVersion } from '../src/release-version.mjs';
 import { createServer } from 'node:http';
 import { promises as fs } from 'node:fs';
@@ -49,7 +52,7 @@ import { planRetentionCleanup, runRetentionCleanup } from '../src/retention.mjs'
 import { normalizeRetentionPolicy, readRetentionPolicy, readRetentionPolicyState, retentionPolicyFailureState, retentionPolicySuccessState, saveRetentionPolicy, writeRetentionPolicyState } from '../src/retention-settings.mjs';
 import { createRetentionScheduler } from '../src/retention-scheduler.mjs';
 import { createInstallStagingCleanupScheduler } from '../src/install-staging-cleanup.mjs';
-import { authorityExplanationFromTraceSummary, latestAuthorityExplanationForSession, listAuthorityExplanationsForSession, summarizeTrace } from '../src/trace-summary.mjs';
+import { authorityExplanationFromTraceSummary, latestAuthorityExplanationForSession, listAuthorityExplanationsForSession, summarizeTrace, validTraceRunId } from '../src/trace-summary.mjs';
 import { routeRequest } from '../src/request-router.mjs';
 import { planTurn } from '../src/turn-planner.mjs';
 import { workbenchWorkflow } from '../src/workbench-workflow.mjs';
@@ -101,6 +104,7 @@ import { createScheduledChannelRoutes } from './ui/scheduled-channel-routes.mjs'
 import { createAuthRoutes } from './ui/auth-routes.mjs';
 import { createChatRoutes } from './ui/chat-routes.mjs';
 import { cleanupMods, createModRoute, loadMods } from '../src/mod-runtime.mjs';
+import { createModManagement } from '../src/mod-management.mjs';
 import { createModDistribution, createModManagementRoute } from '../src/mod-distribution.mjs';
 import { MAX_OVERVIEW_CHILD_CONTEXTS, normalizeOverviewBody, overviewSessionIds } from '../src/agent-overview.mjs';
 
@@ -178,10 +182,7 @@ const postgresApplication = await createPostgresApplication({
 const { anthropicOauthUsage, openaiOauthUsage } = createProviderUsageService({ modelLookup: modelsStore, authSecretToken, fetchImpl: globalThis.fetch, clock: Date.now, openaiUsageUrl: OPENAI_OAUTH_USAGE_URL });
 configureMcpProviderStateStore(postgresApplication.stores.mcpProviderStates);
 await hydrateMcpProviderStates({ runtimeRoot: process.env.BURROW_MCPORTER_ROOT || path.join(runtimeRoot, 'integrations', 'mcporter') }).catch((error) => serverLogger.event('mcp_provider_state_hydration_failed', { error: String(error?.message || error) }));
-const runtimeMetrics = createRuntimeMetricsCollector({
-  runtimeRoot: process.env.BURROW_DATA_ROOT || '/mnt/local/burrow',
-
-});
+const runtimeMetrics = createRuntimeMetricsCollector({ runtimeRoot });
 
 function profilesStore() { return postgresApplication.stores.profiles; }
 function dreamDiaryStore() { return postgresApplication.stores.dreamDiary; }
@@ -2861,7 +2862,80 @@ const scheduledChannelRoute = createScheduledChannelRoutes({ readJsonBody, sendJ
 const authRoute = createAuthRoutes({ runtimeConfig, oidcLoginUrl, setOidcStateCookie, completeOidcCallback, sendOidcSessionCookie, clearOidcCookies, oidcCookieClearHeader, oidcSessionFromRequest, sendJson });
 const chatRoute = createChatRoutes({ handleChat, readJsonBody, sendJson, selectedAgentRuntime, cancelChatRun, steerChatRun, listChatSteering });
 const modsRuntimeRoot = process.env.BURROW_RUNTIME_ROOT || process.env.BURROW_DATA_ROOT || '/mnt/local/burrow';
-const modLoadOptions = { stores: postgresApplication.stores, modStoreFactory: postgresApplication.modStoreFactory, enabledModIds: postgresApplication.enabledModIds, modCatalogWriter: postgresApplication.modCatalogWriter, runtimeRoot: modsRuntimeRoot, executionProviders, resolveAgentRuntime, scheduledJobScheduler: scheduler(), resolveAgentWorkspaceRoot: async (id) => {
+const modAuthority = createModAuthority({ repositoryFactory: postgresApplication.modDistributionRepositoryFactory });
+await modAuthority.ready;
+const runtimeDiagnostics = Object.freeze({
+  async read(input = {}, { caller, global = false } = {}) {
+    const operation = String(input.operation || '');
+    const callerAgentId = String(caller?.agentId || '').trim();
+    if (!callerAgentId) throw Object.assign(new Error('diagnostic_caller_required'), { statusCode: 403 });
+    const targetAgentId = (requested = null) => {
+      const target = String(requested || callerAgentId).trim();
+      if (!target || (!global && target !== callerAgentId)) throw Object.assign(new Error('diagnostic_scope_forbidden'), { statusCode: 403 });
+      return target;
+    };
+    const agentRuntime = async (requested = null) => resolveAgentRuntime(targetAgentId(requested));
+    const requireGlobal = () => { if (!global) throw Object.assign(new Error('diagnostic_global_scope_required'), { statusCode: 403 }); };
+    const sessionId = () => String(input.sessionId || caller.sessionId || 'default');
+    if (operation === 'health') return { ok: true, runtime: 'burrow', version: releaseVersion, buildIdentity: healthBuildIdentity, ...(healthReleaseProvenance ? { releaseProvenance: healthReleaseProvenance } : {}) };
+    if (operation === 'runtime-status') {
+      const status = await runtimeStatus(targetAgentId(input.agentId));
+      if (!status.ok) return status;
+      return { ok: true, runtime: status.runtime, version: status.version, ui: status.ui, memory: status.memory, model: status.model, policy: status.policy, retention: status.retention, traces: status.traces };
+    }
+    if (operation === 'metrics') return runtimeMetrics();
+    if (operation === 'inventory') {
+      const modInventory = await modDistribution.list();
+      const installed = modInventory.mods.filter((mod) => mod.status === 'installed');
+      return { ok: true, inventory: { mcp: { configured: (await mcpStore().list()).length }, mods: { installed: installed.length, enabled: installed.filter((mod) => mod.enabled === true).length } } };
+    }
+    if (operation === 'postgres-status') return postgresDiagnostic(postgresApplication.pool);
+    if (operation === 'brains-status') return brainDiagnosticSummary(postgresApplication.pool, { agentId: targetAgentId(input.agentId) });
+    if (operation === 'brain-memories') return brainDiagnosticMemories(postgresApplication.pool, { agentId: targetAgentId(input.agentId), limit: input.limit, cursor: input.cursor });
+    if (operation === 'brain-embedding-jobs') return brainDiagnosticEmbeddingJobs(postgresApplication.pool, { agentId: targetAgentId(input.agentId), limit: input.limit, cursor: input.cursor });
+    if (operation === 'forge-jobs') { requireGlobal(); return forgeDiagnosticJobs(postgresApplication.pool, { limit: input.limit, cursor: input.cursor }); }
+    if (operation === 'forge-job') { requireGlobal(); return forgeDiagnosticJob(postgresApplication.pool, input.jobId); }
+    if (operation === 'mods') return { ok: true, mods: diagnosticMods(loadedMods) };
+    if (operation === 'mod-jobs') { requireGlobal(); return { ok: true, ...await modJobs(loadedMods, input.modId, { limit: input.limit, cursor: input.cursor }) }; }
+    if (operation === 'mod-job') { requireGlobal(); return { ok: true, ...await modJobs(loadedMods, input.modId, { jobId: input.jobId }) }; }
+    if (operation === 'mod-pending') { requireGlobal(); return { ok: true, ...pendingModOperations(loadedMods, input.modId) }; }
+    if (operation === 'agents') return { ok: true, agents: await agentsStore().list({ includeDisabled: input.includeDisabled !== false }) };
+    if (operation === 'agent-status') { const runtime = await agentRuntime(input.agentId); return { ok: true, ...(await agentStatusForSession(sessionId(), runtime)) }; }
+    if (operation === 'sessions') {
+      const runtime = await agentRuntime(input.agentId);
+      const sessions = await listSessions({ rootDir: runtime.agentWorkspaceRoot, agentId: runtime.agentId, includeArchived: input.archived === true, limit: input.limit });
+      return { ok: true, sessions: runtimeDiagnosticSessionSummaries(sessions) };
+    }
+    if (operation === 'session') { const runtime = await agentRuntime(input.agentId); const value = await runtimeDiagnosticSessionDetail(postgresApplication.stores.conversations, { agentId: runtime.agentId, sessionId: sessionId(), limit: input.limit, maxContentChars: input.maxContentChars }); return value ? { ok: true, session: value } : { ok: false, error: 'not_found' }; }
+    if (operation === 'active-runs') return { ok: true, ...runtimeDiagnosticActiveRuns(await currentActiveChatRunSummaries({ agentId: targetAgentId(input.agentId), sessionId: input.sessionId || null })) };
+    if (operation === 'traces') { const runtime = await agentRuntime(input.agentId); const config = await runtimeConfig(runtime.agentId); return { ok: true, ...await runtimeDiagnosticTraces({ traceRoot: runtimeTraceRoot(config, sessionId(), runtime.agentId), agentId: runtime.agentId, sessionId: sessionId(), limit: input.limit, cursor: input.cursor }) }; }
+    if (operation === 'trace' || operation === 'trace-authority') {
+      const runtime = await agentRuntime(input.agentId); const runId = String(input.runId || '');
+      if (!validTraceRunId(runId)) throw Object.assign(new Error('trace_run_id_invalid'), { statusCode: 400 });
+      const config = await runtimeConfig(runtime.agentId);
+      const trace = await summarizeTrace({ conversationStore: postgresApplication.stores.conversations, agentId: runtime.agentId, rootDir: await traceRootForRun({ rootDir: runtime.agentWorkspaceRoot, sessionId: sessionId(), runId, runtime: config, agentId: runtime.agentId }), runId, includeToolOutput: operation === 'trace' && input.includeToolOutput === true });
+      return operation === 'trace' ? { ok: true, trace } : { ok: true, runId, authority: authorityExplanationFromTraceSummary(trace) };
+    }
+    if (operation === 'run-proofs') { const runtime = await agentRuntime(input.agentId); return { ok: true, ...(await archiveRuns({ agentRuntime: runtime, sessionId: input.sessionId || null, limit: input.limit || 100, cursor: input.cursor })) }; }
+    if (operation === 'run-proof') { const runtime = await agentRuntime(input.agentId); const run = await archiveRunDetail({ agentRuntime: runtime, runId: String(input.runId || '') }); return run ? { ok: true, run } : { ok: false, error: 'archive_run_not_found' }; }
+    if (operation === 'session-context' || operation === 'context-status') {
+      const runtime = await agentRuntime(input.agentId); const config = await runtimeConfig(runtime.agentId); const sid = sessionId();
+      const limits = activeConversationLimits({ modelConfig: config.modelConfig, contextConfig: config.contextConfig });
+      const active = [...activeChatRuns.values()].find((run) => run.agentId === runtime.agentId && run.sessionId === sid && !run.controller.signal.aborted) || null;
+      const status = runtimeDiagnosticContextSummary(await inspectSessionContextStatus({ conversationStore: postgresApplication.stores.conversations, agentId: runtime.agentId, rootDir: projectRoot, dataRoot: runtime.agentWorkspaceRoot, sessionId: sid, limits, contextConfig: config.contextConfig, contextWindow: config.modelConfig?.contextWindow, contextTokens: config.modelConfig?.contextTokens, liveContext: active?.contextUsage || null }));
+      return operation === 'session-context' ? { ok: true, context: status } : { ok: true, status };
+    }
+    throw Object.assign(new Error('diagnostic_operation_invalid'), { statusCode: 400 });
+  },
+});
+// Stable Core facade survives all requesting mod host replacements. Activation
+// cannot call it: management requires an active trusted tool invocation.
+let coreModManagement = null;
+const modManagementCapability = Object.freeze(Object.fromEntries(['inventory', 'submit', 'operation'].map(method => [method, (...args) => {
+  if (!coreModManagement) throw new Error('mod_management_unavailable');
+  return coreModManagement[method](...args);
+}])));
+const modLoadOptions = { modAuthority, modManagement: modManagementCapability, stores: postgresApplication.stores, modStoreFactory: postgresApplication.modStoreFactory, enabledModIds: postgresApplication.enabledModIds, modCatalogWriter: postgresApplication.modCatalogWriter, runtimeRoot: modsRuntimeRoot, executionProviders, resolveAgentRuntime, scheduledJobScheduler: scheduler(), runtimeDiagnostics, resolveAgentWorkspaceRoot: async (id) => {
   const agent = await agentsStore().get(id);
   if (!agent) throw new Error('agent_not_found');
   return agentRuntimeContext({ runtimeState: (await runtimeConfig()).runtimeState, agent }).agentWorkspaceRoot;
@@ -2923,6 +2997,9 @@ const modDistribution = createModDistribution({
 // callback above is self-contained and does not call back into the distribution,
 // so this readiness barrier cannot form a lifecycle/distribution cycle.
 await modDistribution.ready;
+coreModManagement = createModManagement({ modAuthority, distribution: modDistribution, repositoryFactory: postgresApplication.modDistributionRepositoryFactory });
+await coreModManagement.ready;
+const modAuthorityRoute = createModAuthorityRoute({ authority: modAuthority, getMods: () => loadedMods, readJsonBody, sendJson });
 const modManagementRoute = createModManagementRoute({ distribution: modDistribution, readJsonBody, sendJson });
 
 const server = createServer((req, res) => {
@@ -3028,6 +3105,7 @@ async function handleRequest(req, res) {
         return sendJson(res, token ? 200 : 404, token ? { ok: true, token } : { ok: false, error: 'api_token_not_found' });
       } finally { await store.close?.(); }
     }
+    if (await modAuthorityRoute({ req, res, url })) return;
     if (await modManagementRoute({ req, res, url })) return;
     if (await modRoute({ req, res, url })) return;
     if (await exportRoute({ req, res, url })) return;
@@ -3109,7 +3187,12 @@ function closeOnlyProducer(resource) {
   return { stop() { closing ||= Promise.resolve().then(() => resource.close()); closing.catch(() => {}); }, close() { this.stop(); return closing; } };
 }
 const skillSyncProducer = closeOnlyProducer(skillGitSync);
-const modDistributionProducer = closeOnlyProducer(modDistribution);
+const modDistributionProducer = closeOnlyProducer({ async close() {
+  // Drain durable work while hosts and PostgreSQL remain alive. Host teardown
+  // must not cancel a submitted operation, including manager self-updates.
+  try { await coreModManagement.close(); }
+  finally { await modDistribution.close(); }
+} });
 const closeRuntimeResources = createCoordinatedShutdown({
   drainMs: SHUTDOWN_DRAIN_MS,
   stopAdmission: () => {

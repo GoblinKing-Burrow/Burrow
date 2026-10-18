@@ -83,6 +83,131 @@ ALTER TABLE conversation_archives ALTER COLUMN entries SET DEFAULT '[]'::json;
 
 export const POSTGRES_SESSION_OPERATOR_LOOKUP_SCHEMA_SQL = `CREATE INDEX IF NOT EXISTS conversation_entries_agent_recent_idx ON conversation_entries(agent_id, created_at DESC, sequence DESC);`;
 
+export const POSTGRES_ARCHIVE_LISTING_INDEX_SQL = `
+CREATE INDEX IF NOT EXISTS conversation_sessions_archive_listing_idx
+ ON conversation_sessions(agent_id,updated_at DESC,session_id DESC);
+CREATE INDEX IF NOT EXISTS conversation_archives_reset_listing_idx
+ ON conversation_archives(agent_id,created_at DESC,archive_id DESC) WHERE kind='reset';
+`;
+
+// Proof lists use a durable run directory for ordering and hydrate only the
+// selected page. Conversation entries remain the detail authority.
+export const POSTGRES_ARCHIVE_RUN_INDEX_SQL = String.raw`
+CREATE OR REPLACE FUNCTION burrow_proof_json_member(payload json, member text) RETURNS json
+LANGUAGE plpgsql IMMUTABLE STRICT AS $proof$
+DECLARE s bytea := convert_to(payload::text,'UTF8'); i int := 1; start_at int;
+ depth int := 0; quoted boolean := false; escaped boolean := false;
+ key_start int := 0; wanted boolean := false; c text;
+BEGIN
+ WHILE i <= octet_length(s) LOOP
+  c := chr(get_byte(s,i-1));
+  IF quoted THEN
+   IF escaped THEN escaped := false;
+   ELSIF c = chr(92) THEN escaped := true;
+   ELSIF c = '"' THEN quoted := false; IF depth=1 AND key_start>0 THEN wanted := convert_from(substring(s FROM key_start FOR i-key_start+1),'UTF8')=to_json(member)::text; key_start:=0; END IF;
+   END IF;
+  ELSE
+   IF c='"' THEN quoted:=true; IF depth=1 AND start_at IS NULL THEN key_start:=i; END IF;
+   ELSIF c=':' AND depth=1 THEN IF wanted THEN start_at:=i+1; END IF;
+   ELSIF c IN ('{','[') THEN depth:=depth+1;
+   ELSIF c IN ('}',']') THEN depth:=depth-1; IF depth=0 AND start_at IS NOT NULL THEN RETURN convert_from(substring(s FROM start_at FOR i-start_at),'UTF8')::json; END IF;
+   ELSIF c=',' AND depth=1 THEN IF start_at IS NOT NULL THEN RETURN convert_from(substring(s FROM start_at FOR i-start_at),'UTF8')::json; END IF; wanted:=false;
+   END IF;
+  END IF;
+  i:=i+1;
+ END LOOP;
+ RETURN NULL;
+END $proof$;
+CREATE OR REPLACE FUNCTION burrow_proof_run_key(payload json) RETURNS text
+LANGUAGE plpgsql IMMUTABLE STRICT AS $proof$
+DECLARE token json;
+BEGIN token:=burrow_proof_json_member(payload,'runId'::text); RETURN CASE WHEN token IS NULL THEN NULL ELSE encode(convert_to(token::text,'UTF8'),'hex') END; END $proof$;
+CREATE OR REPLACE FUNCTION burrow_proof_scalar(payload json, member text) RETURNS text
+LANGUAGE plpgsql IMMUTABLE STRICT AS $proof$
+DECLARE token json;
+BEGIN token:=burrow_proof_json_member(payload,member::text); IF token IS NULL THEN RETURN NULL; END IF; RETURN token::jsonb #>> '{}';
+EXCEPTION WHEN OTHERS THEN RETURN NULL; END $proof$;
+ALTER TABLE conversation_entries ADD COLUMN IF NOT EXISTS run_key text;
+ALTER TABLE conversation_archive_entries ADD COLUMN IF NOT EXISTS run_key text;
+CREATE TABLE IF NOT EXISTS conversation_archive_runs (
+ agent_id text NOT NULL, session_id text NOT NULL, run_key text NOT NULL, run_id text NOT NULL,
+ started_at timestamptz, completed_at timestamptz, last_activity_at timestamptz, sort_timestamp text NOT NULL DEFAULT '',
+ PRIMARY KEY(agent_id,session_id,run_key),
+ FOREIGN KEY(agent_id,session_id) REFERENCES conversation_sessions(agent_id,session_id) ON UPDATE CASCADE ON DELETE CASCADE
+);
+CREATE OR REPLACE FUNCTION burrow_project_archive_run_entry() RETURNS trigger LANGUAGE plpgsql AS $tag$
+DECLARE token json; rid text; at text; role text; kind text; completed text;
+BEGIN
+ token := burrow_proof_json_member(NEW.entry,'runId'); NEW.run_key := burrow_proof_run_key(NEW.entry);
+ IF NEW.run_key IS NULL THEN RETURN NEW; END IF;
+ rid := burrow_proof_scalar(NEW.entry,'runId');
+ IF rid IS NULL OR rid = '' THEN RETURN NEW; END IF;
+ at := burrow_proof_scalar(NEW.entry,'ts');
+ at := COALESCE(NULLIF(at,''),NEW.created_at::text);
+ role := burrow_proof_scalar(NEW.entry,'role');
+ kind := burrow_proof_scalar(NEW.entry,'type');
+ completed := CASE WHEN kind='message' AND role='assistant' THEN at ELSE NULL END;
+ INSERT INTO conversation_archive_runs(agent_id,session_id,run_key,run_id,started_at,completed_at,last_activity_at,sort_timestamp)
+ VALUES(NEW.agent_id,NEW.session_id,NEW.run_key,rid,at::timestamptz,completed::timestamptz,at::timestamptz,COALESCE(completed,at,''))
+ ON CONFLICT(agent_id,session_id,run_key) DO UPDATE SET run_id=EXCLUDED.run_id,
+  started_at=CASE WHEN conversation_archive_runs.started_at IS NULL OR EXCLUDED.started_at<conversation_archive_runs.started_at THEN EXCLUDED.started_at ELSE conversation_archive_runs.started_at END,
+  completed_at=CASE WHEN EXCLUDED.completed_at IS NULL THEN conversation_archive_runs.completed_at WHEN conversation_archive_runs.completed_at IS NULL OR EXCLUDED.completed_at>conversation_archive_runs.completed_at THEN EXCLUDED.completed_at ELSE conversation_archive_runs.completed_at END,
+  last_activity_at=CASE WHEN conversation_archive_runs.last_activity_at IS NULL OR EXCLUDED.last_activity_at>conversation_archive_runs.last_activity_at THEN EXCLUDED.last_activity_at ELSE conversation_archive_runs.last_activity_at END;
+ UPDATE conversation_archive_runs SET sort_timestamp=COALESCE(completed_at::text,started_at::text,'')
+  WHERE agent_id=NEW.agent_id AND session_id=NEW.session_id AND run_key=NEW.run_key;
+ RETURN NEW;
+END $tag$;
+CREATE OR REPLACE FUNCTION burrow_project_archive_run_evidence() RETURNS trigger LANGUAGE plpgsql AS $tag$
+DECLARE item jsonb; rid text; at text; key text;
+BEGIN
+ FOR item IN SELECT value FROM jsonb_array_elements(COALESCE(NEW.metadata->'runEvidence','[]'::jsonb)) LOOP
+  rid := NULLIF(item->>'runId',''); IF rid IS NULL THEN CONTINUE; END IF;
+  at := COALESCE(NULLIF(item->>'createdAt',''),NEW.updated_at::text); key := encode(convert_to(to_json(rid)::text,'UTF8'),'hex');
+  INSERT INTO conversation_archive_runs(agent_id,session_id,run_key,run_id,started_at,completed_at,last_activity_at,sort_timestamp)
+  VALUES(NEW.agent_id,NEW.session_id,key,rid,at::timestamptz,at::timestamptz,at::timestamptz,at)
+  ON CONFLICT(agent_id,session_id,run_key) DO UPDATE SET run_id=EXCLUDED.run_id,
+   completed_at=COALESCE(conversation_archive_runs.completed_at,EXCLUDED.completed_at),
+   last_activity_at=COALESCE(conversation_archive_runs.last_activity_at,EXCLUDED.last_activity_at);
+  UPDATE conversation_archive_runs SET sort_timestamp=COALESCE(completed_at::text,started_at::text,'')
+   WHERE agent_id=NEW.agent_id AND session_id=NEW.session_id AND run_key=key;
+ END LOOP;
+ RETURN NEW;
+END $tag$;
+DROP TRIGGER IF EXISTS burrow_archive_run_evidence ON conversation_sessions;
+CREATE TRIGGER burrow_archive_run_evidence AFTER INSERT OR UPDATE OF metadata ON conversation_sessions FOR EACH ROW EXECUTE FUNCTION burrow_project_archive_run_evidence();
+WITH projected AS (
+ SELECT agent_id,session_id,burrow_proof_run_key(entry) AS run_key,
+  burrow_proof_scalar(entry,'runId') AS run_id,
+  COALESCE(burrow_proof_scalar(entry,'ts'),created_at::text) AS at,
+  burrow_proof_scalar(entry,'type') AS kind,
+  burrow_proof_scalar(entry,'role') AS role
+ FROM conversation_entries WHERE burrow_proof_run_key(entry) IS NOT NULL
+ UNION ALL
+ SELECT agent_id,session_id,burrow_proof_run_key(entry),
+  burrow_proof_scalar(entry,'runId'),
+  COALESCE(burrow_proof_scalar(entry,'ts'),created_at::text),
+  burrow_proof_scalar(entry,'type'),burrow_proof_scalar(entry,'role')
+ FROM conversation_archive_entries WHERE burrow_proof_run_key(entry) IS NOT NULL
+), grouped AS (
+ SELECT agent_id,session_id,run_key,max(run_id) AS run_id,min(at::timestamptz) AS started_at,
+  max(at::timestamptz) FILTER (WHERE kind='message' AND role='assistant') AS completed_at,max(at::timestamptz) AS last_activity_at
+ FROM projected WHERE run_key IS NOT NULL AND run_id IS NOT NULL AND run_id<>'' GROUP BY agent_id,session_id,run_key
+) INSERT INTO conversation_archive_runs(agent_id,session_id,run_key,run_id,started_at,completed_at,last_activity_at,sort_timestamp)
+ SELECT agent_id,session_id,run_key,run_id,started_at,completed_at,last_activity_at,COALESCE(completed_at::text,started_at::text,'') FROM grouped
+ ON CONFLICT(agent_id,session_id,run_key) DO UPDATE SET run_id=EXCLUDED.run_id,started_at=EXCLUDED.started_at,
+  completed_at=EXCLUDED.completed_at,last_activity_at=EXCLUDED.last_activity_at,sort_timestamp=EXCLUDED.sort_timestamp;
+INSERT INTO conversation_archive_runs(agent_id,session_id,run_key,run_id,started_at,completed_at,last_activity_at,sort_timestamp)
+ SELECT s.agent_id,s.session_id,encode(convert_to(to_json(item->>'runId')::text,'UTF8'),'hex'),item->>'runId',(item->>'createdAt')::timestamptz,(item->>'createdAt')::timestamptz,(item->>'createdAt')::timestamptz,COALESCE(item->>'createdAt','')
+ FROM conversation_sessions s CROSS JOIN LATERAL jsonb_array_elements(COALESCE(s.metadata->'runEvidence','[]'::jsonb)) item
+ WHERE NULLIF(item->>'runId','') IS NOT NULL
+ ON CONFLICT(agent_id,session_id,run_key) DO NOTHING;
+CREATE INDEX IF NOT EXISTS conversation_archive_runs_agent_order_idx ON conversation_archive_runs(agent_id,sort_timestamp DESC,run_id DESC);
+CREATE INDEX IF NOT EXISTS conversation_archive_runs_session_order_idx ON conversation_archive_runs(agent_id,session_id,sort_timestamp DESC,run_id DESC);
+CREATE INDEX IF NOT EXISTS conversation_entries_run_idx ON conversation_entries(agent_id,run_key,session_id,sequence);
+CREATE INDEX IF NOT EXISTS conversation_archive_entries_run_idx ON conversation_archive_entries(agent_id,run_key,session_id,generation DESC,source_id DESC,ordinal);
+`;
+
+
 export const POSTGRES_SESSION_ORIGINAL_LOOKUP_SCHEMA_SQL = `
 -- Lexical top-level member scanner: no JSON string is decoded into PostgreSQL text.
 CREATE OR REPLACE FUNCTION burrow_json_member(payload json, member text) RETURNS json
@@ -521,7 +646,7 @@ UPDATE conversation_entries SET has_payload_id=NULL;
 UPDATE conversation_archive_entries SET has_payload_id=NULL;
 `;
 
-export const POSTGRES_SESSION_FULL_SCHEMA_SQL = POSTGRES_SESSION_SCHEMA_SQL + POSTGRES_SESSION_ARCHIVE_SCHEMA_SQL + POSTGRES_SESSION_LOSSLESS_JSON_SCHEMA_SQL + POSTGRES_SESSION_OPERATOR_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_ROWS_SCHEMA_SQL + POSTGRES_SESSION_SEARCH_SCHEMA_SQL + POSTGRES_SESSION_NATIVE_SCHEMA_SQL + POSTGRES_SESSION_METADATA_SCHEMA_SQL + POSTGRES_SESSION_ASCII_SEARCH_SCHEMA_SQL + POSTGRES_CONTINUITY_STATE_SCHEMA_SQL + POSTGRES_RESET_INSTANT_SQL + POSTGRES_HISTORY_KEYSET_SQL + POSTGRES_LOGICAL_MEMBER_SQL + POSTGRES_ARCHIVE_RELATIONAL_ID_SQL + POSTGRES_CATALOG_SCALAR_ID_SQL + POSTGRES_LOGICAL_LOOKUP_INDEX_SQL + POSTGRES_AGENT_DELIVERY_SCHEMA_SQL + POSTGRES_OPERATOR_INSTANT_SQL;
+export const POSTGRES_SESSION_FULL_SCHEMA_SQL = POSTGRES_SESSION_SCHEMA_SQL + POSTGRES_SESSION_ARCHIVE_SCHEMA_SQL + POSTGRES_SESSION_LOSSLESS_JSON_SCHEMA_SQL + POSTGRES_SESSION_OPERATOR_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_ROWS_SCHEMA_SQL + POSTGRES_SESSION_SEARCH_SCHEMA_SQL + POSTGRES_SESSION_NATIVE_SCHEMA_SQL + POSTGRES_SESSION_METADATA_SCHEMA_SQL + POSTGRES_SESSION_ASCII_SEARCH_SCHEMA_SQL + POSTGRES_CONTINUITY_STATE_SCHEMA_SQL + POSTGRES_RESET_INSTANT_SQL + POSTGRES_HISTORY_KEYSET_SQL + POSTGRES_LOGICAL_MEMBER_SQL + POSTGRES_ARCHIVE_RELATIONAL_ID_SQL + POSTGRES_CATALOG_SCALAR_ID_SQL + POSTGRES_LOGICAL_LOOKUP_INDEX_SQL + POSTGRES_AGENT_DELIVERY_SCHEMA_SQL + POSTGRES_OPERATOR_INSTANT_SQL + POSTGRES_ARCHIVE_LISTING_INDEX_SQL;
 
 const text = (value) => String(value ?? '');
 const required = (value, name) => { const result = text(value).trim(); if (!result) throw new Error(`${name} is required`); return result; };
@@ -547,6 +672,10 @@ function originalNewerSQL(row = 'r', newer = 'newer') {
 }
 
 function rowEntry(row) { return row ? { ...row.entry, sequence: String(row.sequence) } : null; }
+function proofRunKey(entry = {}) {
+  const runId = typeof entry?.runId === 'string' ? entry.runId : '';
+  return runId ? Buffer.from(JSON.stringify(runId), 'utf8').toString('hex') : null;
+}
 
 export function assertConversationDeletionAllowed(sessionId, metadata = {}) {
   if (['running', 'finalizing'].includes(metadata.continuityHead?.state)) throw new Error('session_retention_active');
@@ -557,7 +686,14 @@ export function assertConversationDeletionAllowed(sessionId, metadata = {}) {
 export class PostgresSessionStore {
   constructor({ pool, ownsPool = false, clock = stamp } = {}) {
     if (!pool?.query || !pool?.connect) throw new Error('session_postgres_pool_required');
-    this.pool = normalizePostgresPool(pool); this.ownsPool = ownsPool; this.clock = clock;
+    this.pool = normalizePostgresPool(pool); this.ownsPool = ownsPool; this.clock = clock; this.proofProjection = null;
+  }
+  async hasProofProjection(client = this.pool) {
+    // Callers already holding a transaction must use that checked-out client.
+    // Querying the pool here self-deadlocks when its only connection is the
+    // transaction waiting for this capability check to finish.
+    if (!this.proofProjection) this.proofProjection = client.query(`SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='conversation_entries' AND column_name='run_key') AS available`).then(result => result.rows[0]?.available === true);
+    return this.proofProjection;
   }
   async claimAgentMessageDelivery({ deliveryId, request } = {}) {
     const id = required(deliveryId, 'deliveryId');
@@ -857,9 +993,24 @@ export class PostgresSessionStore {
       await client.query('SELECT 1 FROM conversation_sessions WHERE agent_id=$1 AND session_id=$2 FOR UPDATE', [agentId, sid]);
       const replay = await findSessionReplay(client, agentId, sid, entryId, key);
       if (replay) return { ...rowEntry(replay), idempotent: true };
-      const result = await client.query(`INSERT INTO conversation_entries(agent_id,session_id,entry_id,idempotency_key,entry,created_at) VALUES($1,$2,$3,$4,$5::json,$6) ON CONFLICT DO NOTHING RETURNING sequence,entry`, [agentId, sid, entryId, key, JSON.stringify(value), now]);
+      const hasProofProjection = await this.hasProofProjection(client);
+      const result = hasProofProjection
+        ? await client.query(`INSERT INTO conversation_entries(agent_id,session_id,entry_id,idempotency_key,entry,created_at,run_key) VALUES($1,$2,$3,$4,$5::json,$6,$7) ON CONFLICT DO NOTHING RETURNING sequence,entry`, [agentId, sid, entryId, key, JSON.stringify(value), now, proofRunKey(value)])
+        : await client.query(`INSERT INTO conversation_entries(agent_id,session_id,entry_id,idempotency_key,entry,created_at) VALUES($1,$2,$3,$4,$5::json,$6) ON CONFLICT DO NOTHING RETURNING sequence,entry`, [agentId, sid, entryId, key, JSON.stringify(value), now]);
       if (result.rows[0]) {
         await client.query('UPDATE conversation_sessions SET updated_at=$3 WHERE agent_id=$1 AND session_id=$2', [agentId, sid, now]);
+        if (hasProofProjection && typeof value.runId === 'string' && value.runId) {
+          const at = typeof value.ts === 'string' && value.ts ? value.ts : now;
+          const completedAt = value.type === 'message' && value.role === 'assistant' ? at : null;
+          await client.query(`INSERT INTO conversation_archive_runs(agent_id,session_id,run_key,run_id,started_at,completed_at,last_activity_at,sort_timestamp)
+            VALUES($1,$2,$3,$4,$5::timestamptz,$6::timestamptz,$5::timestamptz,COALESCE($6,$5))
+            ON CONFLICT(agent_id,session_id,run_key) DO UPDATE SET run_id=EXCLUDED.run_id,
+              started_at=LEAST(conversation_archive_runs.started_at,EXCLUDED.started_at),
+              completed_at=COALESCE(GREATEST(conversation_archive_runs.completed_at,EXCLUDED.completed_at),conversation_archive_runs.completed_at,EXCLUDED.completed_at),
+              last_activity_at=GREATEST(conversation_archive_runs.last_activity_at,EXCLUDED.last_activity_at),
+              sort_timestamp=COALESCE(GREATEST(conversation_archive_runs.completed_at,EXCLUDED.completed_at)::text,LEAST(conversation_archive_runs.started_at,EXCLUDED.started_at)::text,'')`,
+          [agentId, sid, proofRunKey(value), value.runId, at, completedAt]);
+        }
         return { ...rowEntry(result.rows[0]), idempotent: false };
       }
       const existing = await client.query(`SELECT sequence,entry FROM conversation_entries WHERE agent_id=$1 AND session_id=$2 AND (entry_id=$3 OR ($4::text IS NOT NULL AND idempotency_key=$4::text)) ORDER BY sequence LIMIT 1`, [agentId, sid, entryId, key]);
@@ -1121,8 +1272,9 @@ export class PostgresSessionStore {
            JSON.stringify(row.entry) === JSON.stringify(entry) ||
            JSON.stringify({ ...row.entry, sessionId: sid, metadata: { ...(row.entry.metadata || {}) } }) === JSON.stringify(entry)));
         if (original) used.add(original.entry_id);
-        await client.query('INSERT INTO conversation_entries(agent_id,session_id,entry_id,idempotency_key,entry,created_at) VALUES($1,$2,$3,$4,$5::json,$6)',
-          [agentId, sid, original?.entry_id || text(entry.id).trim() || randomUUID(), original?.idempotency_key || null, original?.raw_entry || JSON.stringify(entry), now]);
+        const args = [agentId, sid, original?.entry_id || text(entry.id).trim() || randomUUID(), original?.idempotency_key || null, original?.raw_entry || JSON.stringify(entry), now];
+        if (await this.hasProofProjection(client)) await client.query('INSERT INTO conversation_entries(agent_id,session_id,entry_id,idempotency_key,entry,created_at,run_key) VALUES($1,$2,$3,$4,$5::json,$6,$7)', [...args, proofRunKey(entry)]);
+        else await client.query('INSERT INTO conversation_entries(agent_id,session_id,entry_id,idempotency_key,entry,created_at) VALUES($1,$2,$3,$4,$5::json,$6)', args);
       }
       const next = { ...prior, generation, archived: false, transcriptGeneration: randomUUID(), activeTranscript: 'postgres', archiveId, updatedAt: now, turnCount: 1 + retained.length, chatTurnCount: retained.filter((entry) => entry.type === 'message' && ['user','assistant','agent'].includes(entry.role)).length };
       await client.query('UPDATE conversation_sessions SET metadata=$3::jsonb,updated_at=$4 WHERE agent_id=$1 AND session_id=$2', [agentId, sid, JSON.stringify(next), now]);
@@ -1188,7 +1340,12 @@ export class PostgresSessionStore {
       const sourceRows = await client.query('SELECT entry,entry::text AS raw_entry,entry_id FROM conversation_entries WHERE agent_id=$1 AND session_id=$2 ORDER BY sequence DESC LIMIT $3', [sourceAgent, source, size]);
       const sourceEntries = sourceRows.rows.reverse();
       const entries = sourceEntries.map((row) => row.entry);
-      for (const row of sourceEntries) await client.query('INSERT INTO conversation_entries(agent_id,session_id,entry_id,entry,created_at) VALUES($1,$2,$3,$4::json,$5)', [targetAgent, target, row.entry_id || randomUUID(), row.raw_entry, now]);
+      const hasProofProjection = await this.hasProofProjection(client);
+      for (const row of sourceEntries) {
+        const args=[targetAgent,target,row.entry_id || randomUUID(),row.raw_entry,now];
+        if (hasProofProjection) await client.query('INSERT INTO conversation_entries(agent_id,session_id,entry_id,entry,created_at,run_key) VALUES($1,$2,$3,$4::json,$5,$6)', [...args,proofRunKey(row.entry)]);
+        else await client.query('INSERT INTO conversation_entries(agent_id,session_id,entry_id,entry,created_at) VALUES($1,$2,$3,$4::json,$5)', args);
+      }
       return { ok: true, sourceAgentId: sourceAgent, targetAgentId: targetAgent, sourceSessionId: source, targetSessionId: target, copiedEntries: entries.length };
     });
   }
@@ -1287,6 +1444,146 @@ export class PostgresSessionStore {
     });
   }
 
+  async listArchiveRunDirectory({ agentId: rawAgentId, sessionId: rawSessionId = null, limit = 100, boundary = null } = {}) {
+    const agentId = required(rawAgentId, 'agentId');
+    const sessionId = rawSessionId == null ? null : required(rawSessionId, 'sessionId');
+    const size = limitValue(limit);
+    if (boundary && (typeof boundary.t !== 'string' || typeof boundary.i !== 'string')) throw new Error('archive_cursor_invalid');
+    const { rows } = await this.pool.query(`SELECT r.agent_id,r.session_id,r.run_id,r.started_at,r.completed_at,r.last_activity_at,r.sort_timestamp,evidence.item AS evidence
+      FROM conversation_archive_runs r LEFT JOIN conversation_sessions s ON s.agent_id=r.agent_id AND s.session_id=r.session_id
+      LEFT JOIN LATERAL (SELECT item FROM jsonb_array_elements(COALESCE(s.metadata->'runEvidence','[]'::jsonb)) item WHERE item->>'runId'=r.run_id LIMIT 1) evidence ON true
+      WHERE r.agent_id=$1 AND ($2::text IS NULL OR r.session_id=$2)
+      AND ($3::text IS NULL OR (r.sort_timestamp,r.agent_id || ':' || r.run_id)<($3,$4))
+      ORDER BY r.sort_timestamp DESC,r.agent_id || ':' || r.run_id DESC LIMIT $5`,
+    [agentId, sessionId, boundary?.t || null, boundary?.i || null, size + 1]);
+    const hasMore = rows.length > size;
+    return { rows: (hasMore ? rows.slice(0, size) : rows).map(row => ({
+      agentId: row.agent_id, sessionId: row.session_id, runId: row.run_id,
+      startedAt: row.started_at?.toISOString?.() || row.started_at || null,
+      completedAt: row.completed_at?.toISOString?.() || row.completed_at || null,
+      lastActivityAt: row.last_activity_at?.toISOString?.() || row.last_activity_at || null,
+      sortTimestamp: row.sort_timestamp, evidence: row.evidence || null,
+    })), hasMore };
+  }
+
+  async readArchiveRunSources({ agentId: rawAgentId, runs = [] } = {}) {
+    const agentId = required(rawAgentId, 'agentId');
+    const requested = (Array.isArray(runs) ? runs : []).filter(item => item?.sessionId && item?.runId);
+    if (!requested.length) return [];
+    const keys = requested.map(item => proofRunKey({ runId: item.runId }));
+    const sessions = requested.map(item => String(item.sessionId));
+    const { rows } = await this.pool.query(`WITH live AS MATERIALIZED (
+      SELECT session_id,run_key,entry,sequence::text AS sequence FROM conversation_entries
+      WHERE agent_id=$1 AND session_id=ANY($2::text[]) AND run_key=ANY($3::text[])
+    ), newest AS (
+      SELECT DISTINCT ON (session_id,run_key) session_id,run_key,generation,source_id FROM conversation_archive_entries
+      WHERE agent_id=$1 AND session_id=ANY($2::text[]) AND run_key=ANY($3::text[])
+      ORDER BY session_id,run_key,generation DESC NULLS LAST,source_id DESC
+    ) SELECT session_id,run_key,entry,sequence FROM live
+      UNION ALL
+      SELECT e.session_id,e.run_key,e.entry,e.ordinal::text FROM conversation_archive_entries e JOIN newest n USING(session_id,run_key,generation,source_id)
+      WHERE NOT EXISTS (SELECT 1 FROM live l WHERE l.session_id=e.session_id AND l.run_key=e.run_key)
+      ORDER BY session_id,run_key,sequence`, [agentId,sessions,keys]);
+    const metadataRows = await this.pool.query('SELECT session_id,metadata FROM conversation_sessions WHERE agent_id=$1 AND session_id=ANY($2::text[])', [agentId,[...new Set(sessions)]]);
+    const metadata = new Map(metadataRows.rows.map(row => [row.session_id,row.metadata]));
+    return requested.map((item,index) => {
+      const entries = rows.filter(row => row.session_id===String(item.sessionId) && row.run_key===keys[index]).map(rowEntry)
+        .sort((left,right)=>String(left.ts||'').localeCompare(String(right.ts||'')) || String(left.sequence||'').localeCompare(String(right.sequence||'')));
+      const evidence = (Array.isArray(metadata.get(String(item.sessionId))?.runEvidence) ? metadata.get(String(item.sessionId)).runEvidence : []).find(value => value?.runId===item.runId) || null;
+      return { sessionId:String(item.sessionId),runId:item.runId,entries,evidence };
+    });
+  }
+
+  async readArchiveRunSource({ agentId: rawAgentId, sessionId: rawSessionId = null, runId: rawRunId } = {}) {
+    const agentId = required(rawAgentId, 'agentId'); const runId = required(rawRunId, 'runId');
+    const sessionId = rawSessionId == null ? null : required(rawSessionId, 'sessionId');
+    const key = JSON.stringify(runId);
+    const located = await this.pool.query(`SELECT session_id FROM conversation_archive_runs
+      WHERE agent_id=$1 AND run_key=encode(convert_to($2,'UTF8'),'hex') AND ($3::text IS NULL OR session_id=$3)
+      ORDER BY sort_timestamp DESC,session_id DESC LIMIT 1`, [agentId, key, sessionId]);
+    const sid = located.rows[0]?.session_id;
+    if (!sid) return null;
+    const { rows } = await this.pool.query(`WITH live AS MATERIALIZED (
+      SELECT entry,sequence::text AS sequence FROM conversation_entries
+      WHERE agent_id=$1 AND run_key=encode(convert_to($3,'UTF8'),'hex') AND session_id=$2
+    ), newest_archive AS (
+      SELECT generation,source_id FROM conversation_archive_entries
+      WHERE agent_id=$1 AND run_key=encode(convert_to($3,'UTF8'),'hex') AND session_id=$2
+      ORDER BY generation DESC NULLS LAST,source_id DESC LIMIT 1
+    ) SELECT entry,sequence FROM live
+      UNION ALL
+      SELECT e.entry,e.ordinal::text FROM conversation_archive_entries e,newest_archive n
+      WHERE NOT EXISTS (SELECT 1 FROM live) AND e.agent_id=$1 AND e.session_id=$2
+        AND e.run_key=encode(convert_to($3,'UTF8'),'hex') AND e.generation=n.generation AND e.source_id=n.source_id
+      ORDER BY sequence`, [agentId, sid, key]);
+    const metadata = await this.getMetadata({ agentId, sessionId: sid });
+    const evidence = (Array.isArray(metadata?.runEvidence) ? metadata.runEvidence : []).find(item => item?.runId === runId) || null;
+    const entries = rows.map(rowEntry).sort((left, right) => String(left.ts || '').localeCompare(String(right.ts || '')) || String(left.sequence || '').localeCompare(String(right.sequence || '')));
+    return { sessionId: sid, entries, evidence };
+  }
+
+  async listArchiveSessions({ agentId: rawAgentId, includeArchived = true, query = '', date = null, month = null, timezone = 'UTC', limit = 100, boundary = null } = {}) {
+    const agentId = required(rawAgentId, 'agentId');
+    const size = limitValue(limit);
+    const search = text(query).trim().toLowerCase();
+    if (date && !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) throw new Error('archive_date_invalid');
+    if (month && !/^\d{4}-\d{2}$/.test(String(month))) throw new Error('archive_month_invalid');
+    if (boundary && (typeof boundary.t !== 'string' || typeof boundary.i !== 'string')) throw new Error('archive_cursor_invalid');
+    const windowKey = date || (month ? `${month}-01` : null);
+    const windowStart = windowKey ? new Date(`${windowKey}T00:00:00Z`) : null;
+    const windowEnd = windowStart ? new Date(windowStart) : null;
+    if (windowStart) windowStart.setUTCDate(windowStart.getUTCDate() - 1);
+    if (windowEnd) date ? windowEnd.setUTCDate(windowEnd.getUTCDate() + 2) : windowEnd.setUTCMonth(windowEnd.getUTCMonth() + 1, 2);
+    const { rows } = await this.pool.query(`WITH archive_rows AS (
+      SELECT s.agent_id,s.session_id AS id,s.session_id,NULL::text AS source_session_id,
+        false AS archive_snapshot,s.metadata,s.created_at,s.updated_at
+      FROM conversation_sessions s
+      WHERE s.agent_id=$1 AND ($2::boolean OR COALESCE((s.metadata->>'archived')::boolean,false)=false)
+        AND ($10::timestamptz IS NULL OR s.updated_at>=$10::timestamptz)
+        AND ($11::timestamptz IS NULL OR s.updated_at<$11::timestamptz)
+      UNION ALL
+      SELECT a.agent_id,a.archive_id AS id,a.session_id,a.session_id AS source_session_id,
+        true AS archive_snapshot,a.metadata,a.created_at,a.created_at AS updated_at
+      FROM conversation_archives a WHERE a.agent_id=$1 AND a.kind='reset'
+        AND ($10::timestamptz IS NULL OR a.created_at>=$10::timestamptz)
+        AND ($11::timestamptz IS NULL OR a.created_at<$11::timestamptz)
+    ), bounded AS (
+      SELECT *,agent_id || ':' || id AS identity FROM archive_rows
+      WHERE ($3::text='' OR lower(concat_ws(' ',id,session_id,source_session_id,metadata::text)) LIKE '%' || $3 || '%')
+      AND ($4::text IS NULL OR to_char(updated_at AT TIME ZONE $6,'YYYY-MM-DD')=$4)
+      AND ($5::text IS NULL OR to_char(updated_at AT TIME ZONE $6,'YYYY-MM')=$5)
+      AND ($7::timestamptz IS NULL OR (updated_at,agent_id || ':' || id)<($7::timestamptz,$8::text))
+      ORDER BY updated_at DESC,agent_id || ':' || id DESC LIMIT $9
+    ) SELECT bounded.*,
+      CASE WHEN archive_snapshot THEN (SELECT count(*) FROM conversation_archive_entries e
+        WHERE e.agent_id=bounded.agent_id AND e.session_id=bounded.session_id AND e.source_id=bounded.id)
+      WHEN metadata->>'turnCount' ~ '^[0-9]+$' THEN (metadata->>'turnCount')::bigint ELSE 0 END AS turn_count
+      FROM bounded ORDER BY updated_at DESC,identity DESC`,
+    [agentId, Boolean(includeArchived), search, date, month, timezone, boundary?.t || null, boundary?.i || null, size + 1, windowStart?.toISOString() || null, windowEnd?.toISOString() || null]);
+    const hasMore = rows.length > size;
+    return { rows: (hasMore ? rows.slice(0, size) : rows).map(row => ({
+      id: row.id, sessionId: row.id, sourceSessionId: row.source_session_id,
+      archiveSnapshot: row.archive_snapshot ? 'reset' : null, metadata: row.metadata,
+      turnCount: Number(row.turn_count), createdAt: row.created_at, updatedAt: row.updated_at,
+      identity: row.identity,
+    })), hasMore };
+  }
+
+  async listArchiveCalendarDates({ agentId: rawAgentId, month, timezone = 'UTC' } = {}) {
+    const agentId = required(rawAgentId, 'agentId');
+    const monthStart = new Date(`${month}-01T00:00:00Z`);
+    const safeStart = new Date(monthStart); safeStart.setUTCDate(safeStart.getUTCDate() - 1);
+    const safeEnd = new Date(monthStart); safeEnd.setUTCMonth(safeEnd.getUTCMonth() + 1, 2);
+    const { rows } = await this.pool.query(`SELECT DISTINCT day FROM (
+      SELECT to_char(updated_at AT TIME ZONE $3,'YYYY-MM-DD') AS day
+      FROM conversation_sessions WHERE agent_id=$1 AND updated_at>=$4 AND updated_at<$5
+      UNION ALL
+      SELECT to_char(created_at AT TIME ZONE $3,'YYYY-MM-DD') AS day
+      FROM conversation_archives WHERE agent_id=$1 AND kind='reset' AND created_at>=$4 AND created_at<$5
+    ) archive_days WHERE day LIKE $2 || '-%' ORDER BY day`, [agentId, month, timezone, safeStart.toISOString(), safeEnd.toISOString()]);
+    return rows.map(row => row.day);
+  }
+
   async listArchives({ agentId: rawAgentId, sessionId: rawSessionId, limit = 100 } = {}) {
     const agentId = required(rawAgentId, 'agentId'); const params = [agentId]; let where = 'agent_id=$1';
     if (rawSessionId != null) { params.push(required(rawSessionId, 'sessionId')); where += ` AND session_id=$${params.length}`; }
@@ -1294,6 +1591,18 @@ export class PostgresSessionStore {
     if (!unbounded) params.push(limitValue(limit));
     const result = await this.pool.query(`SELECT archive_id,session_id,generation,kind,COALESCE((SELECT json_agg(e.entry ORDER BY e.ordinal) FROM conversation_archive_entries e WHERE e.agent_id=conversation_archives.agent_id AND e.session_id=conversation_archives.session_id AND e.source_id=conversation_archives.archive_id),'[]'::json) AS entries,metadata,created_at FROM conversation_archives WHERE ${where} ORDER BY generation DESC, created_at DESC, archive_id DESC${unbounded ? '' : ` LIMIT $${params.length}`}`, params);
     return result.rows.map((row) => ({ archiveId: row.archive_id, sessionId: row.session_id, generation: Number(row.generation), kind: row.kind, entries: row.entries, metadata: row.metadata, createdAt: row.created_at }));
+  }
+
+  async readArchiveById({ agentId: rawAgentId, archiveId, kind = null } = {}) {
+    const agentId = required(rawAgentId, 'agentId'); const id = required(archiveId, 'archiveId');
+    const result = await this.pool.query(`SELECT archive_id,session_id,generation,kind,
+      COALESCE((SELECT json_agg(e.entry ORDER BY e.ordinal) FROM conversation_archive_entries e
+        WHERE e.agent_id=conversation_archives.agent_id AND e.session_id=conversation_archives.session_id
+        AND e.source_id=conversation_archives.archive_id),'[]'::json) AS entries,metadata,created_at
+      FROM conversation_archives WHERE agent_id=$1 AND archive_id=$2 AND ($3::text IS NULL OR kind=$3)
+      ORDER BY created_at DESC,session_id DESC LIMIT 1`, [agentId, id, kind]);
+    const row = result.rows[0];
+    return row ? { archiveId: row.archive_id, sessionId: row.session_id, generation: Number(row.generation), kind: row.kind, entries: row.entries, metadata: row.metadata, createdAt: row.created_at } : null;
   }
 
   async readArchive({ agentId: rawAgentId, sessionId: rawSessionId, archiveId } = {}) {

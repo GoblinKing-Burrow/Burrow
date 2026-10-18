@@ -1,4 +1,12 @@
 import { pathToFileURL } from 'node:url';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import Ajv from 'ajv';
+import addFormats from 'ajv-formats';
+
+// Validate, never coerce, default, or silently strip model-supplied arguments.
+const toolSchemaValidator = new Ajv({ strict: false, coerceTypes: false, useDefaults: false, removeAdditional: false });
+addFormats(toolSchemaValidator);
+const toolValidators = new Map();
 
 let cleanup = null;
 let sequence = 0;
@@ -11,6 +19,7 @@ const activeTools = new Map();
 let diagnosticHandlers = null;
 const pendingStore = new Map();
 const pendingCapabilities = new Map();
+const invocationScope = new AsyncLocalStorage();
 function capabilityRequest(method, input, { signal } = {}) {
   if (stopping || !process.connected) return Promise.reject(new Error("mod_capability_unavailable"));
   if (signal?.aborted) return Promise.reject(new Error("mod_capability_cancelled"));
@@ -23,7 +32,7 @@ function capabilityRequest(method, input, { signal } = {}) {
     };
     signal?.addEventListener("abort", cancel, { once: true });
     pendingCapabilities.set(requestId, { resolve, reject, signal, cancel });
-    send({ type: "capability-request", requestId, method, input }, (error) => {
+    send({ type: "capability-request", requestId, method, input, parentInvocationId: invocationScope.getStore()?.invocationId || null }, (error) => {
       if (error && pendingCapabilities.delete(requestId)) { signal?.removeEventListener("abort", cancel); reject(new Error("mod_capability_unavailable")); }
     });
     if (signal?.aborted) cancel();
@@ -122,6 +131,10 @@ function registrar(modId) {
       if (JSON.stringify(schema) !== JSON.stringify(inputSchema)) throw new Error('mod_tool_registration_invalid');
       if (resolveProtectedReference !== undefined && typeof resolveProtectedReference !== 'function') throw new Error('mod_tool_registration_invalid');
       if (!['grant-required', 'mod-authorized'].includes(availability)) throw new Error('mod_tool_registration_invalid');
+      let validate;
+      try { validate = toolSchemaValidator.compile(schema); }
+      catch { throw new Error('mod_tool_registration_invalid'); }
+      toolValidators.set(name, validate);
       toolHandlers.set(name, handler);
       if (resolveProtectedReference) protectedResolvers.set(name, resolveProtectedReference);
       tools.push({ name, description, inputSchema: schema, availability });
@@ -160,6 +173,7 @@ async function activate(message) {
     api: registration.api,
     tools: registration.toolsApi,
     diagnostics: registration.diagnostics,
+    runtimeDiagnostics: Object.freeze({ read: (input, options) => capabilityRequest("readRuntimeDiagnostics", input, options) }),
     settings: settingsApi(),
     secrets: secretsApi(),
     conversations: Object.freeze({ list: (input) => capabilityRequest("listConversations", input), read: (input, options) => capabilityRequest("readConversation", input, options) }),
@@ -169,6 +183,14 @@ async function activate(message) {
     scheduler: Object.freeze({ list: (input = {}) => capabilityRequest("listScheduledJobs", input), read: (jobId) => capabilityRequest("readScheduledJob", { jobId }), create: (input) => capabilityRequest("createScheduledJob", input), update: (jobId, patch) => capabilityRequest("updateScheduledJob", { jobId, patch }), delete: (jobId) => capabilityRequest("deleteScheduledJob", { jobId }), runs: (jobId, input = {}) => capabilityRequest("listScheduledJobRuns", { ...input, jobId }), trigger: (jobId) => capabilityRequest("triggerScheduledJob", { jobId }) }),
     logger: logger(modId),
   };
+  if (message.management === true) {
+    context.modManagement = Object.freeze({
+      inventory: (input = {}) => capabilityRequest('managementInventory', input),
+      refresh: () => capabilityRequest('managementSubmit', { action: 'refresh' }),
+      submit: input => capabilityRequest('managementSubmit', input),
+      operation: operationId => capabilityRequest('managementOperation', { operationId }),
+    });
+  }
   if (message.systemCapability === SYSTEM_PROTOCOL) {
     controllerInstanceId = String(message.controllerInstanceId || '');
     if (!controllerInstanceId) throw new Error('system_controller_instance_invalid');
@@ -199,10 +221,16 @@ async function invoke(message) {
   if (!handler) throw new Error('mod_route_handler_not_found');
   if (message.routeId?.startsWith('protected:')) return handler(message.request.reference, Object.freeze(message.request.caller));
   if (!message.routeId?.startsWith('tool:')) return handler(message.request);
+  const validate = toolValidators.get(message.routeId.slice(5));
+  if (!validate || !validate(message.request.arguments)) {
+    throw Object.assign(new Error('mod_tool_input_invalid'), { statusCode: 400 });
+  }
   const controller = new AbortController();
   activeTools.set(message.requestId, controller);
-  try { return await handler(message.request.arguments, Object.freeze({ ...message.request.caller, signal: controller.signal })); }
-  finally { activeTools.delete(message.requestId); }
+  try {
+    return await invocationScope.run(Object.freeze({ invocationId: message.requestId }), () =>
+      handler(message.request.arguments, Object.freeze({ ...message.request.caller, signal: controller.signal })));
+  } finally { activeTools.delete(message.requestId); }
 }
 
 async function shutdown() {
