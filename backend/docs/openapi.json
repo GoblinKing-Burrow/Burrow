@@ -2246,7 +2246,8 @@
             }
           }
         },
-        "summary": "List export categories"
+        "summary": "List export categories",
+        "description": "Lists portable export categories. MCP connection exports include connection configuration and credentials, but never deployment-local per-agent tool grants."
       }
     },
     "/api/export": {
@@ -2284,7 +2285,8 @@
             }
           }
         },
-        "summary": "Create a selected export bundle"
+        "summary": "Create a selected export bundle",
+        "description": "Creates a portable bundle. MCP connections never include per-agent tool grants; access must be granted deliberately on the destination deployment."
       }
     },
     "/api/export/import/preview": {
@@ -2321,7 +2323,8 @@
           }
         },
         "operationId": "previewExportImport",
-        "summary": "Preview an export import"
+        "summary": "Preview an export import",
+        "description": "Previews portable configuration import. For MCP connections, mcpAuthorization reports that grants are not transferred and counts any legacy embedded grants that will be ignored."
       }
     },
     "/api/export/import": {
@@ -2358,7 +2361,8 @@
           }
         },
         "operationId": "importExport",
-        "summary": "Apply an export import"
+        "summary": "Apply an export import",
+        "description": "Imports portable configuration after confirmation. MCP connections are restored without agent tool grants; legacy embedded grants are ignored and reported in mcpAuthorization."
       }
     },
     "/api/auth/session": {
@@ -6864,6 +6868,352 @@
             "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/task-board/tasks/{taskId}/history": {
+      "get": {
+        "tags": [
+          "Task board"
+        ],
+        "summary": "Read append-only task audit history",
+        "operationId": "getTaskBoardTaskHistory",
+        "parameters": [
+          {
+            "name": "taskId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque keyset cursor from nextCursor."
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/JsonResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/task-board/tasks/{taskId}/attachments": {
+      "get": {
+        "tags": [
+          "Task board"
+        ],
+        "summary": "List task document attachments",
+        "operationId": "listTaskBoardTaskAttachments",
+        "parameters": [
+          {
+            "name": "taskId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/JsonResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Task board"
+        ],
+        "summary": "Attach a document to a task",
+        "operationId": "createTaskBoardTaskAttachment",
+        "parameters": [
+          {
+            "name": "taskId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "content"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "mimeType": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string",
+                    "description": "Browser data URL containing the document bytes."
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "$ref": "#/components/responses/JsonResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "413": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/task-board/tasks/{taskId}/attachments/{attachmentId}": {
+      "get": {
+        "tags": [
+          "Task board"
+        ],
+        "summary": "Download a task document attachment",
+        "operationId": "getTaskBoardTaskAttachment",
+        "parameters": [
+          {
+            "name": "taskId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachmentId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private attachment bytes",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Task board"
+        ],
+        "summary": "Remove a task document attachment",
+        "operationId": "deleteTaskBoardTaskAttachment",
+        "parameters": [
+          {
+            "name": "taskId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachmentId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/JsonResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/settings/opentelemetry": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Read saved, effective, and runtime OpenTelemetry state",
+        "operationId": "getOpenTelemetrySettings",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/SettingsResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Configure OpenTelemetry export",
+        "operationId": "updateOpenTelemetrySettings",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "enabled",
+                  "endpoint"
+                ],
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "endpoint": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "description": "Saved OTLP/HTTP base endpoint. Environment overrides may take precedence."
+                  },
+                  "headers": {
+                    "type": "string",
+                    "maxLength": 8192,
+                    "writeOnly": true,
+                    "description": "Optional replacement OTLP header string. Omit to preserve the existing protected value."
+                  },
+                  "clearHeaders": {
+                    "type": "boolean",
+                    "description": "Remove the saved protected OTLP headers. Mutually exclusive with headers."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/SettingsResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/settings/browser-tab": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Read the environment-wide browser tab suffix",
+        "operationId": "getBrowserTabSettings",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Saved browser tab suffix.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserTabSettings"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Save the environment-wide browser tab suffix",
+        "operationId": "updateBrowserTabSettings",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BrowserTabSettingsInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved trimmed browser tab suffix.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserTabSettings"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
             "$ref": "#/components/responses/ErrorResponse"
           }
         }
@@ -12398,6 +12748,33 @@
             }
           }
         ]
+      },
+      "BrowserTabSettings": {
+        "type": "object",
+        "required": [
+          "suffix"
+        ],
+        "properties": {
+          "suffix": {
+            "type": "string",
+            "maxLength": 80,
+            "description": "Trimmed suffix appended to the default Burrow document title; empty restores the default title."
+          }
+        },
+        "additionalProperties": false
+      },
+      "BrowserTabSettingsInput": {
+        "type": "object",
+        "required": [
+          "suffix"
+        ],
+        "properties": {
+          "suffix": {
+            "type": "string",
+            "description": "Suffix to trim before enforcing the 80-character stored-value limit; whitespace-only input clears the suffix."
+          }
+        },
+        "additionalProperties": false
       }
     }
   },

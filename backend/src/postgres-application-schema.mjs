@@ -31,6 +31,7 @@ import { POSTGRES_AGENT_PROFILE_SCHEMA_SQL } from './postgres-agent-profile-stor
 import { POSTGRES_MODEL_SETTINGS_SCHEMA_SQL, POSTGRES_MINION_MODEL_SETTINGS_SCHEMA_SQL } from './postgres-model-settings-store.mjs';
 import { POSTGRES_MCP_SETTINGS_SCHEMA_SQL } from './postgres-mcp-settings-store.mjs';
 import { POSTGRES_TASK_BOARD_SCHEMA_SQL } from './postgres-task-board-store.mjs';
+import { POSTGRES_TASK_AUDIT_SCHEMA_SQL } from './postgres-task-audit-schema.mjs';
 import { POSTGRES_SCHEDULED_JOB_SCHEMA_SQL } from './postgres-scheduled-job-store.mjs';
 import { POSTGRES_DREAM_SETTINGS_SCHEMA_SQL } from './postgres-dream-settings-store.mjs';
 import { POSTGRES_DREAM_DIARY_SCHEMA_SQL, POSTGRES_DREAM_CALENDAR_INDEX_SQL } from './postgres-dream-diary-store.mjs';
@@ -45,6 +46,7 @@ import { POSTGRES_RETENTION_SETTINGS_SCHEMA_SQL } from './postgres-retention-set
 import { POSTGRES_WORKING_MEMORY_RETENTION_SCHEMA_SQL } from './postgres-working-memory-retention-settings-store.mjs';
 import { POSTGRES_SESSION_SCHEMA_SQL, POSTGRES_SESSION_ARCHIVE_SCHEMA_SQL, POSTGRES_SESSION_LOSSLESS_JSON_SCHEMA_SQL, POSTGRES_SESSION_OPERATOR_LOOKUP_SCHEMA_SQL, POSTGRES_SESSION_ORIGINAL_LOOKUP_SCHEMA_SQL, POSTGRES_SESSION_ORIGINAL_ROWS_SCHEMA_SQL, POSTGRES_SESSION_SEARCH_SCHEMA_SQL, POSTGRES_SESSION_NATIVE_SCHEMA_SQL, POSTGRES_SESSION_METADATA_SCHEMA_SQL, POSTGRES_SESSION_ASCII_SEARCH_SCHEMA_SQL, POSTGRES_ARCHIVE_LISTING_INDEX_SQL, POSTGRES_ARCHIVE_RUN_INDEX_SQL } from './postgres-session-store.mjs';
 import { POSTGRES_UI_AUTH_SECRET_SCHEMA_SQL } from './postgres-ui-auth-secret-store.mjs';
+import { POSTGRES_OTEL_SETTINGS_SCHEMA_SQL } from './postgres-otel-settings-store.mjs';
 import { POSTGRES_AGENT_DELIVERY_SCHEMA_SQL } from './postgres-agent-delivery-store.mjs';
 
 // Version 1 and its component SQL are immutable after adoption. Schema changes
@@ -140,4 +142,6 @@ ALTER TABLE skill_git_sources ADD COLUMN effective_timezone TEXT;
   { version: 56, name: 'bounded-archive-listing-indexes', sql: POSTGRES_ARCHIVE_LISTING_INDEX_SQL + POSTGRES_DREAM_CALENDAR_INDEX_SQL },
   { version: 57, name: 'indexed-proof-run-directory', sql: POSTGRES_ARCHIVE_RUN_INDEX_SQL },
   { version: 58, name: 'operator-owned-mod-authority', sql: POSTGRES_MOD_AUTHORITY_SCHEMA_SQL },
+  { version: 59, name: 'task-audit-history-and-documents', sql: POSTGRES_TASK_AUDIT_SCHEMA_SQL },
+  { version: 60, name: 'opentelemetry-operator-settings', sql: POSTGRES_OTEL_SETTINGS_SCHEMA_SQL },
 ]);

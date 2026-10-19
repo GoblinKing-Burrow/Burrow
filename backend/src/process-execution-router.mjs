@@ -60,6 +60,7 @@ export function createProcessExecutionRouter({ localExecute, remoteController = 
       targetId,
       parentRunId,
       toolCallId,
+      ...(context.traceContext ? { traceContext: { ...context.traceContext } } : {}),
       process: {
         ...(command ? { command } : { executable, args: process.args ? [...process.args] : [] }),
         ...(process.cwd ? { cwd: String(process.cwd) } : {}),
@@ -101,6 +102,11 @@ export function createExecutionProviderRegistry() {
       return unregister;
     },
     get(providerId) { return controllers.get(String(providerId || '')) || null; },
+    async configure(providerId, configuration) {
+      const controller = controllers.get(requiredId(providerId, 'provider_id'));
+      if (!controller || typeof controller.configureTelemetry !== 'function') return { configured: false, reason: 'provider_configuration_unsupported' };
+      return controller.configureTelemetry(configuration);
+    },
   });
 }
 

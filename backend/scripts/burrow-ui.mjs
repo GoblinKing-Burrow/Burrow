@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { migrateLegacyExecutionProviderApproval } from '../src/execution-provider-approval.mjs';
 import { createModAuthority, createModAuthorityRoute } from '../src/mod-authority.mjs';
 import { createProviderUsageService } from '../src/provider-usage-service.mjs';
 import { createBackgroundLifecycle, createCoordinatedShutdown } from '../src/background-lifecycle.mjs';
@@ -15,6 +16,9 @@ import { buildIdentity } from './build-identity.mjs';
 import { releaseProvenance } from './release-provenance.mjs';
 import { httpAuthorityConfig, hostAuthorityPolicy } from '../src/http-authority.mjs';
 import { browserOriginConfig, browserOriginSettings, saveBrowserOriginSettings, browserRequestPolicy } from '../src/browser-origin-policy.mjs';
+import { browserTabSettings, saveBrowserTabSettings } from '../src/browser-tab-settings.mjs';
+import { otelSettings, readOtelRuntimeConfig, saveOtelSettings } from '../src/otel-settings.mjs';
+import { createReconfigurableOtelRuntime } from '../src/otel-runtime.mjs';
 import { artifactResponseHeaders } from '../src/artifact-response-policy.mjs';
 import { postgresTransactionContext, withPostgresTransaction } from '../src/postgres-foundation.mjs';
 import { readJsonBody } from '../src/request-resource-budgets.mjs';
@@ -103,7 +107,7 @@ import { createObservabilityRoutes } from './ui/observability-routes.mjs';
 import { createScheduledChannelRoutes } from './ui/scheduled-channel-routes.mjs';
 import { createAuthRoutes } from './ui/auth-routes.mjs';
 import { createChatRoutes } from './ui/chat-routes.mjs';
-import { cleanupMods, createModRoute, loadMods } from '../src/mod-runtime.mjs';
+import { cleanupMods, createModRoute, discoverMods, loadMods } from '../src/mod-runtime.mjs';
 import { createModManagement } from '../src/mod-management.mjs';
 import { createModDistribution, createModManagementRoute } from '../src/mod-distribution.mjs';
 import { MAX_OVERVIEW_CHILD_CONTEXTS, normalizeOverviewBody, overviewSessionIds } from '../src/agent-overview.mjs';
@@ -183,6 +187,16 @@ const { anthropicOauthUsage, openaiOauthUsage } = createProviderUsageService({ m
 configureMcpProviderStateStore(postgresApplication.stores.mcpProviderStates);
 await hydrateMcpProviderStates({ runtimeRoot: process.env.BURROW_MCPORTER_ROOT || path.join(runtimeRoot, 'integrations', 'mcporter') }).catch((error) => serverLogger.event('mcp_provider_state_hydration_failed', { error: String(error?.message || error) }));
 const runtimeMetrics = createRuntimeMetricsCollector({ runtimeRoot });
+const otelRuntime = createReconfigurableOtelRuntime({ serviceVersion: releaseVersion });
+await otelRuntime.apply(await readOtelRuntimeConfig({ store: postgresApplication.stores.opentelemetry, metadata: postgresApplication.stores.metadata }));
+async function applyOtelConfigurationToNodeGoblins() {
+  const configuration = otelRuntime.remoteConfiguration();
+  try { return await executionProviders.configure('node-goblin', configuration); }
+  catch (error) {
+    serverLogger.event('node_goblin_otel_configuration_failed', { error: String(error?.code || error?.message || 'configuration_failed') });
+    return { configured: false, reason: 'configuration_failed' };
+  }
+}
 
 function profilesStore() { return postgresApplication.stores.profiles; }
 function dreamDiaryStore() { return postgresApplication.stores.dreamDiary; }
@@ -201,7 +215,7 @@ function scheduler() {
       storeFactory: () => borrowedStore,
       executeTurn: runChatTurnFromBody, createRunId: createChatTurnRunId,
       closeStore: async () => {},
-      resolveAgentRuntime, rootDir: projectRoot, stores: postgresApplication.stores,
+      resolveAgentRuntime, rootDir: projectRoot, stores: postgresApplication.stores, telemetry: otelRuntime,
       activeOwnerModIds: () => loadedMods.filter((mod) => mod.status === 'loaded').map((mod) => mod.id),
     });
   }
@@ -285,7 +299,7 @@ async function executeBoardTask(taskId) {
     const sessionId = 'default';
     const runId = createChatTurnRunId({ sessionId, prefix: 'task' });
     lifecycle?.signal.throwIfAborted();
-    const updated = await store.startExecution(task.id, { agentId: agentRuntime.agentId, sessionId, runId });
+    const updated = await store.startExecution(task.id, { agentId: agentRuntime.agentId, sessionId, runId }, { actor: { type: 'operator', id: 'default' } });
     return { ok: true, task, project, agentRuntime, sessionId, runId, updated };
   });
   if (!dispatch.ok) return dispatch;
@@ -302,6 +316,8 @@ async function executeBoardTask(taskId) {
     agentRuntime,
     stores: postgresApplication.stores,
     resolveAgentRuntime,
+    telemetry: otelRuntime,
+    runSource: 'task-board',
     registerNestedAgentRun: ({ agentRuntime: nestedRuntime, sessionId: nestedSessionId, runId: nestedRunId, message, source, ...a2a }) => registerActiveAgentRun(activeChatRuns, { agentId: nestedRuntime.agentId, sessionId: nestedSessionId, runId: nestedRunId, message, source, a2a: source === 'a2a' ? a2a : null }),
     onModelTextDelta: createChatStreamDelta({ record, type: 'assistant.delta', runId, sessionId, write: () => {} }),
     onModelThoughtDelta: createChatStreamDelta({ record, type: 'assistant.thought', runId, sessionId, write: () => {} }),
@@ -324,9 +340,9 @@ async function executeBoardTask(taskId) {
       verification: result.verification ? { required: Boolean(result.verification.required), ok: result.verification.ok ?? null, reason: result.verification.reason || null } : null,
       completionEvidence: result.completionEvidence || null,
     };
-    await withTaskBoard((store) => store.recordExecution(task.id, { agentId: agentRuntime.agentId, sessionId, runId: result.runId || runId, decision: result.decision || null, ok: Boolean(result.ok), executedAt: new Date().toISOString(), traceDir: result.traceDir || null, error: result.ok ? null : (result.error || null), result: taskResult }));
+    await withTaskBoard((store) => store.recordExecution(task.id, { agentId: agentRuntime.agentId, sessionId, runId: result.runId || runId, decision: result.decision || null, ok: Boolean(result.ok), executedAt: new Date().toISOString(), traceDir: result.traceDir || null, error: result.ok ? null : (result.error || null), result: taskResult }, { actor: { type: 'agent', id: agentRuntime.agentId } }));
   }).catch(async (error) => {
-    await withTaskBoard((store) => store.recordExecution(task.id, { agentId: agentRuntime.agentId, sessionId, runId, ok: false, error: String(error?.message || error), result: { answerText: null, blockers: [String(error?.message || error)], verification: null, completionEvidence: null } }));
+    await withTaskBoard((store) => store.recordExecution(task.id, { agentId: agentRuntime.agentId, sessionId, runId, ok: false, error: String(error?.message || error), result: { answerText: null, blockers: [String(error?.message || error)], verification: null, completionEvidence: null } }, { actor: { type: 'agent', id: agentRuntime.agentId } }));
   }).finally(() => {
     if (activeChatRuns.get(activeChatRunKey(agentRuntime.agentId, runId)) === record) activeChatRuns.delete(activeChatRunKey(agentRuntime.agentId, runId));
   });
@@ -1410,10 +1426,30 @@ async function importPreview(decoded, conflictPolicy) {
     const summary = record => ({ mode: record.mode, enabled: record.mode !== 'none', basicPasswordConfigured: Boolean(record.basic.passwordHash), oidcClientSecretConfigured: Boolean(record.oidc.clientSecretConfigured || record.oidc.clientSecret) });
     uiAuth = { before: summary(existing), after: summary(plan.next), basicCredentialsPortable: false, requiresBasicReconfiguration: basicReconfigurationRequired, warning: basicReconfigurationRequired ? 'Basic credentials are not portable. Existing authentication will be preserved; configure Basic credentials deliberately after import.' : null };
   }
-  return { ok: true, format: decoded.payload.manifest.format, encrypted: decoded.encrypted, categories: decoded.categories, supported, unsupported, conflictPolicy, requiresConfirmation: true, redacted: Boolean(decoded.payload.manifest.redacted), uiAuth };
+  const mcpCategory = decoded.payload.categories['mcp-connections'];
+  const legacyMcpGrants = mcpCategory && typeof mcpCategory === 'object' && !Array.isArray(mcpCategory) && Array.isArray(mcpCategory.grants) ? mcpCategory.grants : [];
+  const mcpConnections = Array.isArray(mcpCategory) ? mcpCategory : (Array.isArray(mcpCategory?.connections) ? mcpCategory.connections : []);
+  const mcpAuthorization = supported.includes('mcp-connections') ? {
+    transferred: false,
+    ignoredGrantRecords: legacyMcpGrants.length,
+    ignoredToolGrants: legacyMcpGrants.reduce((count, grant) => count + (Array.isArray(grant?.tools) ? grant.tools.length : 0), 0),
+    regrantRequired: mcpConnections.length > 0,
+    message: 'MCP tool grants are deployment-local and are not imported. Regrant access deliberately on this deployment.',
+  } : null;
+  return { ok: true, format: decoded.payload.manifest.format, encrypted: decoded.encrypted, categories: decoded.categories, supported, unsupported, conflictPolicy, requiresConfirmation: true, redacted: Boolean(decoded.payload.manifest.redacted), uiAuth, mcpAuthorization };
 }
 async function applyImport(decoded, { conflictPolicy = 'error' } = {}) {
   const categories = Object.fromEntries(decoded.categories.map(id => [id, decoded.payload.categories[id]]));
+  const importedMcpCategory = categories['mcp-connections'];
+  const legacyMcpGrants = importedMcpCategory && typeof importedMcpCategory === 'object' && !Array.isArray(importedMcpCategory) && Array.isArray(importedMcpCategory.grants) ? importedMcpCategory.grants : [];
+  const importedMcpConnections = Array.isArray(importedMcpCategory) ? importedMcpCategory : (Array.isArray(importedMcpCategory?.connections) ? importedMcpCategory.connections : []);
+  const mcpAuthorization = Object.hasOwn(categories, 'mcp-connections') ? {
+    transferred: false,
+    ignoredGrantRecords: legacyMcpGrants.length,
+    ignoredToolGrants: legacyMcpGrants.reduce((count, grant) => count + (Array.isArray(grant?.tools) ? grant.tools.length : 0), 0),
+    regrantRequired: importedMcpConnections.length > 0,
+    message: 'MCP tool grants are deployment-local and are not imported. Regrant access deliberately on this deployment.',
+  } : null;
   const unsupported = decoded.categories.filter((id) => !IMPORT_SUPPORTED_CATEGORIES.has(id));
   if (unsupported.length) return { ok: false, status: 400, error: 'import_category_unsupported', details: { categories: unsupported } };
   if (Object.hasOwn(categories, 'agents') && (!categories.agents || typeof categories.agents !== 'object' || Array.isArray(categories.agents) || categories.agents.schema !== 'burrow.agents-and-profiles/v2' || !Array.isArray(categories.agents.records) || !categories.agents.profiles || typeof categories.agents.profiles !== 'object' || Array.isArray(categories.agents.profiles))) {
@@ -1445,15 +1481,15 @@ async function applyImport(decoded, { conflictPolicy = 'error' } = {}) {
     }
   }
   for (const agent of (categories.agents?.records || [])) if (await agentsStore().get(agent.id)) conflicts.push({ category: 'agents', id: agent.id });
-  const mcpConnections = Array.isArray(categories['mcp-connections']) ? categories['mcp-connections'] : (categories['mcp-connections']?.connections || []);
+  const mcpConnections = importedMcpConnections;
   for (const connection of mcpConnections) if (await mcpStore().get(connection.id)) conflicts.push({ category: 'mcp-connections', id: connection.id });
   for (const task of (categories['task-board']?.tasks || [])) if (await withTaskBoard(store => store.getTask(task.id))) conflicts.push({ category: 'task-board.tasks', id: task.id });
-  if (conflicts.length && conflictPolicy === 'error') return { ok: false, status: 409, error: 'import_conflicts', details: { conflicts } };
+  if (conflicts.length && conflictPolicy === 'error') return { ok: false, status: 409, error: 'import_conflicts', details: { conflicts }, mcpAuthorization };
   const imported = [];
   const deleted = [];
   const completed = [];
   let currentItem = null;
-  const failure = (result) => ({ ...result, ok: false, status: result.status || result.statusCode || 400, imported: [...imported], deleted: [...deleted], completed: [...completed], partial: completed.length > 0 || deleted.length > 0, failed: { item: currentItem, error: String(result.error || 'import_failed') }, skipped: conflicts.filter(c => conflictPolicy === 'skip'), unsupported: [] });
+  const failure = (result) => ({ ...result, ok: false, status: result.status || result.statusCode || 400, imported: [...imported], deleted: [...deleted], completed: [...completed], partial: completed.length > 0 || deleted.length > 0, failed: { item: currentItem, error: String(result.error || 'import_failed') }, skipped: conflicts.filter(c => conflictPolicy === 'skip'), unsupported: [], mcpAuthorization });
   const write = async (item, operation) => {
     currentItem = item;
     const result = await operation();
@@ -1591,19 +1627,6 @@ async function applyImport(decoded, { conflictPolicy = 'error' } = {}) {
   if (categories['mcp-connections'] && typeof categories['mcp-connections'] === 'object' && !Array.isArray(categories['mcp-connections'])) {
     const connections = Array.isArray(categories['mcp-connections'].connections) ? categories['mcp-connections'].connections : [];
     for (const connection of connections) { if (connection.apiKey === '[redacted]' || (conflictPolicy === 'skip' && conflicts.some(c => c.category === 'mcp-connections' && c.id === connection.id))) continue; const { environmentVariables, ...portableConnection } = connection; await write(`mcp-connections:${connection.id}`, () => mcpStore().save(portableConnection)); imported.push(`mcp-connections:${connection.id}`); }
-    for (const grant of (Array.isArray(categories['mcp-connections'].grants) ? categories['mcp-connections'].grants : [])) {
-      if (!await agentsStore().get(grant?.agentId) || !Array.isArray(grant?.tools) || !grant.tools.length) continue;
-      if (conflictPolicy === 'skip' && (conflicts.some(c => c.category === 'agents' && c.id === grant.agentId) || grant.tools.some(tool => conflicts.some(c => c.category === 'mcp-connections' && c.id === tool.connectionId)))) continue;
-      // v2 stores connection IDs inside each per-agent tool grant. The old
-      // importer incorrectly looked for grant.connectionId on the wrapper,
-      // which is undefined and caused every valid MCP export to fail with
-      // mcp_connection_id_invalid before setAgentTools could validate it.
-      const connectionIds = [...new Set(grant.tools.map((tool) => String(tool?.connectionId || '').trim()).filter(Boolean))];
-      if (connectionIds.length && (await Promise.all(connectionIds.map((connectionId) => mcpStore().get(connectionId)))).every(Boolean)) {
-        await write(`mcp-grants:${grant.agentId}`, () => mcpStore().setAgentTools(grant.agentId, grant.tools));
-        imported.push(`mcp-grants:${grant.agentId}`);
-      }
-    }
   } else if (Array.isArray(categories['mcp-connections'])) for (const connection of categories['mcp-connections']) { if (connection.apiKey === '[redacted]' || (conflictPolicy === 'skip' && conflicts.some(c => c.category === 'mcp-connections' && c.id === connection.id))) continue; const { environmentVariables, ...portableConnection } = connection; await write(`mcp-connections:${connection.id}`, () => mcpStore().save(portableConnection)); imported.push(`mcp-connections:${connection.id}`); }
   if (categories['ui-auth'] && typeof categories['ui-auth'] === 'object') {
     const importedAuth = categories['ui-auth'].auth;
@@ -1619,7 +1642,7 @@ async function applyImport(decoded, { conflictPolicy = 'error' } = {}) {
       imported.push('ui-auth:settings');
     }
   }
-  return { ok: true, imported, deleted, completed, partial: false, skipped: conflicts.filter((c) => conflictPolicy === 'skip'), unsupported: [] };
+  return { ok: true, imported, deleted, completed, partial: false, skipped: conflicts.filter((c) => conflictPolicy === 'skip'), unsupported: [], mcpAuthorization };
   } catch (error) {
     return failure({ ...(error?.importResult || {}), error: String(error?.importResult?.error || error?.message || error), status: error?.importResult?.status || error?.statusCode || 400 });
   }
@@ -1689,11 +1712,9 @@ async function exportSnapshot(categories = []) {
   }
   if (categories.includes('mcp-connections')) {
     const store = mcpStore();
-    const agents = await agentsStore().list({ includeDisabled: true });
     data['mcp-connections'] = {
-      schema: 'burrow.mcp-connections-and-grants/v2',
+      schema: 'burrow.mcp-connections/v3',
       connections: await Promise.all((await store.list()).filter(connection => connection.transport !== 'mod' && !connection.id.startsWith('mod.')).map(async (connection) => ({ ...connection, apiKey: await store.apiKey(connection.id), environmentVariables: (connection.environmentVariables || []).map(({ name }) => ({ name, configured: true })) }))),
-      grants: (await Promise.all(agents.map(async (agent) => ({ agentId: agent.id, tools: (await store.agentTools(agent.id)).filter(grant => !grant.connectionId.startsWith('mod.')).map((grant) => ({ connectionId: grant.connectionId, toolName: grant.toolName, enabled: grant.enabled })) })))).filter((entry) => entry.tools.length > 0),
     };
   }
   if (categories.includes('ui-auth')) {
@@ -2703,6 +2724,8 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
       stores: postgresApplication.stores,
       resolveAgentRuntime,
       latencyTiming,
+      telemetry: otelRuntime,
+      runSource: 'operator-chat',
       registerNestedAgentRun: ({ agentRuntime: nestedRuntime, sessionId: nestedSessionId, runId: nestedRunId, message, source, ...a2a }) => registerActiveAgentRun(activeChatRuns, { agentId: nestedRuntime.agentId, sessionId: nestedSessionId, runId: nestedRunId, message, source, a2a: source === 'a2a' ? a2a : null }),
       onTraceRecord: (traceRecord) => {
         const progress = publicChatProgress(traceRecord);
@@ -2767,7 +2790,7 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
   }
 }
 
-const startGroupChannelMessage = createGroupChannelMessageStarter({ runtimeDataRoot, resolveAgentRuntime, conversationStore: postgresApplication.stores.conversations, stores: postgresApplication.stores, retentionDays: async () => (await postgresApplication.stores.albdruck.readRetention()).attachmentDays, projectRoot, groupChannelRuns, groupChannelRunKey, runChatTurnFromBody, lifecycle: requestLifecycle });
+const startGroupChannelMessage = createGroupChannelMessageStarter({ runtimeDataRoot, resolveAgentRuntime, conversationStore: postgresApplication.stores.conversations, stores: postgresApplication.stores, retentionDays: async () => (await postgresApplication.stores.albdruck.readRetention()).attachmentDays, projectRoot, groupChannelRuns, groupChannelRunKey, runChatTurnFromBody, telemetry: otelRuntime, lifecycle: requestLifecycle });
 
 async function cancelGroupChannelRun(channelId, runId, body = {}) {
   const record = [...groupChannelRuns.values()].find((item) => item.channelId === channelId && item.runId === runId);
@@ -2856,7 +2879,7 @@ const { archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, arc
 });
 const sessionRoute = createSessionRoutes({ rootDir: projectRoot, readJsonBody, sendJson, resolveAgentRuntime, runtimeAgentWorkspaceRoot, runtimeDataRoot, runtimeSessionRoot, runtimeConfig, activeConversationLimits, inspectSessionContext, inspectSessionContextStatus, activeChatRuns, searchSessionEvidence, searchBurrowSessionEvidence, agentsStore, agentRuntimeContext, archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveContinuityCards, archiveContinuityCardDetail, listSessions, sessionDetail, sessionWriteHandoff, sessionContinuityScope, setSessionContinuityScope, clearSessionContinuityScope, sessionReadHandoff, sessionWriteHandoffCandidate, archiveSummaryForReset, archiveSummaryForSession, latestAuthorityExplanationForSession, listAuthorityExplanationsForSession, conversationStore: postgresApplication.stores.conversations });
 const brainRoute = createBrainRoutes({ store: postgresApplication.stores.brains, embeddings: postgresApplication.stores.brainEmbeddings, readJsonBody, sendJson });
-const generalSettingsRoute = createGeneralSettingsRoutes({ readJsonBody, sendJson, chatIdentities, saveChatIdentity, curatorSettings, saveCuratorSettings, tiddleSettings: async (agentId) => tiddleStatus({ agentId, stores: postgresApplication.stores, }), tiddleCards: async (query) => listTiddleCards({ ...query, stores: postgresApplication.stores, }), tiddleHistory: async (query) => tiddleHistory({ ...query, stores: postgresApplication.stores, }), uiAuthSettings, saveUiAuthSettings, browserOriginSettings: () => browserOriginSettings({ metadata: metadataStore() }), saveBrowserOriginSettings: body => saveBrowserOriginSettings(body, { metadata: metadataStore() }), executionBoundarySettings, saveExecutionBoundarySettings, retentionPolicySettings, saveRetentionPolicySettings, retentionCleanup });
+const generalSettingsRoute = createGeneralSettingsRoutes({ readJsonBody, sendJson, chatIdentities, saveChatIdentity, curatorSettings, saveCuratorSettings, tiddleSettings: async (agentId) => tiddleStatus({ agentId, stores: postgresApplication.stores, }), tiddleCards: async (query) => listTiddleCards({ ...query, stores: postgresApplication.stores, }), tiddleHistory: async (query) => tiddleHistory({ ...query, stores: postgresApplication.stores, }), uiAuthSettings, saveUiAuthSettings, browserOriginSettings: () => browserOriginSettings({ metadata: metadataStore() }), saveBrowserOriginSettings: body => saveBrowserOriginSettings(body, { metadata: metadataStore() }), browserTabSettings: () => browserTabSettings({ metadata: metadataStore() }), saveBrowserTabSettings: body => saveBrowserTabSettings(body, { metadata: metadataStore() }), otelSettings: () => otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }), saveOtelSettings: async body => { let result = await saveOtelSettings(body, { store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); if (result.ok) { try { await otelRuntime.apply(await readOtelRuntimeConfig({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore() })); await applyOtelConfigurationToNodeGoblins(); } catch (error) { serverLogger.event('otel_configuration_apply_failed', { error: String(error?.message || 'configuration_failed') }); return { ok: false, status: 500, error: 'opentelemetry_configuration_apply_failed' }; } result = await otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); } return result; }, executionBoundarySettings, saveExecutionBoundarySettings, retentionPolicySettings, saveRetentionPolicySettings, retentionCleanup });
 const observabilityRoute = createObservabilityRoutes({ readJsonBody, sendJson, validateBoundaryBody, runtimeStatus, runtimeMetrics, codexLbAccounts, anthropicOauthUsage, openaiOauthUsage, currentActiveChatRunSummaries, selectedAgentRuntime, resolveAgentRuntime, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, listTraces, runtimeConfig, traceRootForRun, conversationStore: postgresApplication.stores.conversations, summarizeTrace, authorityExplanationFromTraceSummary, projectRoot });
 const scheduledChannelRoute = createScheduledChannelRoutes({ readJsonBody, sendJson, validateBoundaryBody, withScheduledJobs, scheduler, listGroupChannels, createGroupChannel, readGroupChannelTurns, groupChannelRuns, startGroupChannelMessage, cancelGroupChannelRun, runtimeDataRoot, conversationStore: postgresApplication.stores.conversations });
 const authRoute = createAuthRoutes({ runtimeConfig, oidcLoginUrl, setOidcStateCookie, completeOidcCallback, sendOidcSessionCookie, clearOidcCookies, oidcCookieClearHeader, oidcSessionFromRequest, sendJson });
@@ -2935,19 +2958,20 @@ const modManagementCapability = Object.freeze(Object.fromEntries(['inventory', '
   if (!coreModManagement) throw new Error('mod_management_unavailable');
   return coreModManagement[method](...args);
 }])));
-const modLoadOptions = { modAuthority, modManagement: modManagementCapability, stores: postgresApplication.stores, modStoreFactory: postgresApplication.modStoreFactory, enabledModIds: postgresApplication.enabledModIds, modCatalogWriter: postgresApplication.modCatalogWriter, runtimeRoot: modsRuntimeRoot, executionProviders, resolveAgentRuntime, scheduledJobScheduler: scheduler(), runtimeDiagnostics, resolveAgentWorkspaceRoot: async (id) => {
+const modLoadOptions = { modAuthority, modManagement: modManagementCapability, onExecutionProviderActivated: async modId => { if (modId === 'node-goblin') await applyOtelConfigurationToNodeGoblins(); }, stores: postgresApplication.stores, modStoreFactory: postgresApplication.modStoreFactory, enabledModIds: postgresApplication.enabledModIds, modCatalogWriter: postgresApplication.modCatalogWriter, runtimeRoot: modsRuntimeRoot, executionProviders, resolveAgentRuntime, scheduledJobScheduler: scheduler(), runtimeDiagnostics, resolveAgentWorkspaceRoot: async (id) => {
   const agent = await agentsStore().get(id);
   if (!agent) throw new Error('agent_not_found');
   return agentRuntimeContext({ runtimeState: (await runtimeConfig()).runtimeState, agent }).agentWorkspaceRoot;
 } };
-const mods = await loadMods(modLoadOptions);
-loadedMods = mods;
+let modsStarting = true;
 const modRoute = createModRoute({ getMods: () => loadedMods, readJsonBody, sendJson });
-async function transitionMod({ modId, enabled, installed, action }) {
+async function transitionMod({ modId, enabled, installed, action, reactivate = false }) {
+  // Startup journals reconcile files and metadata before any hosts are started.
+  if (modsStarting) return;
   const old = loadedMods.find((entry) => entry.id === modId) || null;
   // Repeated enable is a no-op only for a genuinely active loaded host.
   // Failed/disconnected hosts must still pass through activation on retry.
-  if (action === 'enable' && installed && enabled && old?.status === 'loaded' && old.host && !old.host.child?.killed && old.host.child?.connected) return;
+  if (!reactivate && ['enable', 'enable-recovery'].includes(action) && installed && enabled && old?.status === 'loaded' && old.host && !old.host.child?.killed && old.host.child?.connected) return;
   if (old?.host?.activeOperationCount?.() > 0) throw Object.assign(new Error('mod_busy'), { statusCode: 409 });
   if (action === 'update-preflight') return;
   // A failed uninstall can restore files and lifecycle records after the old
@@ -2965,6 +2989,12 @@ async function transitionMod({ modId, enabled, installed, action }) {
       ? loadedMods.map((entry) => entry.id === modId ? { ...entry, host: null, routes: [], store: null, lifecycleCleanup: null, status: 'disabled' } : entry)
       : loadedMods.filter((entry) => entry.id !== modId);
     return;
+  }
+  if (reactivate && old) {
+    // Newly approved interfaces require a fresh host. Stop the old listener
+    // before activation; overlapping Node Goblin listeners cannot share a port.
+    await cleanupMods([old]);
+    Object.assign(old, { host: null, routes: [], store: null, lifecycleCleanup: null, status: 'disabled' });
   }
   const [next] = await loadMods({ ...modLoadOptions, onlyModIds: [modId], replaceExecutionProviders: action === 'update' });
   if (!next || next.status !== 'loaded') {
@@ -2987,6 +3017,7 @@ async function transitionMod({ modId, enabled, installed, action }) {
     throw error;
   }
   if (old) await cleanupMods([old]);
+  await modLoadOptions.onExecutionProviderActivated?.(modId);
 }
 const modDistribution = createModDistribution({
   runtimeRoot: modsRuntimeRoot,
@@ -2997,6 +3028,14 @@ const modDistribution = createModDistribution({
 // callback above is self-contained and does not call back into the distribution,
 // so this readiness barrier cannot form a lifecycle/distribution cycle.
 await modDistribution.ready;
+await migrateLegacyExecutionProviderApproval({
+  repositoryFactory: postgresApplication.modDistributionRepositoryFactory,
+  mods: await discoverMods({ runtimeRoot: modsRuntimeRoot }),
+  agents: await agentsStore().list({ includeDisabled: true }),
+});
+loadedMods = await loadMods(modLoadOptions);
+await applyOtelConfigurationToNodeGoblins();
+modsStarting = false;
 coreModManagement = createModManagement({ modAuthority, distribution: modDistribution, repositoryFactory: postgresApplication.modDistributionRepositoryFactory });
 await coreModManagement.ready;
 const modAuthorityRoute = createModAuthorityRoute({ authority: modAuthority, getMods: () => loadedMods, readJsonBody, sendJson });
@@ -3210,7 +3249,7 @@ const closeRuntimeResources = createCoordinatedShutdown({
     }
   },
   drainAdmission: () => httpClosePromise,
-  closers: () => [() => cleanupMods(loadedMods), () => postgresApplication.close()],
+  closers: () => [() => cleanupMods(loadedMods), () => otelRuntime.shutdown(), () => postgresApplication.close()],
   onTimeout: () => server.closeAllConnections?.(),
 });
 let shutdownPromise = null;
@@ -3297,6 +3336,7 @@ server.listen(port, host, () => {
           stores:postgresApplication.stores,
           body: { message: recoveryInstruction, sessionId, runId, abortSignal: lifecycle.signal },
           rootDir: projectRoot, agentRuntime: runtime, resolveAgentRuntime,
+          telemetry: otelRuntime, runSource: 'recovery',
           onTraceRecord: lifecycle.onTraceRecord, onModelTextDelta: lifecycle.onModelTextDelta,
           onModelThoughtDelta: lifecycle.onModelThoughtDelta, onModelContextUsage: lifecycle.onModelContextUsage,
           onSteeringReady: lifecycle.onSteeringReady,
@@ -3308,3 +3348,4 @@ server.listen(port, host, () => {
   void recoveryContinuationScheduler.start().catch(() => {});
   }).catch(error => { console.error(`Burrow startup failed: ${String(error?.message || error)}`); void shutdownRuntime('startup_failure', { exitCode: 1 }); });
 });
+

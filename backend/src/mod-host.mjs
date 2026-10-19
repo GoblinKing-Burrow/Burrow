@@ -33,6 +33,16 @@ function capabilityErrorEnvelope(error, fallback = 'mod_capability_failed') {
 
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const NATIVE_FILESYSTEM_TOOLS = new Set(['files_read', 'files_list', 'files_find', 'files_inspect', 'files_search', 'files_write', 'files_edit']);
+const TRACEPARENT = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/;
+function traceContextCarrier(value) {
+  if (value == null) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw hostError('remote_trace_context_invalid');
+  const traceparent = String(value.traceparent || '').trim().toLowerCase();
+  const tracestate = value.tracestate == null ? '' : String(value.tracestate).trim();
+  if (!TRACEPARENT.test(traceparent) || traceparent.slice(3, 35) === '0'.repeat(32) || traceparent.slice(36, 52) === '0'.repeat(16)
+    || (tracestate && (tracestate.length > 512 || /[\r\n]/.test(tracestate)))) throw hostError('remote_trace_context_invalid');
+  return { traceparent, ...(tracestate ? { tracestate } : {}) };
+}
 function validateJsonBody(value) {
   if (value === undefined) throw hostError('mod_route_response_invalid');
   let encoded;
@@ -112,6 +122,7 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
   let systemControllerReady = false;
   const controllerInstanceId = systemCapability ? randomUUID() : null;
   const pendingSystemProcess = new Map();
+  const pendingSystemConfiguration = new Map();
   const activeCapabilities = new Map();
   const cancelCapabilities = () => { for (const { controller } of activeCapabilities.values()) controller.abort(hostError("mod_capability_shutdown")); activeCapabilities.clear(); capabilities?.dispose?.(); };
   async function serviceCapabilityRequest(message) {
@@ -176,6 +187,8 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
       entry.reject(error);
     }
     pendingSystemProcess.clear();
+    for (const entry of pendingSystemConfiguration.values()) { clearTimeout(entry.timer); entry.reject(error); }
+    pendingSystemConfiguration.clear();
   };
   const rejectSystemFilesystems = (code = 'remote_native_filesystem_controller_unavailable') => {
     const error = hostError(code);
@@ -296,6 +309,17 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
       }
       return;
     }
+    if (message?.type === 'system-controller-configuration-result') {
+      if (message.protocol !== systemCapability || message.controllerInstanceId !== controllerInstanceId) return;
+      const requestId = typeof message.requestId === 'string' ? message.requestId : '';
+      const entry = pendingSystemConfiguration.get(requestId);
+      if (!entry) return;
+      pendingSystemConfiguration.delete(requestId);
+      clearTimeout(entry.timer);
+      if (message.ok !== true) entry.reject(hostError(typeof message.error === 'string' && /^[a-z0-9_]+$/.test(message.error) ? message.error : 'remote_configuration_failed'));
+      else entry.resolve(validateJsonBody(message.result));
+      return;
+    }
     if (message?.type === 'system-controller-process-result') {
       if (message.protocol !== systemCapability || message.controllerInstanceId !== controllerInstanceId) return;
       const requestId = typeof message.requestId === 'string' ? message.requestId : '';
@@ -397,6 +421,30 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
 
   function createSystemControllerProxy() {
     return Object.freeze({
+      async configureTelemetry(configuration = {}) {
+        if (!modAuthority) throw hostError('mod_authority_forbidden');
+        await modAuthority.assertAllowed(mod.id, 'execution-provider-v1');
+        if (!systemControllerReady || closing || stopped || !child.connected) throw hostError('remote_configuration_controller_unavailable');
+        let value;
+        try { value = jsonObject(configuration, 'remote_configuration_invalid'); }
+        catch { throw hostError('remote_configuration_invalid'); }
+        const requestId = randomUUID();
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            if (!pendingSystemConfiguration.has(requestId)) return;
+            pendingSystemConfiguration.delete(requestId);
+            reject(hostError('remote_configuration_timeout'));
+          }, finiteTimeout(routeTimeoutMs, DEFAULT_MOD_ROUTE_TIMEOUT_MS));
+          timer.unref?.();
+          pendingSystemConfiguration.set(requestId, { resolve, reject, timer });
+          child.send({ type: 'system-controller-configure-telemetry', protocol: systemCapability, controllerInstanceId, requestId, configuration: value }, (error) => {
+            if (!error || !pendingSystemConfiguration.has(requestId)) return;
+            pendingSystemConfiguration.delete(requestId);
+            clearTimeout(timer);
+            reject(hostError('remote_configuration_send_failed'));
+          });
+        });
+      },
       async executeProcess(request = {}, { abortSignal = null } = {}) {
         if (!modAuthority) throw hostError('mod_authority_forbidden');
         await modAuthority.assertAllowed(mod.id, 'execution-provider-v1');
@@ -408,8 +456,10 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
         const toolCallId = String(request.toolCallId || '');
         if (!operationId || !targetId || !parentRunId || !toolCallId || !request.process || typeof request.process !== 'object' || Array.isArray(request.process)) return Promise.reject(hostError('remote_process_request_invalid'));
         let operation;
+        const traceContext = traceContextCarrier(request.traceContext);
         try {
           operation = JSON.parse(JSON.stringify({ operationId, targetId, parentRunId, toolCallId, process: request.process,
+            ...(traceContext ? { traceContext } : {}),
             ...(request.protectedBindingMetadata ? { protectedBindingMetadata: request.protectedBindingMetadata } : {}),
             ...(request.protectedValues ? { protectedValues: request.protectedValues } : {}) }));
         } catch { return Promise.reject(hostError('remote_process_request_invalid')); }
@@ -458,9 +508,10 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
         const tool = String(request.operation?.tool || '');
         if (!operationId || !targetId || !parentRunId || !toolCallId || !NATIVE_FILESYSTEM_TOOLS.has(tool)) return Promise.reject(hostError('remote_filesystem_request_invalid'));
         let operation;
+        const traceContext = traceContextCarrier(request.traceContext);
         try {
           const args = jsonObject(request.operation?.arguments || {}, 'remote_filesystem_request_invalid');
-          operation = { operationId, targetId, parentRunId, toolCallId, tool, arguments: args };
+          operation = { operationId, targetId, parentRunId, toolCallId, tool, arguments: args, ...(traceContext ? { traceContext } : {}) };
         } catch { return Promise.reject(hostError('remote_filesystem_request_invalid')); }
         const requestId = randomUUID();
         return new Promise((resolve, reject) => {
