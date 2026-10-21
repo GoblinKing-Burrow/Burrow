@@ -1,7 +1,9 @@
 # Mods
 
+
 !!! warning "Earlier technical reference"
     This page is retained from earlier documentation and has not been fully revalidated for the public 2026.10.19 release. Its revision-specific links and examples may describe older or development behavior. Start with the [current public-release user guide](../../guide/installation.md); do not use this page alone to select installation commands, image tags, or security settings.
+
 
 Mods are trusted installed server/UI code. Distribution, activation, tool grants and application data are separate lifecycles. See [extension development](../../development/extensions.md) and [trust boundaries](../../security/trust-boundaries.md) before installing a source.
 
@@ -14,6 +16,12 @@ The management API supports adding/removing sources, refreshing release discover
 Sources use validated Git URLs, tagged manifests and checked archives. The current installer chooses the latest accepted version tag; an explicit requested version must match that latest release. Do not assume arbitrary historical pin/rollback selection. Source discovery is not auto-update installation. Background refresh is normally every six hours, with stale checks/backoff; read/save its persisted settings through `/source-refresh`.
 
 Uninstall refuses system mods and preserves mod settings, encrypted secrets and `mods/mod-data/<id>`. Removing source metadata and uninstalling code are separate actions. Active lifecycle changes can be refused while the mod is busy; inspect the response rather than retrying destructive transitions blindly.
+## Operator-owned system capability access
+
+`GET`/`PUT /api/operator/mods/{modId}/access` reads or replaces `grants`, `adminAgentIds` and `diagnosticAgentIds`. Supply all three arrays on replacement; grants must be declared by that mod and supported by Core. A manifest alone does not grant system capabilities. The response includes `declaredCapabilities` and reports `restartRequired` after a save.
+
+In public **2026.10.19**, this route requires an authenticated operator even when ordinary UI auth is `none`; diagnostics tokens are always rejected. Unpromoted development build **2026.10.21.2** changes that route to accept direct operator actions in `none` mode, while continuing to reject API tokens. This development behavior must not be assumed for the public release.
+
 ## Mod-specific routes and assets
 
 Enabled loaded mods can register JSON HTTP routes beneath `/api/mods/{modId}/…` using GET, POST, PUT, PATCH or DELETE. They are not enumerable from the core OpenAPI artifact: each installed extension supplies its own route contract. Declared Control, Settings and Archive UI entry points/assets use the same namespace.
@@ -32,6 +40,8 @@ Methods are significant. Braced segments are placeholders; URL-encode identifier
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/mods` | List loaded mods and host contributions |
+| `GET` | `/api/operator/mods/{modId}/access` | Read operator-owned system capability grants |
+| `PUT` | `/api/operator/mods/{modId}/access` | Replace operator-owned system capability grants |
 | `GET` | `/api/mod-management` | List installed and available mods |
 | `GET` | `/api/mod-management/source-refresh` | Read persisted mod source refresh settings |
 | `PUT` | `/api/mod-management/source-refresh` | Replace persisted mod source refresh settings |
@@ -42,3 +52,11 @@ Methods are significant. Braced segments are placeholders; URL-encode identifier
 | `POST` | `/api/mod-management/{modId}/enable` | Enable an installed mod |
 | `POST` | `/api/mod-management/{modId}/disable` | Disable an installed mod |
 | `POST` | `/api/mod-management/{modId}/uninstall` | Uninstall a mod while preserving settings |
+
+## Targeted source review
+
+Corrections on this page were checked against public **2026.10.19**; any newer development behavior is labeled separately. This was static source inspection, not a live deployment test. Other retained details remain subject to the earlier-reference warning.
+
+- [backend/src/mod-authority.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/mod-authority.mjs)
+- [backend/src/mod-distribution.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/mod-distribution.mjs)
+- [backend/src/mod-runtime.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/mod-runtime.mjs)
