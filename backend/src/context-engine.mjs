@@ -90,8 +90,11 @@ export async function buildTurnContext({
     if (!store) throw new Error('agent_profile_store_required');
     try {
       const documents = await store.list(agentRuntime.agentId);
+      // DREAM_MEMORY remains operator-readable legacy state, but is retired from
+      // runtime prompt injection. Dreaming now publishes individual Brains.
+      const promptDocuments = documents.filter(document => document.kind !== 'DREAM_MEMORY');
       profileFiles = documents.length === AGENT_PROFILE_KINDS.length
-        ? profileFilesFromDocuments(documents, { agentId: agentRuntime.agentId })
+        ? profileFilesFromDocuments(promptDocuments, { agentId: agentRuntime.agentId, globalDocuments: await store.listGlobal(), globalProfile: await store.globalProfile(agentRuntime.agentId) })
         : { profileDir: 'postgres:agent_profile_documents', files: [{ id: 'profile-unavailable', name: 'PROFILE_UNAVAILABLE.md', path: `postgres:agent_profile_documents/${agentRuntime.agentId}`, content: 'Agent profile documents are unavailable. Do not borrow another agent profile; report this configuration blocker if it affects the task.', chars: 125 }], chars: 125 };
     } finally { /* composed store remains open */ }
   }
@@ -110,6 +113,21 @@ function renderedMessageChars(messages = []) {
     const rendered = `${message.role}: ${String(message.content || '').trim()}`;
     return total + rendered.length + (index ? 2 : 0);
   }, 0);
+}
+
+function entryInstant(entry = {}) {
+  const value = Date.parse(entry.ts ?? entry.timestamp ?? entry.at ?? entry.createdAt ?? '');
+  return Number.isFinite(value) ? value : null;
+}
+
+function activeTranscriptAfterReset(transcript = [], resetAt = null) {
+  const resetInstant = Date.parse(resetAt || '');
+  const entries = Array.isArray(transcript) ? transcript : [];
+  if (!Number.isFinite(resetInstant)) return entries;
+  return entries.filter((entry) => {
+    const instant = entryInstant(entry);
+    return instant === null || instant > resetInstant;
+  });
 }
 
 function latestRuntimeReceiptFromTranscript(transcript = []) {
@@ -305,7 +323,9 @@ export function inspectContextEngineResult({ sessionId = 'default', context, tra
 
 export async function inspectSessionContext({ rootDir, dataRoot = rootDir, sessionId = 'default', limits = {}, includeProfileFiles = false, agentRuntime = null, contextWindow = null, contextTokens = null, agentWorkspaceRoot = null, agentDataRoot = null, cacheRoot = null, stores = null, conversationStore = stores?.conversations || null, agentId = agentRuntime?.agentId || 'hatchet' } = {}) {
   assertContextBoundary({ rootDir, dataRoot, agentWorkspaceRoot, agentDataRoot, cacheRoot });
-  const transcript = await conversationAuthority({ store: conversationStore, agentId }).entriesAll(sessionId);
+  const authority = conversationAuthority({ store: conversationStore, agentId });
+  const snapshot = await authority.sessionSnapshot(sessionId);
+  const transcript = activeTranscriptAfterReset(snapshot.entries, snapshot.metadata?.resetAt);
   const context = await buildTurnContext({ rootDir, dataRoot, sessionId, transcript, limits, includeProfileFiles, agentRuntime, agentWorkspaceRoot, agentDataRoot, cacheRoot, stores, agentId });
   return inspectContextEngineResult({ sessionId, context, transcript, contextWindow, contextTokens });
 }
@@ -336,7 +356,9 @@ function compactCompressionSummary(summary = {}) {
 // inspection endpoint it contains no transcript, prompt text, or provider body.
 export async function inspectSessionContextStatus({ rootDir, dataRoot = rootDir, sessionId = 'default', limits = {}, contextConfig = {}, contextWindow = null, contextTokens = null, liveContext = null, agentRuntime = null, agentWorkspaceRoot = null, agentDataRoot = null, cacheRoot = null, stores = null, conversationStore = stores?.conversations || null, agentId = agentRuntime?.agentId || 'hatchet' } = {}) {
   assertContextBoundary({ rootDir, dataRoot, agentWorkspaceRoot, agentDataRoot, cacheRoot });
-  const transcript = await conversationAuthority({ store: conversationStore, agentId }).entriesAll(sessionId);
+  const authority = conversationAuthority({ store: conversationStore, agentId });
+  const snapshot = await authority.sessionSnapshot(sessionId);
+  const transcript = activeTranscriptAfterReset(snapshot.entries, snapshot.metadata?.resetAt);
   const context = await buildTurnContext({ rootDir, dataRoot, sessionId, transcript, limits, includeProfileFiles: false, agentRuntime, agentWorkspaceRoot, agentDataRoot, cacheRoot, stores, agentId });
   const inspection = inspectContextEngineResult({ sessionId, context, transcript, contextWindow, contextTokens });
   const budget = inspection.contextBudget || {};
@@ -361,7 +383,7 @@ export async function inspectSessionContextStatus({ rootDir, dataRoot = rootDir,
   // The active meter is a run-scoped high-water mark. Continuation payloads
   // remain transient for compression planning, but their observed pressure may
   // raise the displayed value without ever lowering it.
-  const meterKind = liveCanonicalTokens !== null ? 'live' : (hasFreshReceipt ? 'receipt' : 'persisted');
+  const meterKind = liveCanonicalTokens !== null ? 'live' : (hasFreshReceipt ? 'receipt' : (persistedMeter ? 'persisted' : 'reconstructed'));
   const sameRunPersistedTokens = liveIsContinuation && (!liveContext?.runId || !persistedMeter?.runId || persistedMeter.runId === liveContext.runId)
     ? finiteNumber(persistedMeter?.estimatedTokens)
     : null;
@@ -390,7 +412,7 @@ export async function inspectSessionContextStatus({ rootDir, dataRoot = rootDir,
       percent: displayedRatio === null ? null : Math.round(Math.max(0, Math.min(1, displayedRatio)) * 100),
       pressure: displayedPressure,
       source: meterKind === 'live' ? (liveContext.source || 'live-provider-request') : ((meterKind === 'persisted') ? (persistedMeter?.source || 'provider-request-estimate') : (budget.source || 'reconstructed')),
-      provenance: meterKind === 'live' ? (liveContext.provenance || (liveIsContinuation ? 'run-high-water-continuation' : 'run-high-water-initial')) : (persistedMeter?.provenance || null),
+      provenance: meterKind === 'live' ? (liveContext.provenance || (liveIsContinuation ? 'run-high-water-continuation' : 'run-high-water-initial')) : (meterKind === 'persisted' ? persistedMeter?.provenance || null : null),
       lastTurnAt: meterKind === 'live' ? (liveContext.updatedAt || null) : ((meterKind === 'persisted') ? persistedMeter?.updatedAt || null : (inspection.contextBuildReceipt?.entryId ? transcript.find((entry) => entry.id === inspection.contextBuildReceipt.entryId)?.ts || null : null)),
       ...(liveEstimatedTokens !== null ? { active: true, modelCall: finiteNumber(liveContext.modelCall), continuation: liveIsContinuation, providerInputTokens: finiteNumber(liveContext.providerInputTokens) } : {}),
       ...((meterKind === 'persisted' || meterKind === 'continuation-baseline') ? { modelCall: persistedMeter?.modelCall || null, continuation: meterKind === 'continuation-baseline' ? true : Boolean(persistedMeter?.continuation), providerInputTokens: persistedMeter?.providerInputTokens || null, runId: persistedMeter?.runId || null } : {}),

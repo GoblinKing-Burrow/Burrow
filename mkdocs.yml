@@ -37,10 +37,8 @@ theme:
     - search.suggest
     - search.highlight
     - content.code.copy
-
 plugins:
   - search
-
 markdown_extensions:
   - admonition
   - attr_list
@@ -60,7 +58,6 @@ markdown_extensions:
           format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.tabbed:
       alternate_style: true
-
 validation:
   nav:
     omitted_files: warn
@@ -71,10 +68,8 @@ validation:
     anchors: warn
     absolute_links: warn
     unrecognized_links: warn
-
 extra_css:
   - assets/stylesheets/extra.css?v=20261019-full-width-hero
-
 nav:
   - Home: index.md
   - User guide:
@@ -141,6 +136,7 @@ nav:
           - Developer setup: development/setup.md
           - Repository structure: development/repository.md
           - Extensions: development/extensions.md
+          - Third-party mod contract: development/mod-contract.md
           - Releases and versioning: development/releases.md
       - Project:
           - Known limitations: project/known-limitations.md

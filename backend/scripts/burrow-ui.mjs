@@ -7,7 +7,7 @@ import { SkillGitSync } from '../src/skill-git-sync.mjs';
 import { createSkillSourceRoutes } from './ui/skill-source-routes.mjs';
 import { performance } from 'node:perf_hooks';
 import { createChatStreamDelta } from '../src/chat-stream-delta.mjs';
-import { serializeSessionAdmission } from '../src/session-admission.mjs';
+import { beginSessionAdmissionSupersession, finishSessionAdmissionSupersession, serializeSessionAdmission } from '../src/session-admission.mjs';
 import { createBrainRoutes } from './ui/brain-routes.mjs';
 import { createArchiveService } from './ui/archive-service.mjs';
 import { completeSetupOperation } from '../src/setup-operation.mjs';
@@ -38,7 +38,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inspectSessionContext, inspectSessionContextStatus } from '../src/context-engine.mjs';
 import { activeConversationLimits } from '../src/context-preparation.mjs';
-import { chatTurnInputFromBody, createChatTurnRunId, runChatTurnFromBody, runChatTurnFromWorkbenchContinuation, chatTurnResponse, chatTurnProgressResponse, chatTurnErrorResponse, loadRuntimeConfig } from '../src/chat-turn-controller.mjs';
+import { beginRuntimeSessionExecutionSupersession, chatTurnInputFromBody, createChatTurnRunId, finishRuntimeSessionExecutionSupersession, runChatTurnFromBody, runChatTurnFromWorkbenchContinuation, chatTurnResponse, chatTurnProgressResponse, chatTurnErrorResponse, loadRuntimeConfig } from '../src/chat-turn-controller.mjs';
 import { resolveModelConfig, resolveRuntimeTracePath } from '../src/config.mjs';
 import { API_TOKEN_SCOPES } from '../src/api-token-store.mjs';
 import { loadEffectiveSkillCatalog, skillManifest } from '../src/skill-catalog.mjs';
@@ -47,6 +47,7 @@ import { listSubagentRecords, subagentVisibilitySummary } from '../src/subagent-
 import { buildContinuityHandoff } from '../src/continuity-handoff-store.mjs';
 import { createRecoveryContinuationScheduler } from '../src/recovery-continuation-runner.mjs';
 import { recordActiveRunInterruptions } from '../src/interrupted-run-recovery.mjs';
+import { postgresContinuity } from '../src/postgres-continuity.mjs';
 import { generateArchiveSummary } from '../src/archive-summary.mjs';
 import { loadWorkingContinuityAsync, normalizeContinuityScope, projectHandoffsIntoWorkingContinuity } from '../src/working-memory-continuity.mjs';
 import { workingContextFromSession } from '../src/working-context.mjs';
@@ -108,6 +109,7 @@ import { createScheduledChannelRoutes } from './ui/scheduled-channel-routes.mjs'
 import { createAuthRoutes } from './ui/auth-routes.mjs';
 import { createChatRoutes } from './ui/chat-routes.mjs';
 import { cleanupMods, createModRoute, discoverMods, loadMods } from '../src/mod-runtime.mjs';
+import { activeManagedSkillDeclarations, createManagedSkillSynchronizer, inspectManagedSkills, reconcileManagedSkills } from '../src/managed-skills.mjs';
 import { createModManagement } from '../src/mod-management.mjs';
 import { createModDistribution, createModManagementRoute } from '../src/mod-distribution.mjs';
 import { MAX_OVERVIEW_CHILD_CONTEXTS, normalizeOverviewBody, overviewSessionIds } from '../src/agent-overview.mjs';
@@ -143,6 +145,8 @@ const uiDistRoot = path.join(projectRoot, 'public', 'ui');
 const apiDocsRoot = path.join(sourceRoot, 'public', 'api-docs');
 const port = Number(process.env.BURROW_UI_PORT || process.argv.find((arg) => arg.startsWith('--port='))?.split('=')[1] || 42817);
 const host = process.env.BURROW_UI_HOST || '0.0.0.0';
+const configuredRunCancellationGraceMs = Number(process.env.BURROW_RUN_CANCELLATION_GRACE_MS || 5_000);
+const RUN_CANCELLATION_GRACE_MS = Number.isFinite(configuredRunCancellationGraceMs) ? Math.max(1_000, configuredRunCancellationGraceMs) : 5_000;
 const authorityConfig = httpAuthorityConfig({ host, port });
 browserOriginConfig(); // Validate optional environment override at startup.
 const requestLifecycle = createBackgroundLifecycle({ name: 'runtime_request' });
@@ -155,9 +159,10 @@ const sessionContinuityHeads = new Map();
 // runtime queue in app-runtime.
 const sessionChatQueues = new Map();
 function sessionChatQueueKey(agentId, sessionId) { return `${String(agentId)}:${String(sessionId || 'default')}`; }
-async function serializeSessionChat({ agentId, sessionId, operation, signal }) {
+async function serializeSessionChat({ agentId, sessionId, operation, signal, onCancellationDeadline = null }) {
   const key = sessionChatQueueKey(agentId, sessionId);
-  return serializeSessionAdmission(sessionChatQueues, key, operation, signal);
+  const cancellationGraceMs = typeof RUN_CANCELLATION_GRACE_MS === 'number' ? RUN_CANCELLATION_GRACE_MS : 10_000;
+  return serializeSessionAdmission(sessionChatQueues, key, operation, signal, { cancellationGraceMs, onCancellationDeadline });
 }
 const claudeCodeLoginConnectionIds = new Map();
 const groupChannelRuns = new Map();
@@ -305,7 +310,7 @@ async function executeBoardTask(taskId) {
   if (!dispatch.ok) return dispatch;
   const { task, project, agentRuntime, sessionId, runId, updated } = dispatch;
   const controller = new AbortController();
-  const record = { agentId: agentRuntime.agentId, runId, sessionId, controller, startedAt: new Date().toISOString(), phase: 'thinking', latestUserMessage: taskExecutionMessage(task, project).slice(0, 16_000), progress: [], contextUsage: null, cancelled: false, reason: null, detached: true, steeringReady: false, taskId: task.id };
+  const record = { agentId: agentRuntime.agentId, runId, sessionId, controller, startedAt: new Date().toISOString(), phase: 'thinking', latestUserMessage: taskExecutionMessage(task, project).slice(0, 16_000), objective: taskExecutionMessage(task, project).slice(0, 16_000), progress: [], contextUsage: null, cancelled: false, reason: null, detached: true, steeringReady: false, taskId: task.id };
   const headKey = sessionContinuityHeadKey(agentRuntime.agentId, sessionId);
   sessionContinuityHeads.set(headKey, record);
   activeChatRuns.set(activeChatRunKey(agentRuntime.agentId, runId), record);
@@ -318,7 +323,9 @@ async function executeBoardTask(taskId) {
     resolveAgentRuntime,
     telemetry: otelRuntime,
     runSource: 'task-board',
-    registerNestedAgentRun: ({ agentRuntime: nestedRuntime, sessionId: nestedSessionId, runId: nestedRunId, message, source, ...a2a }) => registerActiveAgentRun(activeChatRuns, { agentId: nestedRuntime.agentId, sessionId: nestedSessionId, runId: nestedRunId, message, source, a2a: source === 'a2a' ? a2a : null }),
+    cancellationGraceMs: RUN_CANCELLATION_GRACE_MS,
+    onCancellationDeadline: () => retireCancelledRun(record),
+    registerNestedAgentRun: ({ agentRuntime: nestedRuntime, sessionId: nestedSessionId, runId: nestedRunId, message, source, ...a2a }) => registerRuntimeActiveRun({ agentId: nestedRuntime.agentId, sessionId: nestedSessionId, runId: nestedRunId, message, source, a2a: source === 'a2a' ? a2a : null }),
     onModelTextDelta: createChatStreamDelta({ record, type: 'assistant.delta', runId, sessionId, write: () => {} }),
     onModelThoughtDelta: createChatStreamDelta({ record, type: 'assistant.thought', runId, sessionId, write: () => {} }),
     onSteeringReady: () => { record.steeringReady = true; },
@@ -359,6 +366,29 @@ function updateContextUsageHighWater(previous, usage) {
   if (!candidates.length) return { ...usage };
   const highWater = Math.max(...candidates);
   return { ...usage, estimatedTokens: highWater, highWaterEstimatedTokens: highWater, highWaterProviderInputTokens: Math.max(...[previousProvider, currentProvider].filter((value) => value !== null), 0) || null, provenance: usage.continuation ? 'run-high-water-continuation' : 'run-high-water-initial' };
+}
+
+function registerRuntimeActiveRun(options) {
+  const lifecycle = registerActiveAgentRun(activeChatRuns, options);
+  lifecycle.cancellationGraceMs = RUN_CANCELLATION_GRACE_MS;
+  lifecycle.onCancellationDeadline = () => retireCancelledRun(lifecycle.record);
+  return lifecycle;
+}
+
+async function retireCancelledRun(record, { recovery = record?.source === 'recovery' } = {}) {
+  if (!record?.agentId || !record?.sessionId || !record?.runId) return { ok: false, stale: true };
+  const authority = postgresContinuity({ store: postgresApplication.stores.conversations, agentId: record.agentId });
+  const retired = await authority.retire({
+    sessionId: record.sessionId,
+    runId: record.runId,
+    generation: Number.isSafeInteger(record.generation) ? record.generation : null,
+    reason: String(record.reason || 'cancellation_deadline_exceeded'),
+    objective: record.objective || record.latestUserMessage || null,
+    recovery,
+  });
+  const key = activeChatRunKey(record.agentId, record.runId);
+  if (retired.ok && activeChatRuns.get(key) === record) activeChatRuns.delete(key);
+  return retired;
 }
 
 function sessionContinuityHeadKey(agentId, sessionId) {
@@ -997,12 +1027,20 @@ async function deleteAgent(id) {
 async function agentProfileDocuments(agentId, body = null) {
   const store = profilesStore();
   try {
-    if (body === null) return { ok: true, documents: await store.list(agentId) };
-    return { ok: true, documents: await store.replace(agentId, body.documents) };
+    if (body === null) return { ok: true, documents: await store.list(agentId), globalProfile: await store.globalProfile(agentId) };
+    const result = await store.replaceWithGlobalProfile(agentId, body.documents, body.globalProfile);
+    return { ok: true, ...result };
   } catch (error) {
     const message = String(error?.message || error);
     return { ok: false, status: message === 'agent_not_found' ? 404 : 400, error: message };
   } finally { await store.close(); }
+}
+
+async function globalProfileDocuments(body = null) {
+  const store = profilesStore();
+  try { return { ok: true, documents: body === null ? await store.listGlobal() : await store.replaceGlobal(body.documents) }; }
+  catch (error) { return { ok: false, status: 400, error: String(error?.message || error) }; }
+  finally { await store.close(); }
 }
 
 async function agentDreamSettings(agentId, body = null) {
@@ -2429,7 +2467,8 @@ async function agentOverview(body = {}) {
         agentStatusForSession(sessionId, agentRuntime),
         runtimeConfig(agent.id),
       ]);
-      const active = [...activeChatRuns.values()].find((run) => run.agentId === agent.id && run.sessionId === sessionId && !run.controller.signal.aborted) || null;
+      const matchingRuns = [...activeChatRuns.values()].filter((run) => run.agentId === agent.id && run.sessionId === sessionId);
+      const active = matchingRuns.find((run) => !run.controller.signal.aborted) || matchingRuns.at(-1) || null;
       const limits = activeConversationLimits({ modelConfig: runtime.modelConfig, contextConfig: runtime.contextConfig });
       const childSessionIds = status.agents
         .filter((item) => item.sessionId !== sessionId)
@@ -2492,11 +2531,12 @@ async function agentStatusForSession(sessionId = 'default', agentRuntime = null)
       subagentId: item.id,
       result: item.result || null,
     }));
-  const active = [...activeChatRuns.values()].find((run) => run.agentId === agentRuntime?.agentId && run.sessionId === sessionId && !run.controller.signal.aborted) || null;
+  const matchingRuns = [...activeChatRuns.values()].filter((run) => run.agentId === agentRuntime?.agentId && run.sessionId === sessionId);
+  const active = matchingRuns.find((run) => !run.controller.signal.aborted) || matchingRuns.at(-1) || null;
   return {
     sessionId,
     agents: [
-      { sessionId, parentSessionId: null, label: agentRuntime?.agent?.name || agentRuntime?.agentId || 'Hatchet', status: active ? (active.phase === 'streaming' ? 'STREAMING' : 'THINKING') : 'IDLE', since: active ? new Date().toISOString() : null },
+      { sessionId, parentSessionId: null, label: agentRuntime?.agent?.name || agentRuntime?.agentId || 'Hatchet', status: active ? (active.controller.signal.aborted ? 'CANCELLING' : active.phase === 'streaming' ? 'STREAMING' : 'THINKING') : 'IDLE', since: active ? new Date().toISOString() : null },
       ...children,
     ],
   };
@@ -2618,22 +2658,28 @@ async function handleChatCommand({ parsed, sessionId, agentRuntime } = {}) {
   if (parsed.args && !(parsed.command === 'context' && parsed.args === 'full')) return { status: 400, response: chatCommandResponse({ command: parsed.command, sessionId, text: `${parsed.definition.usage} does not accept arguments.`, receipt: { error: 'command_arguments_not_supported' }, ok: false }) };
   if (parsed.command === 'help') return { status: 200, response: chatCommandResponse({ command: 'help', sessionId, text: chatCommandHelpText(), receipt: { available: ['help', 'context', 'status', 'new', 'stop'] } }) };
   if (parsed.command === 'new') {
-    const active = [...activeChatRuns.values()].find((run) => run.agentId === agentRuntime.agentId && run.sessionId === sessionId && !run.controller.signal.aborted) || null;
-    if (active) await cancelChatRun(active.runId, { reason: 'superseded by /new' }, agentRuntime);
-    await sessionWriteHandoff({ agentId: agentRuntime.agentId, sessionId, title: `Boundary checkpoint before new conversation: ${sessionId}`, runId: `session-reset-${Date.now()}`, message: `Preserve the useful state from session ${sessionId} before starting a new conversation.` });
-    const reset = await postgresApplication.stores.conversations.reset({ agentId: agentRuntime.agentId, sessionId });
-    void archiveSummaryForReset({ agentId: agentRuntime.agentId, rootDir: agentRuntime.agentWorkspaceRoot, sessionId, archiveId: reset.archiveId, archivedPath: reset.archivedPath }).catch(() => {});
-    return { status: 200, response: chatCommandResponse({ command: 'new', sessionId, text: 'Started a fresh conversation. Prior history was archived; it was not deleted.', receipt: { conversationId: reset.conversationId, archivedPath: reset.archivedPath || null, resetAt: reset.resetAt || reset.metadata?.resetAt || null, ...(reset.archiveId ? { archiveId: reset.archiveId } : {}), ...(active ? { cancelledRunId: active.runId } : {}) } }) };
+    const resetBarrier = await beginSessionAdmissionsReset({ agentId: agentRuntime.agentId, sessionId });
+    try {
+      const supersededRuns = await supersedeSessionRuns({ agentId: agentRuntime.agentId, sessionId, reason: 'superseded by /new' });
+      const active = supersededRuns[0] || null;
+      await sessionWriteHandoff({ agentId: agentRuntime.agentId, sessionId, title: `Boundary checkpoint before new conversation: ${sessionId}`, runId: `session-reset-${Date.now()}`, message: `Preserve the useful state from session ${sessionId} before starting a new conversation.` });
+      const reset = await postgresApplication.stores.conversations.reset({ agentId: agentRuntime.agentId, sessionId });
+      void archiveSummaryForReset({ agentId: agentRuntime.agentId, rootDir: agentRuntime.agentWorkspaceRoot, sessionId, archiveId: reset.archiveId, archivedPath: reset.archivedPath }).catch(() => {});
+      return { status: 200, response: chatCommandResponse({ command: 'new', sessionId, text: 'Started a fresh conversation. Prior history was archived; it was not deleted.', receipt: { conversationId: reset.conversationId, archivedPath: reset.archivedPath || null, resetAt: reset.resetAt || reset.metadata?.resetAt || null, ...(reset.archiveId ? { archiveId: reset.archiveId } : {}), ...(active ? { cancelledRunId: active.runId } : {}) } }) };
+    } finally { finishSessionAdmissionsReset(resetBarrier); }
   }
   if (parsed.command === 'stop') {
-    const active = [...activeChatRuns.values()].find((run) => run.agentId === agentRuntime.agentId && run.sessionId === sessionId && !run.controller.signal.aborted) || null;
+    const matchingRuns = [...activeChatRuns.values()].filter((run) => run.agentId === agentRuntime.agentId && run.sessionId === sessionId);
+    const active = matchingRuns.find((run) => !run.controller.signal.aborted) || matchingRuns.at(-1) || null;
     if (!active) return { status: 200, response: chatCommandResponse({ command: 'stop', sessionId, text: 'No active run in this session.', receipt: { status: 'idle' } }) };
+    if (active.controller.signal.aborted) return { status: 200, response: chatCommandResponse({ command: 'stop', sessionId, text: `Run ${active.runId} is already cancelling.`, receipt: { status: 'cancelling', runId: active.runId, agentId: active.agentId, sessionId: active.sessionId, reason: active.reason || null } }) };
     const cancelled = await cancelChatRun(active.runId, { reason: 'stopped by /stop' }, agentRuntime);
     return { status: 200, response: chatCommandResponse({ command: 'stop', sessionId, text: `Stopped active run ${active.runId}.`, receipt: cancelled }) };
   }
   const runtime = await runtimeConfig(agentRuntime.agentId);
   const limits = activeConversationLimits({ modelConfig: runtime.modelConfig, contextConfig: runtime.contextConfig });
-  const active = [...activeChatRuns.values()].find((run) => run.agentId === agentRuntime.agentId && run.sessionId === sessionId && !run.controller.signal.aborted) || null;
+  const matchingRuns = [...activeChatRuns.values()].filter((run) => run.agentId === agentRuntime.agentId && run.sessionId === sessionId);
+  const active = matchingRuns.find((run) => !run.controller.signal.aborted) || matchingRuns.at(-1) || null;
   const status = await inspectSessionContextStatus({ stores: postgresApplication.stores, agentId: agentRuntime.agentId, rootDir: projectRoot, dataRoot: agentRuntime.agentWorkspaceRoot, sessionId, limits, contextConfig: runtime.contextConfig, contextWindow: runtime.modelConfig?.contextWindow, contextTokens: runtime.modelConfig?.contextTokens, liveContext: active?.contextUsage || null });
   const context = status.context || {};
   if (parsed.command === 'context') {
@@ -2659,10 +2705,10 @@ async function handleChat(req, res) {
     return sendJson(res, error?.statusCode || 500, { ok: false, error: String(error?.message || error) });
   }
   const sessionId = String(body.sessionId || 'default');
-  // Cancellation must reach the active turn, not wait for that turn to finish.
-  // Keep boundary validation, agent resolution, and command response handling
-  // shared with ordinary requests; only /stop bypasses session serialization.
-  if (parseChatCommand(body.message)?.command === 'stop') {
+  // Cancellation, reset, and read-only status must reach the active turn, not
+  // wait for that turn to finish. Mutating ordinary chat remains serialized
+  // within the current session generation.
+  if (['stop', 'new', 'status'].includes(parseChatCommand(body.message)?.command)) {
     return handleSerializedChat({ req, res, body, agentRuntime, sessionId });
   }
   const admission = new AbortController();
@@ -2704,7 +2750,7 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
   const runId = body.runId ? String(body.runId) : createChatTurnRunId({ sessionId, prefix: 'ui' });
   if (activeChatRuns.has(activeChatRunKey(agentRuntime.agentId, runId))) throw Object.assign(new Error('chat_run_id_already_used'), { statusCode: 409 });
   const controller = new AbortController();
-  const record = { agentId: agentRuntime.agentId, runId, sessionId, controller, startedAt: new Date().toISOString(), phase: 'thinking', latestUserMessage: String(body.message || '').trim().slice(0, 16_000), progress: [], contextUsage: null, cancelled: false, reason: null, detached: false, steeringReady: false };
+  const record = { agentId: agentRuntime.agentId, runId, sessionId, controller, startedAt: new Date().toISOString(), phase: 'thinking', latestUserMessage: String(body.message || '').trim().slice(0, 16_000), objective: String(body.message || '').trim().slice(0, 16_000), progress: [], contextUsage: null, cancelled: false, reason: null, detached: false, steeringReady: false };
   const headKey = sessionContinuityHeadKey(agentRuntime.agentId, sessionId);
   sessionContinuityHeads.set(headKey, record);
   activeChatRuns.set(activeChatRunKey(agentRuntime.agentId, runId), record);
@@ -2726,7 +2772,9 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
       latencyTiming,
       telemetry: otelRuntime,
       runSource: 'operator-chat',
-      registerNestedAgentRun: ({ agentRuntime: nestedRuntime, sessionId: nestedSessionId, runId: nestedRunId, message, source, ...a2a }) => registerActiveAgentRun(activeChatRuns, { agentId: nestedRuntime.agentId, sessionId: nestedSessionId, runId: nestedRunId, message, source, a2a: source === 'a2a' ? a2a : null }),
+      cancellationGraceMs: RUN_CANCELLATION_GRACE_MS,
+      onCancellationDeadline: () => retireCancelledRun(record),
+      registerNestedAgentRun: ({ agentRuntime: nestedRuntime, sessionId: nestedSessionId, runId: nestedRunId, message, source, ...a2a }) => registerRuntimeActiveRun({ agentId: nestedRuntime.agentId, sessionId: nestedSessionId, runId: nestedRunId, message, source, a2a: source === 'a2a' ? a2a : null }),
       onTraceRecord: (traceRecord) => {
         const progress = publicChatProgress(traceRecord);
         if (progress) {
@@ -2773,15 +2821,15 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
     if (streaming) { writeNdjson(res, { type: 'run.completed', runId, sessionId, ts: new Date().toISOString(), data: { response: streamResponse } }); return res.end(); }
     return sendJson(res, 200, response);
   } catch (error) {
-    const errorResponse = chatTurnErrorResponse(error);
-    if (errorResponse) {
-      if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: errorResponse.body } }); return res.end(); }
-      return sendJson(res, errorResponse.status, errorResponse.body);
-    }
     if (controller.signal.aborted) {
       const response = { ok: false, error: String(record.reason || error?.message || 'agent_stopped'), runId };
       if (streaming) { writeNdjson(res, { type: 'run.cancelled', runId, sessionId, ts: new Date().toISOString(), data: { response } }); return res.end(); }
       return sendJson(res, 499, response);
+    }
+    const errorResponse = chatTurnErrorResponse(error);
+    if (errorResponse) {
+      if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: errorResponse.body } }); return res.end(); }
+      return sendJson(res, errorResponse.status, errorResponse.body);
     }
     if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: { ok: false, error: String(error?.message || error), runId } } }); return res.end(); }
     throw error;
@@ -2803,6 +2851,34 @@ async function cancelGroupChannelRun(channelId, runId, body = {}) {
 
 async function cancelChatRun(runId, body = {}, agentRuntime = null) {
   return cancelActiveChatRun(activeChatRuns, runId, { body, agentId: agentRuntime?.agentId || null });
+}
+
+async function supersedeSessionRuns({ agentId, sessionId, reason = 'superseded by session reset' } = {}) {
+  const matches = [...activeChatRuns.values()].filter((run) => run.agentId === agentId && run.sessionId === sessionId);
+  const superseded = [];
+  for (const run of matches) {
+    sessionContinuityHeads.delete(sessionContinuityHeadKey(agentId, sessionId));
+    const result = cancelActiveChatRun(activeChatRuns, run.runId, { body: { reason }, agentId });
+    if (result.ok) superseded.push(...result.cancelledRuns);
+    else if (run.controller.signal.aborted) superseded.push({ runId: run.runId, agentId: run.agentId, sessionId: run.sessionId });
+  }
+  return superseded.filter((run, index, all) => all.findIndex((candidate) => candidate.agentId === run.agentId && candidate.runId === run.runId) === index);
+}
+
+async function beginSessionAdmissionsReset({ agentId, sessionId } = {}) {
+  const agentRuntime = await resolveAgentRuntime(agentId);
+  const http = beginSessionAdmissionSupersession(sessionChatQueues, sessionChatQueueKey(agentId, sessionId));
+  try {
+    return { http, runtime: beginRuntimeSessionExecutionSupersession({ rootDir: projectRoot, sessionId, agentRuntime }) };
+  } catch (error) {
+    finishSessionAdmissionSupersession(http);
+    throw error;
+  }
+}
+
+function finishSessionAdmissionsReset(tokens = {}) {
+  finishRuntimeSessionExecutionSupersession(tokens.runtime);
+  finishSessionAdmissionSupersession(tokens.http);
 }
 
 async function steerChatRun(runId, body, agentRuntime) {
@@ -2870,14 +2946,14 @@ const skillApi = {
   agentSkills: async (id) => { const runtime = await resolveAgentContext(id); const assignments = await skillStoreCall(store => store.assignments(runtime.agentId)); const catalog = await loadEffectiveSkillCatalog({ workspaceRoot: runtime.workspaceRoot, agentRuntime: runtime, skillStore: postgresApplication.stores.skills }); return { ok: true, ...assignments, effectiveSkills: catalog.skills.map(skillManifest) }; },
   saveAgentSkills: async (id, body) => { const runtime = await resolveAgentContext(id); await skillStoreCall(store => store.replaceAssignments(runtime.agentId, body.skillIds)); return skillApi.agentSkills(runtime.agentId); },
 };
-const settingsRoute = createSettingsRoutes({ timezoneSettings: async () => ({ ok: true, timezone: await operatorTimezone(postgresApplication.stores.metadata) }), saveTimezoneSettings: (body) => saveOperatorTimezone(postgresApplication.stores.metadata, body), ...skillApi, readJsonBody, sendJson, modelConnections, claudeCliCredentialStatus, importClaudeCliCredential, startOpenAiOAuthLoginApi, openAiOAuthLoginStatus, submitOpenAiOAuthLoginApi, cancelOpenAiOAuthLoginApi, startClaudeCodeLoginApi, claudeCodeLoginStatus, submitClaudeCodeLoginApi, cancelClaudeCodeLoginApi, importClaudeCodeLoginApi, mcpConnections, discoverMcpConnection, diagnoseMcpConnection, saveMcpConnection, removeMcpConnection, agentMcpTools, saveAgentMcpTools, agentModelSelection, saveAgentModelSelection, agentMinionModelSelection, saveAgentMinionModelSelection, archiveSummaryModelSelection: async (agentId) => ({ ok: true, selection: await archiveSummarySelection((await resolveAgentRuntime(agentId)).agentId) }), saveArchiveSummaryModelSelection, discoverModelConnection, saveModelConnection, removeModelConnection: async (id) => await modelsStore().remove(id), completeSetupOperation: async body => { try { return await completeSetupOperation({ pool: postgresApplication.pool, encryptionKey: modelsStore().key, body }); } catch (error) { return { ok: false, status: error.message === 'setup_operation_conflict' || error.message === 'agent_id_exists' ? 409 : 400, error: error.message }; } }, setupStatus: async () => postgresApplication.stores.setupState.readStatus(), completeSetup: async () => postgresApplication.stores.setupState.completeSetup() });
+const settingsRoute = createSettingsRoutes({ globalProfileDocuments, timezoneSettings: async () => ({ ok: true, timezone: await operatorTimezone(postgresApplication.stores.metadata) }), saveTimezoneSettings: (body) => saveOperatorTimezone(postgresApplication.stores.metadata, body), ...skillApi, readJsonBody, sendJson, modelConnections, claudeCliCredentialStatus, importClaudeCliCredential, startOpenAiOAuthLoginApi, openAiOAuthLoginStatus, submitOpenAiOAuthLoginApi, cancelOpenAiOAuthLoginApi, startClaudeCodeLoginApi, claudeCodeLoginStatus, submitClaudeCodeLoginApi, cancelClaudeCodeLoginApi, importClaudeCodeLoginApi, mcpConnections, discoverMcpConnection, diagnoseMcpConnection, saveMcpConnection, removeMcpConnection, agentMcpTools, saveAgentMcpTools, agentModelSelection, saveAgentModelSelection, agentMinionModelSelection, saveAgentMinionModelSelection, archiveSummaryModelSelection: async (agentId) => ({ ok: true, selection: await archiveSummarySelection((await resolveAgentRuntime(agentId)).agentId) }), saveArchiveSummaryModelSelection, discoverModelConnection, saveModelConnection, removeModelConnection: async (id) => await modelsStore().remove(id), completeSetupOperation: async body => { try { return await completeSetupOperation({ pool: postgresApplication.pool, encryptionKey: modelsStore().key, body }); } catch (error) { return { ok: false, status: error.message === 'setup_operation_conflict' || error.message === 'agent_id_exists' ? 409 : 400, error: error.message }; } }, setupStatus: async () => postgresApplication.stores.setupState.readStatus(), completeSetup: async () => postgresApplication.stores.setupState.completeSetup() });
 const agentRoute = createAgentRoutes({ readJsonBody, sendJson, validateBoundaryBody, agentsStore, createAgent, updateAgent, deleteAgent, agentProfileDocuments, selectedAgentRuntime, agentStatusForSession, agentOverview });
 const { archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveContinuityCards, archiveContinuityCardDetail } = createArchiveService({
   stores: () => postgresApplication.stores, agentsStore, dreamDiaryStore,
   resolveAgentRuntime, runtimeConfig, runtimeTraceRoot, settingsKeyFromEnvironment,
   isChatMessage, compactChatTurn, summarizeSessionTurns, boundedInteger,
 });
-const sessionRoute = createSessionRoutes({ rootDir: projectRoot, readJsonBody, sendJson, resolveAgentRuntime, runtimeAgentWorkspaceRoot, runtimeDataRoot, runtimeSessionRoot, runtimeConfig, activeConversationLimits, inspectSessionContext, inspectSessionContextStatus, activeChatRuns, searchSessionEvidence, searchBurrowSessionEvidence, agentsStore, agentRuntimeContext, archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveContinuityCards, archiveContinuityCardDetail, listSessions, sessionDetail, sessionWriteHandoff, sessionContinuityScope, setSessionContinuityScope, clearSessionContinuityScope, sessionReadHandoff, sessionWriteHandoffCandidate, archiveSummaryForReset, archiveSummaryForSession, latestAuthorityExplanationForSession, listAuthorityExplanationsForSession, conversationStore: postgresApplication.stores.conversations });
+const sessionRoute = createSessionRoutes({ rootDir: projectRoot, readJsonBody, sendJson, resolveAgentRuntime, runtimeAgentWorkspaceRoot, runtimeDataRoot, runtimeSessionRoot, runtimeConfig, activeConversationLimits, inspectSessionContext, inspectSessionContextStatus, activeChatRuns, searchSessionEvidence, searchBurrowSessionEvidence, agentsStore, agentRuntimeContext, archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveContinuityCards, archiveContinuityCardDetail, listSessions, sessionDetail, sessionWriteHandoff, sessionContinuityScope, setSessionContinuityScope, clearSessionContinuityScope, sessionReadHandoff, sessionWriteHandoffCandidate, archiveSummaryForReset, archiveSummaryForSession, supersedeSessionRuns, beginSessionAdmissionsReset, finishSessionAdmissionsReset, latestAuthorityExplanationForSession, listAuthorityExplanationsForSession, conversationStore: postgresApplication.stores.conversations });
 const brainRoute = createBrainRoutes({ store: postgresApplication.stores.brains, embeddings: postgresApplication.stores.brainEmbeddings, readJsonBody, sendJson });
 const generalSettingsRoute = createGeneralSettingsRoutes({ readJsonBody, sendJson, chatIdentities, saveChatIdentity, curatorSettings, saveCuratorSettings, tiddleSettings: async (agentId) => tiddleStatus({ agentId, stores: postgresApplication.stores, }), tiddleCards: async (query) => listTiddleCards({ ...query, stores: postgresApplication.stores, }), tiddleHistory: async (query) => tiddleHistory({ ...query, stores: postgresApplication.stores, }), uiAuthSettings, saveUiAuthSettings, browserOriginSettings: () => browserOriginSettings({ metadata: metadataStore() }), saveBrowserOriginSettings: body => saveBrowserOriginSettings(body, { metadata: metadataStore() }), browserTabSettings: () => browserTabSettings({ metadata: metadataStore() }), saveBrowserTabSettings: body => saveBrowserTabSettings(body, { metadata: metadataStore() }), otelSettings: () => otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }), saveOtelSettings: async body => { let result = await saveOtelSettings(body, { store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); if (result.ok) { try { await otelRuntime.apply(await readOtelRuntimeConfig({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore() })); await applyOtelConfigurationToNodeGoblins(); } catch (error) { serverLogger.event('otel_configuration_apply_failed', { error: String(error?.message || 'configuration_failed') }); return { ok: false, status: 500, error: 'opentelemetry_configuration_apply_failed' }; } result = await otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); } return result; }, executionBoundarySettings, saveExecutionBoundarySettings, retentionPolicySettings, saveRetentionPolicySettings, retentionCleanup });
 const observabilityRoute = createObservabilityRoutes({ readJsonBody, sendJson, validateBoundaryBody, runtimeStatus, runtimeMetrics, codexLbAccounts, anthropicOauthUsage, openaiOauthUsage, currentActiveChatRunSummaries, selectedAgentRuntime, resolveAgentRuntime, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, listTraces, runtimeConfig, traceRootForRun, conversationStore: postgresApplication.stores.conversations, summarizeTrace, authorityExplanationFromTraceSummary, projectRoot });
@@ -2963,6 +3039,15 @@ const modLoadOptions = { modAuthority, modManagement: modManagementCapability, o
   if (!agent) throw new Error('agent_not_found');
   return agentRuntimeContext({ runtimeState: (await runtimeConfig()).runtimeState, agent }).agentWorkspaceRoot;
 } };
+const coreManagedSkills = [{ id: 'burrow-runtime', repository: 'https://github.com/GoblinKing-Burrow/Burrow-Skills.git', path: 'burrow-runtime/SKILL.md' }];
+async function reconcileRuntimeManagedSkills(mods = loadedMods) {
+  const workspaceRoot = (await runtimeConfig()).runtimeState.workspaceRoot;
+  return reconcileManagedSkills({ root: path.join(workspaceRoot, 'global', 'managed-skills'), declarations: activeManagedSkillDeclarations(mods, coreManagedSkills) });
+}
+const managedSkillSynchronizer = createManagedSkillSynchronizer({
+  reconcile: () => reconcileRuntimeManagedSkills(),
+  intervalMs: Math.max(60_000, Number(process.env.BURROW_MANAGED_SKILL_SYNC_INTERVAL_MS || 6 * 60 * 60 * 1000)),
+});
 let modsStarting = true;
 const modRoute = createModRoute({ getMods: () => loadedMods, readJsonBody, sendJson });
 async function transitionMod({ modId, enabled, installed, action, reactivate = false }) {
@@ -2988,6 +3073,7 @@ async function transitionMod({ modId, enabled, installed, action, reactivate = f
     loadedMods = installed
       ? loadedMods.map((entry) => entry.id === modId ? { ...entry, host: null, routes: [], store: null, lifecycleCleanup: null, status: 'disabled' } : entry)
       : loadedMods.filter((entry) => entry.id !== modId);
+    await reconcileRuntimeManagedSkills();
     return;
   }
   if (reactivate && old) {
@@ -3017,6 +3103,7 @@ async function transitionMod({ modId, enabled, installed, action, reactivate = f
     throw error;
   }
   if (old) await cleanupMods([old]);
+  await reconcileRuntimeManagedSkills();
   await modLoadOptions.onExecutionProviderActivated?.(modId);
 }
 const modDistribution = createModDistribution({
@@ -3034,12 +3121,33 @@ await migrateLegacyExecutionProviderApproval({
   agents: await agentsStore().list({ includeDisabled: true }),
 });
 loadedMods = await loadMods(modLoadOptions);
+const initialManagedSkillSync = await managedSkillSynchronizer.tick();
+if (!initialManagedSkillSync.ok) await serverLogger.event('managed_skill_sync_failed', { error: initialManagedSkillSync.error });
 await applyOtelConfigurationToNodeGoblins();
 modsStarting = false;
 coreModManagement = createModManagement({ modAuthority, distribution: modDistribution, repositoryFactory: postgresApplication.modDistributionRepositoryFactory });
 await coreModManagement.ready;
 const modAuthorityRoute = createModAuthorityRoute({ authority: modAuthority, getMods: () => loadedMods, readJsonBody, sendJson });
-const modManagementRoute = createModManagementRoute({ distribution: modDistribution, readJsonBody, sendJson });
+const modManagementDistribution = {
+  ...modDistribution,
+  async list() {
+    const result = await modDistribution.list();
+    const workspaceRoot = (await runtimeConfig()).runtimeState.workspaceRoot;
+    const managedRoot = path.join(workspaceRoot, 'global', 'managed-skills');
+    const loadedById = new Map(loadedMods.map(mod => [mod.id, mod]));
+    return {
+      ...result,
+      mods: await Promise.all(result.mods.map(async mod => {
+        const declarations = loadedById.get(mod.id)?.managedSkills || [];
+        if (!declarations.length) return mod;
+        const installed = await inspectManagedSkills({ root: managedRoot, declarations });
+        const managedSkillVersion = installed.length === 1 ? installed[0].version : null;
+        return managedSkillVersion ? { ...mod, managedSkillVersion } : mod;
+      })),
+    };
+  },
+};
+const modManagementRoute = createModManagementRoute({ distribution: modManagementDistribution, readJsonBody, sendJson });
 
 const server = createServer((req, res) => {
   void requestLifecycle.track(() => handleRequest(req, res)).catch(error => {
@@ -3216,7 +3324,8 @@ async function handleRequest(req, res) {
 }
 
 let shuttingDown = false;
-const SHUTDOWN_DRAIN_MS = Math.max(1_000, Number(process.env.BURROW_SHUTDOWN_DRAIN_MS || 10_000));
+const configuredShutdownDrainMs = Number(process.env.BURROW_SHUTDOWN_DRAIN_MS || 10_000);
+const SHUTDOWN_DRAIN_MS = Number.isFinite(configuredShutdownDrainMs) ? Math.max(1_000, configuredShutdownDrainMs) : 10_000;
 let shutdownReason = 'service_shutdown';
 let httpClosePromise = null;
 // These existing producer close methods stop polling and drain their retained
@@ -3239,7 +3348,7 @@ const closeRuntimeResources = createCoordinatedShutdown({
     httpClosePromise = new Promise(resolve => server.close(() => resolve()));
     server.closeIdleConnections?.();
   },
-  producers: () => [skillSyncProducer, modDistributionProducer, requestLifecycle, startupLifecycle, scheduledJobScheduler, dreamCycleScheduler, tiddleScheduler, retentionScheduler, installStagingCleanupScheduler, recoveryContinuationScheduler, versionRefreshProducer],
+  producers: () => [skillSyncProducer, managedSkillSynchronizer, modDistributionProducer, requestLifecycle, startupLifecycle, scheduledJobScheduler, dreamCycleScheduler, tiddleScheduler, retentionScheduler, installStagingCleanupScheduler, recoveryContinuationScheduler, versionRefreshProducer],
   beforeDrain: async () => {
     try {
       await recordActiveRunInterruptions({ stores: postgresApplication.stores, activeRuns: activeChatRuns, resolveAgentRuntime, reason: shutdownReason });
@@ -3300,6 +3409,9 @@ server.listen(port, host, () => {
   await postgresApplication.stores.dreamCycles.reconcileInterrupted();
   if (shuttingDown) return;
   if (backgroundSchedulersEnabled()) {
+    void managedSkillSynchronizer.start().then(result => {
+      if (!result.ok) return serverLogger.event('managed_skill_sync_failed', { error: result.error });
+    }).catch(error => serverLogger.event('managed_skill_sync_failed', { error: String(error?.message || error) }));
     void skillGitSync.start().catch(error => serverLogger.event('skill_sync_startup_failed',{error:'skill_sync_failed'}));
     const store = postgresApplication.stores.scheduledJobs;
     try { await store.markMissedRuns(); await store.markMissedSchedules({ activeOwnerModIds: loadedMods.filter((mod) => mod.status === 'loaded').map((mod) => mod.id) }); } finally { /* Shared application store remains open. */ }
@@ -3326,11 +3438,12 @@ server.listen(port, host, () => {
     stores:postgresApplication.stores,
     agentRuntimes: await Promise.all((await agentsStore().list({ includeDisabled: false })).map((agent) => resolveAgentRuntime(agent.id))),
     createRunId: createChatTurnRunId,
+    cancellationGraceMs: Math.min(RUN_CANCELLATION_GRACE_MS, Math.max(0, SHUTDOWN_DRAIN_MS - 1_000)),
     runContinuation: async ({ runtime, sessionId, runId, manifest, continuation, signal }) => {
       const recoveryInstruction = continuation?.decision === 'resume'
         ? 'Continue the interrupted work using the runtime recovery record and bounded same-session transcript.'
         : 'Recover the interrupted work using the runtime recovery record. Reconcile durable state before acting; do not repeat completed work blindly.';
-      const lifecycle = registerActiveAgentRun(activeChatRuns, { agentId: runtime.agentId, sessionId, runId, message: `Recover interrupted run: ${manifest.objective || 'reconcile durable state'}`, source: 'recovery', parentSignal: signal });
+      const lifecycle = registerRuntimeActiveRun({ agentId: runtime.agentId, sessionId, runId, message: `Recover interrupted run: ${manifest.objective || 'reconcile durable state'}`, objective: manifest.objective || null, source: 'recovery', parentSignal: signal });
       try {
         return await runChatTurnFromBody({
           stores:postgresApplication.stores,
@@ -3340,7 +3453,9 @@ server.listen(port, host, () => {
           onTraceRecord: lifecycle.onTraceRecord, onModelTextDelta: lifecycle.onModelTextDelta,
           onModelThoughtDelta: lifecycle.onModelThoughtDelta, onModelContextUsage: lifecycle.onModelContextUsage,
           onSteeringReady: lifecycle.onSteeringReady,
-          registerNestedAgentRun: ({ agentRuntime: nestedRuntime, sessionId: nestedSessionId, runId: nestedRunId, message, source, ...a2a }) => registerActiveAgentRun(activeChatRuns, { agentId: nestedRuntime.agentId, sessionId: nestedSessionId, runId: nestedRunId, message, source, a2a: source === 'a2a' ? a2a : null }),
+          cancellationGraceMs: lifecycle.cancellationGraceMs,
+          onCancellationDeadline: lifecycle.onCancellationDeadline,
+          registerNestedAgentRun: ({ agentRuntime: nestedRuntime, sessionId: nestedSessionId, runId: nestedRunId, message, source, ...a2a }) => registerRuntimeActiveRun({ agentId: nestedRuntime.agentId, sessionId: nestedSessionId, runId: nestedRunId, message, source, a2a: source === 'a2a' ? a2a : null }),
         });
       } finally { lifecycle.finish(); }
     },

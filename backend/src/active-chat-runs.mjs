@@ -3,19 +3,22 @@ export function activeChatRunKey(agentId, runId) {
 }
 
 export function activeChatRunSummary(record = {}) {
+  const cancelling = record.controller?.signal?.aborted === true;
   return {
     runId: record.runId,
     agentId: record.agentId,
     sessionId: record.sessionId,
-    status: record.controller?.signal?.aborted ? 'cancelled' : 'running',
-    phase: record.phase || 'thinking',
+    // Records remain registered until their execution promise settles. An
+    // aborted registered record is therefore still draining, not terminal.
+    status: cancelling ? 'cancelling' : 'running',
+    phase: cancelling ? 'cancelling' : (record.phase || 'thinking'),
     startedAt: record.startedAt || null,
     latestUserMessage: record.latestUserMessage || null,
     answerText: record.answerText || null,
     progress: Array.isArray(record.progress) ? record.progress.slice(-50) : [],
     contextUsage: record.contextUsage || null,
     detached: record.detached === true,
-    steeringReady: record.steeringReady === true,
+    steeringReady: !cancelling && record.steeringReady === true,
     source: record.source || null,
     a2a: record.a2a || null,
     a2aActivities: Array.isArray(record.a2aActivities) ? record.a2aActivities.slice(-12) : [],
@@ -29,13 +32,14 @@ export function activeChatRunSummaries(activeChatRuns, { agentId = null, session
     .map(activeChatRunSummary);
 }
 
-export function registerActiveAgentRun(activeChatRuns, { agentId, sessionId = 'default', runId, message = '', source = 'internal', a2a = null, parentSignal = null } = {}) {
+export function registerActiveAgentRun(activeChatRuns, { agentId, sessionId = 'default', runId, message = '', objective = null, source = 'internal', a2a = null, parentSignal = null } = {}) {
   if (!agentId || !runId) throw new Error('active_agent_run_identity_required');
   if (activeChatRuns.has(activeChatRunKey(agentId, runId))) throw Object.assign(new Error('chat_run_id_already_used'), { statusCode: 409 });
   const controller = new AbortController();
   const record = {
     agentId: String(agentId), runId: String(runId), sessionId: String(sessionId || 'default'), controller,
     startedAt: new Date().toISOString(), phase: 'thinking', latestUserMessage: String(message || '').slice(0, 16_000),
+    objective: objective == null ? null : String(objective).slice(0, 16_000),
     progress: [], contextUsage: null, cancelled: false, reason: null, detached: true, steeringReady: false, source, a2a, a2aActivities: [],
   };
   const key = activeChatRunKey(record.agentId, record.runId);
@@ -95,12 +99,15 @@ export function cancelActiveChatRun(activeChatRuns, runId, { body = {}, agentId 
     if (!candidate || candidate.controller?.signal?.aborted) return;
     candidate.cancelled = true;
     candidate.reason = reason;
+    candidate.phase = 'cancelling';
+    candidate.steeringReady = false;
     cancelledRuns.push({ runId: candidate.runId, agentId: candidate.agentId, sessionId: candidate.sessionId });
     for (const child of activeChatRuns.values()) {
       if (child.a2a?.parentAgentId === candidate.agentId && child.a2a?.parentRunId === candidate.runId) cancelTree(child);
     }
+    candidate.cancelledAt ||= new Date().toISOString();
     candidate.controller.abort(new Error(reason));
   };
   cancelTree(record);
-  return { ok: true, runId, agentId: record.agentId, sessionId: record.sessionId, status: 'cancelled', reason, cancelledRuns };
+  return { ok: true, runId, agentId: record.agentId, sessionId: record.sessionId, status: 'cancelling', reason, cancelledRuns };
 }
