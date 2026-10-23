@@ -1,3 +1,6 @@
+import { POSTGRES_COMPACTION_PROJECTIONS_SQL } from './postgres-compaction-projections.mjs';
+import { POSTGRES_MOD_GENERATION_SCHEMA_SQL } from './postgres-mod-generation-store.mjs';
+import { POSTGRES_MOD_EXTERNAL_TURN_SCHEMA_SQL } from './postgres-mod-external-turn-store.mjs';
 import { POSTGRES_MOD_AUTHORITY_SCHEMA_SQL } from './mod-authority.mjs';
 import { POSTGRES_SKILL_SOURCES_SQL } from './postgres-skill-sources.mjs';
 import { POSTGRES_LIVE_RUN_STEERING_SQL } from './postgres-live-run-steering.mjs';
@@ -155,4 +158,7 @@ ALTER TABLE global_profile_documents
   ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at::timestamptz,
   ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING updated_at::timestamptz;
 ` },
+  { version: 63, name: 'mod-external-agent-turns', sql: POSTGRES_MOD_EXTERNAL_TURN_SCHEMA_SQL },
+  { version: 64, name: 'mod-text-generations', sql: POSTGRES_MOD_GENERATION_SCHEMA_SQL },
+  { version: 65, name: 'native-compaction-projection-reuse', sql: POSTGRES_COMPACTION_PROJECTIONS_SQL },
 ]);
