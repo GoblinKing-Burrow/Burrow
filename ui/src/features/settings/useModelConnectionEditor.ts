@@ -4,6 +4,7 @@ import { useConfirm } from '../../app/ConfirmDialog';
 import type { SavedProvider } from '../../app/types';
 import { isOpenAiOAuthConnection } from '../../app/useRuntimeDashboard';
 import { modelConnectionsApi, type OpenAiOAuthConnection } from './modelConnectionsApi';
+import { compatiblePoolMembers, isProviderPool } from './providerPools';
 import { useClaudeCodeLoginFlow } from './useClaudeCodeLoginFlow';
 import { useOpenAiOAuthConnectionFlow } from './useOpenAiOAuthConnectionFlow';
 
@@ -13,18 +14,27 @@ const selectedRuntimeModels = (models: Array<string | RuntimeModel> = []): Runti
 });
 
 type Options = {
+  savedProviders?: SavedProvider[];
+  loadBalancing?: boolean;
   onModelConnectionsChanged: () => Promise<void>;
 };
 
-export function useModelConnectionEditor({ onModelConnectionsChanged }: Options) {
+export function useModelConnectionEditor({ savedProviders = [], onModelConnectionsChanged, loadBalancing = false }: Options) {
   const confirm = useConfirm();
   const editorGeneration = useRef(0);
   const isEditorCurrent = (generation: number) => generation === editorGeneration.current;
   useEffect(() => () => { editorGeneration.current += 1; }, []);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [provider, setProvider] = useState('');
-  const [apiType, setApiType] = useState('openai-chat-completions');
+  const [provider, setProvider] = useState(loadBalancing ? 'OpenAI LB' : '');
+  const [apiType, setApiType] = useState(loadBalancing ? 'openai-lb' : 'openai-chat-completions');
+  const [poolEnabled, setPoolEnabled] = useState(true);
+  const [memberConnectionIds, setMemberConnectionIds] = useState<string[]>([]);
+  const poolConnection = isProviderPool(apiType);
+  const poolMembers = compatiblePoolMembers(apiType, savedProviders);
+  const missingPoolMembers = memberConnectionIds.filter(id => !poolMembers.some(member => member.id === id));
+  const pool = { enabled: poolEnabled, memberConnectionIds, sticky: true as const, preferEarlierReset: false as const };
   const [url, setUrl] = useState('');
+  const connectionReady = Boolean(provider.trim() && (poolConnection ? memberConnectionIds.length && !missingPoolMembers.length : url.trim()));
   const [apiKey, setApiKey] = useState('');
   const [apiKeyConfigured, setApiKeyConfigured] = useState(false);
   const [oauthConnection, setOauthConnection] = useState(false);
@@ -43,8 +53,10 @@ export function useModelConnectionEditor({ onModelConnectionsChanged }: Options)
   const resetProvider = () => {
     editorGeneration.current += 1;
     setEditingId(null);
-    setProvider('');
-    setApiType('openai-chat-completions');
+    setPoolEnabled(true);
+    setMemberConnectionIds([]);
+    setProvider(loadBalancing ? 'OpenAI LB' : '');
+    setApiType(loadBalancing ? 'openai-lb' : 'openai-chat-completions');
     setUrl('');
     setApiKey('');
     setApiKeyConfigured(false);
@@ -65,7 +77,7 @@ export function useModelConnectionEditor({ onModelConnectionsChanged }: Options)
   const connect = async (connection?: OpenAiOAuthConnection, isCurrent = () => true) => {
     const discoveryProvider = connection ? connection.provider ?? 'OpenAI' : provider;
     const discoveryUrl = connection ? connection.baseUrl ?? 'https://chatgpt.com/backend-api' : url;
-    if (!discoveryProvider.trim() || !discoveryUrl.trim()) return availableModels;
+    if (connection ? !discoveryProvider.trim() || !discoveryUrl.trim() : !connectionReady) return availableModels;
     const generation = ++editorGeneration.current;
     const current = () => isEditorCurrent(generation) && isCurrent();
     setRequestState('connecting');
@@ -75,12 +87,11 @@ export function useModelConnectionEditor({ onModelConnectionsChanged }: Options)
         ...((connection?.id ?? editingId) ? { id: connection?.id ?? editingId! } : {}),
         provider: discoveryProvider.trim(),
         apiType: connection ? connection.apiType ?? 'openai-responses' : apiType,
-        baseUrl: discoveryUrl.trim(),
-        apiKey: connection ? '' : apiKey,
+        ...(!connection && poolConnection ? { pool } : { baseUrl: discoveryUrl.trim(), apiKey: connection ? '' : apiKey }),
         models: connection ? selectedRuntimeModels(connection.models) : availableModels,
       });
       if (!current()) return [];
-      if (connection && (result.discovery?.status === 'error' || result.discovery?.error)) throw new Error(result.discovery.error || 'Discovery failed');
+      if (result.discovery?.status === 'error' || result.discovery?.error) throw new Error(result.discovery.error || 'Discovery failed');
       setAvailableModels(result.models);
       setSelectedModelId(result.models[0]?.id ?? null);
       setConnected(true);
@@ -98,9 +109,9 @@ export function useModelConnectionEditor({ onModelConnectionsChanged }: Options)
     }
   };
 
-  const saveProvider = async (modelsOverride?: RuntimeModel[]) => {
+  const saveProvider = async (modelsOverride?: RuntimeModel[], onSaved?: () => void) => {
     const models = modelsOverride ?? availableModels;
-    if (!provider.trim() || !url.trim() || !models.some((model) => model.selected !== false)) return;
+    if (!connectionReady || (!poolConnection && !models.some((model) => model.selected !== false))) return;
     const generation = ++editorGeneration.current;
     setRequestState('saving');
     setRequestError('');
@@ -112,14 +123,14 @@ export function useModelConnectionEditor({ onModelConnectionsChanged }: Options)
           ...(editingId ? { id: editingId } : {}),
           provider: provider.trim(),
           apiType,
-          baseUrl: url.trim(),
-          ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          ...((oauthIdToken.trim() || oauthAccessToken.trim() || oauthRefreshToken.trim()) ? { oauthTokens: {
+          ...(poolConnection ? { pool } : { baseUrl: url.trim() }),
+          ...(!poolConnection && apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+          ...((!poolConnection && (oauthIdToken.trim() || oauthAccessToken.trim() || oauthRefreshToken.trim())) ? { oauthTokens: {
             ...(oauthIdToken.trim() ? { id_token: oauthIdToken.trim() } : {}),
             ...(oauthAccessToken.trim() ? { access_token: oauthAccessToken.trim() } : {}),
             ...(oauthRefreshToken.trim() ? { refresh_token: oauthRefreshToken.trim() } : {}),
           } } : {}),
-          models,
+          ...(!poolConnection ? { models } : {}),
         }),
       });
       if (isEditorCurrent(generation)) {
@@ -133,6 +144,7 @@ export function useModelConnectionEditor({ onModelConnectionsChanged }: Options)
       if (!isEditorCurrent(generation)) return;
       setSavedProvidersOpen(true);
       resetProvider();
+      onSaved?.();
     } catch (error) {
       if (isEditorCurrent(generation)) setRequestError(error instanceof Error ? `Could not save provider: ${error.message}` : 'Could not save provider.');
     } finally {
@@ -167,13 +179,18 @@ export function useModelConnectionEditor({ onModelConnectionsChanged }: Options)
   });
   const claudeFlow = useClaudeCodeLoginFlow({
     onConnection: applyOAuthConnection,
-    onImported: async () => {
+    onImported: async (_login, isCurrent) => {
+      const generation = editorGeneration.current;
       await onModelConnectionsChanged();
-      const discoveredModels = await connect();
-      const selectedModels = (discoveredModels ?? availableModels).map((model) => ({ ...model, selected: true }));
+      if (!isCurrent() || !isEditorCurrent(generation)) return;
+      // Discovery advances the editor generation; retain that owner across its await.
+      const discovery = connect(undefined, isCurrent);
+      const discoveryGeneration = editorGeneration.current;
+      const discoveredModels = await discovery;
+      if (!isCurrent() || !isEditorCurrent(discoveryGeneration)) return;
+      const selectedModels = discoveredModels.map((model) => ({ ...model, selected: true }));
       setAvailableModels(selectedModels);
-      await saveProvider(selectedModels);
-      setOauthModal(null);
+      await saveProvider(selectedModels, () => setOauthModal(null));
     },
   });
   const { reset: resetOpenAiOAuth } = openAiFlow;
@@ -241,6 +258,8 @@ export function useModelConnectionEditor({ onModelConnectionsChanged }: Options)
     setEditingId(item.id);
     setProvider(item.provider);
     setApiType(item.apiType);
+    setPoolEnabled(item.pool?.enabled ?? true);
+    setMemberConnectionIds(item.pool?.memberConnectionIds ?? []);
     setUrl(item.url);
     setApiKey('');
     setOauthIdToken('');
@@ -305,12 +324,40 @@ export function useModelConnectionEditor({ onModelConnectionsChanged }: Options)
     setOauthModal('anthropic');
   };
 
+  const changeApiType = (next: string) => {
+    if (next === apiType) return;
+    if (isProviderPool(next) && poolConnection) {
+      editorGeneration.current += 1;
+      setMemberConnectionIds([]);
+      setAvailableModels([]);
+      setRequestError('');
+      setRequestState('idle');
+    } else if (isProviderPool(next) || poolConnection) {
+      resetProvider();
+      setProvider(next === 'openai-lb' ? 'OpenAI LB' : next === 'anthropic-lb' ? 'Anthropic LB' : '');
+    } else {
+      editorGeneration.current += 1;
+      setRequestState('idle');
+    }
+    setApiType(next);
+  };
+  const togglePoolMember = (id: string) => {
+    editorGeneration.current += 1;
+    setRequestState('idle');
+    setRequestError('');
+    setMemberConnectionIds(ids => ids.includes(id) ? ids.filter(value => value !== id) : [...ids, id]);
+    setAvailableModels([]);
+    setSelectedModelId(null);
+    setConnected(false);
+  };
+
   return {
+    poolConnection, poolEnabled, setPoolEnabled, poolMembers, memberConnectionIds, missingPoolMembers, togglePoolMember, connectionReady,
     editingId,
     provider,
     setProvider,
     apiType,
-    setApiType,
+    setApiType: changeApiType,
     url,
     setUrl,
     apiKey,

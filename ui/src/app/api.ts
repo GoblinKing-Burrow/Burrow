@@ -62,6 +62,7 @@ export type RuntimeAgent = {
   name: string;
   enabled: boolean;
   avatar?: string | null;
+  contextConfig?: { a2aInDefault?: boolean };
   executionEnvironment?: { kind: 'local' | 'remote' | 'unresolved'; providerId?: string; targetId?: string; legacyKind?: string; workspaceRoot: string } | null;
 };
 
@@ -140,6 +141,8 @@ export type OpenAiUsage = {
   credits?: { hasCredits?: boolean | null; unlimited?: boolean | null; balance?: number | null; overageLimitReached?: boolean } | null;
 };
 
+export type ProviderPool = { enabled: boolean; memberConnectionIds: string[]; sticky?: true; preferEarlierReset?: false };
+
 export type ModelConnection = {
   id: string;
   provider: string;
@@ -148,7 +151,8 @@ export type ModelConnection = {
   models: RuntimeModel[];
   apiKeyConfigured: boolean;
   authConfigured?: boolean;
-  auth?: { type?: string | null; source?: string | null; expiresAt?: string | null };
+  pool?: ProviderPool;
+  auth?: { type?: string | null; provider?: string | null; source?: string | null; expiresAt?: string | null };
 };
 
 export type MemoryConnection = {

@@ -1,3 +1,5 @@
+import { isProviderPool, assertProviderPoolMembers } from './model-settings-store.mjs';
+import { createProviderUsageService } from './provider-usage-service.mjs';
 import path from 'node:path';
 import { normalizeContextCompressionConfig } from './context-compression.mjs';
 import { anthropicSupportsTemperature, isAnthropicMessagesConnection } from './anthropic-model-capabilities.mjs';
@@ -68,14 +70,18 @@ export function modelSupportsTemperature({ provider = '', api = '', model = '', 
   if (isAnthropicMessagesConnection({ provider, apiType: api })) return anthropicSupportsTemperature(model);
   return true;
 }
+// Internal capability: only a pool resolver may bypass direct-selection flags.
+const POOL_MEMBER_MODEL = Symbol('pool-member-model');
 async function resolveInjectedModel(connectionId, modelId, args = {}) {
   const store = args.modelSettings || args.stores?.models || args.runtimeStores?.models;
   if (!store) throw new Error('model_settings_store_required');
   const connection = await store.get(connectionId);
   if (!connection) throw new Error('model_connection_not_found');
-  const model = selectedModels(connection).find((item) => item.id === modelId);
+  const poolMember = args[POOL_MEMBER_MODEL];
+  const catalog = poolMember?.connectionId === connectionId && poolMember?.modelId === modelId && !isProviderPool(connection) ? connection.models || [] : selectedModels(connection);
+  const model = catalog.find((item) => item.id === modelId);
   if (!model) throw new Error('model_not_enabled_for_connection');
-  const auth = await store.resolveAuth(connection.id, { fetchImpl: args.fetchImpl ?? fetch, signal: args.abort_signal ?? args.abortSignal });
+  const auth = isProviderPool(connection) ? null : await store.resolveAuth(connection.id, { fetchImpl: args.fetchImpl ?? fetch, signal: args.abort_signal ?? args.abortSignal });
   const token = auth?.token ?? auth?.apiKey ?? auth?.accessToken;
   return { connection, model, auth: { ...auth, token } };
 }
@@ -148,6 +154,25 @@ export async function resolveModelConfig(args = {}) {
     runtimeId: 'direct-api',
     selectionSource: agentSelection ? 'agent-default' : 'turn-override',
   };
+  if (isProviderPool(connection)) {
+    const store = args.modelSettings || args.stores?.models || args.runtimeStores?.models;
+    if (!connection.pool?.enabled) throw new Error('provider_pool_disabled');
+    const usageService = args.providerUsageService || createProviderUsageService({
+      modelLookup: () => store, authSecretToken: auth => auth?.token || auth?.accessToken || auth?.apiKey,
+      fetchImpl: args.fetchImpl || fetch,
+    });
+    result.providerPool = {
+      connection, store, usageService,
+      refreshConnection: async () => {
+        const current = await store.get(connection.id);
+        if (!current || !isProviderPool(current)) throw new Error('provider_pool_not_found');
+        const members = await Promise.all(current.pool.memberConnectionIds.map(id => store.get(id)));
+        assertProviderPoolMembers(current, members.filter(Boolean));
+        return { connection: current, members };
+      },
+      resolveMember: id => resolveModelConfig({ ...args, [POOL_MEMBER_MODEL]: { connectionId: id, modelId: model.id }, model_connection_id: id, modelConnectionId: id, model: model.id }),
+    };
+  }
   Object.defineProperty(result, 'resolveChildModel', { enumerable: false, value: async (childId = null) => {
     if (childId) return resolveModelConfig({ ...args, model_connection_id: connection.id, modelConnectionId: connection.id, model: childId });
     const configured = args.modelSettings || args.stores?.models || args.runtimeStores?.models;

@@ -8,7 +8,7 @@ import { POSTGRES_HISTORY_KEYSET_SQL } from './postgres-history-keyset.mjs';
 import { POSTGRES_RESET_INSTANT_SQL } from './postgres-reset-instant.mjs';
 import { normalizePostgresPool } from './postgres-foundation.mjs';
 import { POSTGRES_CONTINUITY_STATE_SCHEMA_SQL } from './postgres-continuity-state-store.mjs';
-import { POSTGRES_AGENT_DELIVERY_SCHEMA_SQL } from './postgres-agent-delivery-store.mjs';
+import { PostgresAgentDeliveryStore, POSTGRES_AGENT_DELIVERY_OWNER_SQL, POSTGRES_AGENT_DELIVERY_SCHEMA_SQL } from './postgres-agent-delivery-store.mjs';
 import { resolveAlbdruckConfig } from './config.mjs';
 import { matchesQuery } from './session-search.mjs';
 import { closeContinuityOwners } from './postgres-continuity-owner.mjs';
@@ -648,7 +648,7 @@ UPDATE conversation_entries SET has_payload_id=NULL;
 UPDATE conversation_archive_entries SET has_payload_id=NULL;
 `;
 
-export const POSTGRES_SESSION_FULL_SCHEMA_SQL = POSTGRES_SESSION_SCHEMA_SQL + POSTGRES_SESSION_ARCHIVE_SCHEMA_SQL + POSTGRES_SESSION_LOSSLESS_JSON_SCHEMA_SQL + POSTGRES_SESSION_OPERATOR_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_ROWS_SCHEMA_SQL + POSTGRES_SESSION_SEARCH_SCHEMA_SQL + POSTGRES_SESSION_NATIVE_SCHEMA_SQL + POSTGRES_SESSION_METADATA_SCHEMA_SQL + POSTGRES_SESSION_ASCII_SEARCH_SCHEMA_SQL + POSTGRES_CONTINUITY_STATE_SCHEMA_SQL + POSTGRES_RESET_INSTANT_SQL + POSTGRES_HISTORY_KEYSET_SQL + POSTGRES_LOGICAL_MEMBER_SQL + POSTGRES_ARCHIVE_RELATIONAL_ID_SQL + POSTGRES_CATALOG_SCALAR_ID_SQL + POSTGRES_LOGICAL_LOOKUP_INDEX_SQL + POSTGRES_AGENT_DELIVERY_SCHEMA_SQL + POSTGRES_OPERATOR_INSTANT_SQL + POSTGRES_ARCHIVE_LISTING_INDEX_SQL + POSTGRES_COMPACTION_PROJECTIONS_SQL;
+export const POSTGRES_SESSION_FULL_SCHEMA_SQL = POSTGRES_SESSION_SCHEMA_SQL + POSTGRES_SESSION_ARCHIVE_SCHEMA_SQL + POSTGRES_SESSION_LOSSLESS_JSON_SCHEMA_SQL + POSTGRES_SESSION_OPERATOR_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_ROWS_SCHEMA_SQL + POSTGRES_SESSION_SEARCH_SCHEMA_SQL + POSTGRES_SESSION_NATIVE_SCHEMA_SQL + POSTGRES_SESSION_METADATA_SCHEMA_SQL + POSTGRES_SESSION_ASCII_SEARCH_SCHEMA_SQL + POSTGRES_CONTINUITY_STATE_SCHEMA_SQL + POSTGRES_RESET_INSTANT_SQL + POSTGRES_HISTORY_KEYSET_SQL + POSTGRES_LOGICAL_MEMBER_SQL + POSTGRES_ARCHIVE_RELATIONAL_ID_SQL + POSTGRES_CATALOG_SCALAR_ID_SQL + POSTGRES_LOGICAL_LOOKUP_INDEX_SQL + POSTGRES_AGENT_DELIVERY_SCHEMA_SQL + POSTGRES_AGENT_DELIVERY_OWNER_SQL + POSTGRES_OPERATOR_INSTANT_SQL + POSTGRES_ARCHIVE_LISTING_INDEX_SQL + POSTGRES_COMPACTION_PROJECTIONS_SQL;
 
 const text = (value) => String(value ?? '');
 const required = (value, name) => { const result = text(value).trim(); if (!result) throw new Error(`${name} is required`); return result; };
@@ -679,6 +679,25 @@ function proofRunKey(entry = {}) {
   return runId ? Buffer.from(JSON.stringify(runId), 'utf8').toString('hex') : null;
 }
 
+// Preserve first transcript position while later snapshots replace payloads.
+// Relational occurrence IDs keep equal-content id-less messages distinct.
+function mergeTranscriptSnapshots(snapshots) {
+  const entries = []; const positions = new Map();
+  for (const snapshot of snapshots) {
+    const seen = new Set();
+    for (const occurrence of snapshot) {
+      const entry = occurrence.entry;
+      const identity = entry?.id ? `payload:${entry.id}` : occurrence.occurrence ? `occurrence:${occurrence.occurrence}` : null;
+      if (!identity) { entries.push(entry); continue; }
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      if (positions.has(identity)) entries[positions.get(identity)] = entry;
+      else { positions.set(identity, entries.length); entries.push(entry); }
+    }
+  }
+  return entries;
+}
+
 export function assertConversationDeletionAllowed(sessionId, metadata = {}) {
   if (['running', 'finalizing'].includes(metadata.continuityHead?.state)) throw new Error('session_retention_active');
   if (metadata.current === true || metadata.currentMain === true || (['main', 'default'].includes(sessionId) && (!metadata.kind || metadata.kind === 'main'))) throw new Error('retention_refused_current_main');
@@ -697,33 +716,19 @@ export class PostgresSessionStore {
     if (!this.proofProjection) this.proofProjection = client.query(`SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='conversation_entries' AND column_name='run_key') AS available`).then(result => result.rows[0]?.available === true);
     return this.proofProjection;
   }
+  get agentDeliveries() { return this.deliveryStore ||= new PostgresAgentDeliveryStore(this.pool); }
   async claimAgentMessageDelivery({ deliveryId, request } = {}) {
-    const id = required(deliveryId, 'deliveryId');
-    const payload = request && typeof request === 'object' ? request : {};
-    const inserted = await this.pool.query(`INSERT INTO agent_message_deliveries(delivery_id,status,request)
-      VALUES($1,'executing',$2::jsonb) ON CONFLICT DO NOTHING RETURNING delivery_id`, [id, JSON.stringify(payload)]);
-    if (inserted.rowCount === 1) return { execute: true, status: 'executing', result: null };
-    const { rows } = await this.pool.query('SELECT status,request,result FROM agent_message_deliveries WHERE delivery_id=$1', [id]);
-    const row = rows[0];
-    if (!row || JSON.stringify(Object.fromEntries(Object.entries(row.request).sort())) !== JSON.stringify(Object.fromEntries(Object.entries(payload).sort()))) throw new Error('agent_message_delivery_identity_conflict');
-    return { execute: false, status: row.status, result: row.result || null };
+    return this.agentDeliveries.claim({ deliveryId: required(deliveryId, 'deliveryId'), request: request && typeof request === 'object' ? request : {} });
   }
-
-  async completeAgentMessageDelivery({ deliveryId, result } = {}) {
-    const id = required(deliveryId, 'deliveryId');
-    const { rows } = await this.pool.query(`UPDATE agent_message_deliveries SET status='completed',result=$2::jsonb,completed_at=CURRENT_TIMESTAMP
-      WHERE delivery_id=$1 AND status='executing' RETURNING result`, [id, JSON.stringify(result)]);
-    if (rows.length) return rows[0].result;
-    const existing = await this.pool.query('SELECT status,result FROM agent_message_deliveries WHERE delivery_id=$1', [id]);
-    if (existing.rows[0]?.status === 'completed') return existing.rows[0].result;
-    throw new Error('agent_message_delivery_claim_missing');
+  async completeAgentMessageDelivery(args = {}) {
+    required(args.deliveryId, 'deliveryId');
+    return this.agentDeliveries.complete(args);
   }
-
   async readAgentMessageDelivery({ deliveryId } = {}) {
-    const id = required(deliveryId, 'deliveryId');
-    const { rows } = await this.pool.query('SELECT status,result FROM agent_message_deliveries WHERE delivery_id=$1', [id]);
-    return rows[0] || null;
+    return this.agentDeliveries.read(required(deliveryId, 'deliveryId'));
   }
+  async assertAgentMessageDeliveryOwner(args) { return this.agentDeliveries.assertOwner(args); }
+  async executeAgentMessageDelivery(args, work) { return this.agentDeliveries.execute(args, work); }
 
   async deleteSession({agentId: rawAgentId, sessionId: rawSessionId, retentionPolicy = null} = {}) {
     const agentId = required(rawAgentId, 'agentId');
@@ -753,7 +758,7 @@ export class PostgresSessionStore {
     });
   }
 
-  async close() { await closeContinuityOwners(this.pool); if (this.ownsPool) await closePostgresPool(this.pool); }
+  async close() { await this.deliveryStore?.close(); await closeContinuityOwners(this.pool); if (this.ownsPool) await closePostgresPool(this.pool); }
 
   /** Original JSON is decoded in JS: SQL JSON extraction is not lossless for NUL. */
   async history({ agentId, scope = 'agent', query, cursor = '', signal, budgetMs = resolveAlbdruckConfig().historyBudgetMs, pageSize = Math.min(50, resolveAlbdruckConfig().maxPageSize) } = {}) {
@@ -1188,23 +1193,42 @@ export class PostgresSessionStore {
     [required(agentId, 'agentId'), required(sessionId, 'sessionId')]);
     const row = result.rows[0];
     if (!row) return null;
-    // Keep each identity's first transcript position, but replace its payload with
-    // the canonical winner. Each archive retains its earliest duplicate ordinal;
-    // ascending generation/source snapshots then live establish precedence.
-    const entries = []; const positions = new Map();
-    for (const snapshot of [...row.history, row.entries]) {
-      const seen = new Set();
-      for (const occurrence of snapshot) {
-        const entry = occurrence.entry;
-        const identity = entry?.id ? `payload:${entry.id}` : occurrence.occurrence ? `occurrence:${occurrence.occurrence}` : null;
-        if (!identity) { entries.push(entry); continue; }
-        if (seen.has(identity)) continue;
-        seen.add(identity);
-        if (positions.has(identity)) entries[positions.get(identity)] = entry;
-        else { positions.set(identity, entries.length); entries.push(entry); }
-      }
-    }
+    const entries = mergeTranscriptSnapshots([...row.history, row.entries]);
     return { schemaVersion: '1', session: { id: sessionId, metadata: { ...row.metadata, createdAt: row.created_at, updatedAt: row.updated_at } }, entries };
+  }
+
+
+  // Reconstruct a reset's entire conversation without rewriting immutable
+  // evidence. The target's generation window, not today's live metadata, owns
+  // its history. One statement gives selection and payloads one MVCC snapshot.
+  async exportArchiveTranscript({ agentId, sessionId = null, archiveId } = {}) {
+    const result = await this.pool.query(`WITH target AS (
+      SELECT * FROM conversation_archives WHERE agent_id=$1 AND archive_id=$2
+        AND kind='reset' AND ($3::text IS NULL OR session_id=$3)
+      ORDER BY created_at DESC,session_id DESC LIMIT 1
+    ) SELECT t.archive_id,t.session_id,t.generation,t.metadata,t.created_at,
+      COALESCE((SELECT json_agg((SELECT COALESCE(json_agg(
+          json_build_object('occurrence',e.entry_id,'entry',e.entry) ORDER BY e.ordinal),'[]'::json)
+        FROM conversation_archive_entries e WHERE e.agent_id=a.agent_id
+          AND e.session_id=a.session_id AND e.source_id=a.archive_id)
+        ORDER BY a.generation,a.archive_id)
+        FROM conversation_archives a WHERE a.agent_id=t.agent_id AND a.session_id=t.session_id
+          AND a.kind='compacted' AND a.generation<=t.generation
+          AND a.generation>=COALESCE((t.metadata->>'resetGeneration')::bigint,
+            (SELECT max(r.generation)+1 FROM conversation_archives r
+              WHERE r.agent_id=t.agent_id AND r.session_id=t.session_id
+                AND r.kind='reset' AND r.generation<t.generation),0)), '[]'::json) AS history,
+      COALESCE((SELECT json_agg(json_build_object('occurrence',e.entry_id,'entry',e.entry)
+        ORDER BY e.ordinal) FROM conversation_archive_entries e
+        WHERE e.agent_id=t.agent_id AND e.session_id=t.session_id AND e.source_id=t.archive_id),
+        '[]'::json) AS entries FROM target t`,
+    [required(agentId, 'agentId'), required(archiveId, 'archiveId'), sessionId == null ? null : required(sessionId, 'sessionId')]);
+    const row = result.rows[0];
+    if (!row) return null;
+    const entries = mergeTranscriptSnapshots([...row.history, row.entries]);
+    return { schemaVersion: '1', archiveId: row.archive_id, sourceSessionId: row.session_id,
+      generation: Number(row.generation), createdAt: row.created_at,
+      session: { id: row.archive_id, metadata: { ...row.metadata, createdAt: row.created_at, updatedAt: row.created_at } }, entries };
   }
 
   async getMetadata({ agentId: rawAgentId, sessionId: rawSessionId } = {}) {
@@ -1393,18 +1417,55 @@ export class PostgresSessionStore {
       if (!sourceRow.rows[0]) return null;
       const reserved = await client.query('INSERT INTO conversation_sessions(agent_id,session_id,metadata,created_at,updated_at) VALUES($1,$2,$3::jsonb,$4,$5) ON CONFLICT DO NOTHING RETURNING session_id', [agentId, target, JSON.stringify({ ...sourceRow.rows[0].metadata, sessionId: target }), sourceRow.rows[0].created_at, sourceRow.rows[0].updated_at]);
       if (!reserved.rows[0]) throw new Error('rename_target_exists');
-      await client.query(`INSERT INTO conversation_entries(agent_id,session_id,entry_id,idempotency_key,entry,created_at) SELECT agent_id,$3,entry_id,idempotency_key,entry,created_at FROM conversation_entries WHERE agent_id=$1 AND session_id=$2`, [agentId, source, target]);
+      const hasProofProjection = await this.hasProofProjection(client);
+      const runColumn = hasProofProjection ? ',run_key' : '';
+      // Owned occurrence payloads and complete mutable projections move together.
+      // Copy JSON directly in SQL: parsing/serializing would destroy lexical
+      // evidence (duplicate keys, escapes, whitespace and unsafe Unicode).
+      const projections = 'entry_key,search_projection,search_grams,has_payload_id,has_compression_summary,operator_at,operator_ts_fallback,operator_projected';
+      await client.query(`INSERT INTO conversation_entries(agent_id,session_id,entry_id,idempotency_key,entry,created_at,${projections}${runColumn})
+        SELECT agent_id,$3,entry_id,idempotency_key,entry,created_at,${projections}${runColumn}
+        FROM conversation_entries WHERE agent_id=$1 AND session_id=$2 ORDER BY sequence`, [agentId, source, target]);
       await client.query(`INSERT INTO conversation_archives(agent_id,session_id,archive_id,generation,kind,metadata,created_at) SELECT agent_id,$3,archive_id,generation,kind,metadata,created_at FROM conversation_archives WHERE agent_id=$1 AND session_id=$2`, [agentId, source, target]);
       await client.query(`INSERT INTO conversation_archive_entries
-        (agent_id,session_id,source_store,source_id,ordinal,entry_key,entry,search_projection,created_at,archive_kind,generation,search_grams,entry_id,idempotency_key)
-        SELECT agent_id,$3,source_store,source_id,ordinal,entry_key,entry,search_projection,created_at,archive_kind,generation,search_grams,entry_id,idempotency_key
+        (agent_id,session_id,source_store,source_id,ordinal,entry,created_at,archive_kind,generation,entry_id,idempotency_key,${projections}${runColumn})
+        SELECT agent_id,$3,source_store,source_id,ordinal,entry,created_at,archive_kind,generation,entry_id,idempotency_key,${projections}${runColumn}
         FROM conversation_archive_entries WHERE agent_id=$1 AND session_id=$2`, [agentId,source,target]);
+      // Session metadata's runEvidence trigger may already have inserted a
+      // subset. The source directory is authoritative, including runs with no
+      // runEvidence and their exact timestamps/sort keys.
+      if (hasProofProjection) await client.query(`INSERT INTO conversation_archive_runs
+        (agent_id,session_id,run_key,run_id,started_at,completed_at,last_activity_at,sort_timestamp)
+        SELECT agent_id,$3,run_key,run_id,started_at,completed_at,last_activity_at,sort_timestamp
+        FROM conversation_archive_runs WHERE agent_id=$1 AND session_id=$2
+        ON CONFLICT(agent_id,session_id,run_key) DO UPDATE SET run_id=EXCLUDED.run_id,
+          started_at=EXCLUDED.started_at,completed_at=EXCLUDED.completed_at,
+          last_activity_at=EXCLUDED.last_activity_at,sort_timestamp=EXCLUDED.sort_timestamp`, [agentId,source,target]);
       // Mutable ownership and citations follow the new identity; original JSON
       // entries/archives above remain byte-for-byte lexical evidence.
       const exists = async name => (await client.query('SELECT to_regclass($1) AS relation',[name])).rows[0].relation !== null;
       if (await exists('conversation_project_bindings')) await client.query('UPDATE conversation_project_bindings SET session_id=$3 WHERE agent_id=$1 AND session_id=$2',[agentId,source,target]);
       if (await exists('working_memory')) await client.query(`UPDATE working_memory SET session_id=$3,conversation_id=CASE WHEN conversation_id=$2 THEN $3 WHEN conversation_id=$1 || ':' || $2 THEN $1 || ':' || $3 ELSE conversation_id END WHERE agent_id=$1 AND session_id=$2`,[agentId,source,target]);
-      if (await exists('continuity_handoffs')) await client.query('UPDATE continuity_handoffs SET session_id=$3 WHERE agent_id=$1 AND session_id=$2',[agentId,source,target]);
+      if (await exists('continuity_handoffs')) {
+        const oldId = `continuity:${agentId}:${source}`, newId = `continuity:${agentId}:${target}`;
+        // Only the canonical session-derived id changes; arbitrary historical
+        // ids stay stable. Never overwrite an existing destination handoff.
+        const collision = await client.query(`SELECT 1 FROM continuity_handoffs
+          WHERE id=$2 AND EXISTS (SELECT 1 FROM continuity_handoffs WHERE id=$1 AND agent_id=$3 AND session_id=$4)`, [oldId,newId,agentId,source]);
+        if (collision.rows[0]) throw new Error('rename_handoff_target_exists');
+        await client.query(`UPDATE continuity_handoffs SET session_id=$3,id=CASE WHEN id=$4 THEN $5 ELSE id END
+          WHERE agent_id=$1 AND session_id=$2`, [agentId,source,target,oldId,newId]);
+      }
+      // Steering is a mutable run/input directory with cascading owner FKs.
+      // Reserve parents before copying inputs, then source deletion is safe.
+      if (await exists('chat_steering_runs')) {
+        await client.query(`INSERT INTO chat_steering_runs(agent_id,session_id,run_id,accepting,generation)
+          SELECT agent_id,$3,run_id,accepting,generation FROM chat_steering_runs WHERE agent_id=$1 AND session_id=$2`, [agentId,source,target]);
+        await client.query(`INSERT INTO chat_steering_inputs
+          (agent_id,session_id,run_id,ordinal,input_id,idempotency_key,payload,status,created_at,delivered_at) OVERRIDING SYSTEM VALUE
+          SELECT agent_id,$3,run_id,ordinal,input_id,idempotency_key,payload,status,created_at,delivered_at
+          FROM chat_steering_inputs WHERE agent_id=$1 AND session_id=$2`, [agentId,source,target]);
+      }
       if (await exists('scheduled_jobs')) await client.query('UPDATE scheduled_jobs SET session_id=$3 WHERE agent_id=$1 AND session_id=$2',[agentId,source,target]);
       if (await exists('scheduled_job_runs')) await client.query('UPDATE scheduled_job_runs SET session_id=$3 WHERE agent_id=$1 AND session_id=$2',[agentId,source,target]);
       if (await exists('albdruck_evidence')) await client.query(`UPDATE albdruck_evidence SET source_ref=jsonb_set(source_ref,'{sessionId}',to_jsonb($3::text)) WHERE source_ref->>'agentId'=$1 AND source_ref->>'sessionId'=$2`,[agentId,source,target]);
@@ -1486,6 +1547,7 @@ export class PostgresSessionStore {
       FROM conversation_archive_runs r LEFT JOIN conversation_sessions s ON s.agent_id=r.agent_id AND s.session_id=r.session_id
       LEFT JOIN LATERAL (SELECT item FROM jsonb_array_elements(COALESCE(s.metadata->'runEvidence','[]'::jsonb)) item WHERE item->>'runId'=r.run_id LIMIT 1) evidence ON true
       WHERE r.agent_id=$1 AND ($2::text IS NULL OR r.session_id=$2)
+      AND ($2::text IS NOT NULL OR NULLIF(s.metadata->'contextIsolation'->>'historySessionId','') IS NULL)
       AND ($3::text IS NULL OR (r.sort_timestamp,r.agent_id || ':' || r.run_id)<($3,$4))
       ORDER BY r.sort_timestamp DESC,r.agent_id || ':' || r.run_id DESC LIMIT $5`,
     [agentId, sessionId, boundary?.t || null, boundary?.i || null, size + 1]);
@@ -1571,25 +1633,40 @@ export class PostgresSessionStore {
       SELECT s.agent_id,s.session_id AS id,s.session_id,NULL::text AS source_session_id,
         false AS archive_snapshot,s.metadata,s.created_at,s.updated_at
       FROM conversation_sessions s
-      WHERE s.agent_id=$1 AND ($2::boolean OR COALESCE((s.metadata->>'archived')::boolean,false)=false)
-        AND ($10::timestamptz IS NULL OR s.updated_at>=$10::timestamptz)
-        AND ($11::timestamptz IS NULL OR s.updated_at<$11::timestamptz)
+      WHERE s.agent_id=$1 AND NULLIF(s.metadata->'contextIsolation'->>'historySessionId','') IS NULL AND ($2::boolean OR COALESCE((s.metadata->>'archived')::boolean,false)=false)
+        AND ($10::timestamptz IS NULL OR burrow_legacy_instant(s.updated_at::text)>=$10::timestamptz)
+        AND ($11::timestamptz IS NULL OR burrow_legacy_instant(s.updated_at::text)<$11::timestamptz)
       UNION ALL
       SELECT a.agent_id,a.archive_id AS id,a.session_id,a.session_id AS source_session_id,
         true AS archive_snapshot,a.metadata,a.created_at,a.created_at AS updated_at
       FROM conversation_archives a WHERE a.agent_id=$1 AND a.kind='reset'
-        AND ($10::timestamptz IS NULL OR a.created_at>=$10::timestamptz)
-        AND ($11::timestamptz IS NULL OR a.created_at<$11::timestamptz)
+        AND NULLIF(a.metadata->'contextIsolation'->>'historySessionId','') IS NULL
+        AND ($10::timestamptz IS NULL OR burrow_legacy_instant(a.created_at::text)>=$10::timestamptz)
+        AND ($11::timestamptz IS NULL OR burrow_legacy_instant(a.created_at::text)<$11::timestamptz)
     ), bounded AS (
       SELECT *,agent_id || ':' || id AS identity FROM archive_rows
       WHERE ($3::text='' OR lower(concat_ws(' ',id,session_id,source_session_id,metadata::text)) LIKE '%' || $3 || '%')
-      AND ($4::text IS NULL OR to_char(updated_at AT TIME ZONE $6,'YYYY-MM-DD')=$4)
-      AND ($5::text IS NULL OR to_char(updated_at AT TIME ZONE $6,'YYYY-MM')=$5)
-      AND ($7::timestamptz IS NULL OR (updated_at,agent_id || ':' || id)<($7::timestamptz,$8::text))
+      AND ($4::text IS NULL OR to_char(burrow_legacy_instant(updated_at::text) AT TIME ZONE $6,'YYYY-MM-DD')=$4)
+      AND ($5::text IS NULL OR to_char(burrow_legacy_instant(updated_at::text) AT TIME ZONE $6,'YYYY-MM')=$5)
+      AND ($7::timestamptz IS NULL OR (burrow_legacy_instant(updated_at::text),agent_id || ':' || id)<($7::timestamptz,$8::text))
       ORDER BY updated_at DESC,agent_id || ':' || id DESC LIMIT $9
     ) SELECT bounded.*,
-      CASE WHEN archive_snapshot THEN (SELECT count(*) FROM conversation_archive_entries e
-        WHERE e.agent_id=bounded.agent_id AND e.session_id=bounded.session_id AND e.source_id=bounded.id)
+      CASE WHEN archive_snapshot THEN (SELECT count(*) FROM (
+        SELECT DISTINCT COALESCE(
+          CASE WHEN e.has_payload_id THEN 'payload:' || NULLIF(burrow_history_key(e.entry_key),'') END,
+          'occurrence:' || e.entry_id,
+          'row:' || e.source_id || ':' || e.ordinal::text) AS identity
+        FROM conversation_archives target JOIN conversation_archives a
+          ON a.agent_id=target.agent_id AND a.session_id=target.session_id
+        JOIN conversation_archive_entries e ON e.agent_id=a.agent_id
+          AND e.session_id=a.session_id AND e.source_id=a.archive_id
+        WHERE target.agent_id=bounded.agent_id AND target.session_id=bounded.session_id AND target.archive_id=bounded.id
+          AND (a.archive_id=target.archive_id OR (a.kind='compacted' AND a.generation<=target.generation
+            AND a.generation>=COALESCE((target.metadata->>'resetGeneration')::bigint,
+              (SELECT max(r.generation)+1 FROM conversation_archives r
+                WHERE r.agent_id=target.agent_id AND r.session_id=target.session_id
+                  AND r.kind='reset' AND r.generation<target.generation),0)))
+      ) occurrences)
       WHEN metadata->>'turnCount' ~ '^[0-9]+$' THEN (metadata->>'turnCount')::bigint ELSE 0 END AS turn_count
       FROM bounded ORDER BY updated_at DESC,identity DESC`,
     [agentId, Boolean(includeArchived), search, date, month, timezone, boundary?.t || null, boundary?.i || null, size + 1, windowStart?.toISOString() || null, windowEnd?.toISOString() || null]);
@@ -1608,11 +1685,11 @@ export class PostgresSessionStore {
     const safeStart = new Date(monthStart); safeStart.setUTCDate(safeStart.getUTCDate() - 1);
     const safeEnd = new Date(monthStart); safeEnd.setUTCMonth(safeEnd.getUTCMonth() + 1, 2);
     const { rows } = await this.pool.query(`SELECT DISTINCT day FROM (
-      SELECT to_char(updated_at AT TIME ZONE $3,'YYYY-MM-DD') AS day
-      FROM conversation_sessions WHERE agent_id=$1 AND updated_at>=$4 AND updated_at<$5
+      SELECT to_char(burrow_legacy_instant(updated_at::text) AT TIME ZONE $3,'YYYY-MM-DD') AS day
+      FROM conversation_sessions WHERE agent_id=$1 AND NULLIF(metadata->'contextIsolation'->>'historySessionId','') IS NULL AND updated_at>=$4 AND updated_at<$5
       UNION ALL
-      SELECT to_char(created_at AT TIME ZONE $3,'YYYY-MM-DD') AS day
-      FROM conversation_archives WHERE agent_id=$1 AND kind='reset' AND created_at>=$4 AND created_at<$5
+      SELECT to_char(burrow_legacy_instant(created_at::text) AT TIME ZONE $3,'YYYY-MM-DD') AS day
+      FROM conversation_archives WHERE agent_id=$1 AND kind='reset' AND NULLIF(metadata->'contextIsolation'->>'historySessionId','') IS NULL AND created_at>=$4 AND created_at<$5
     ) archive_days WHERE day LIKE $2 || '-%' ORDER BY day`, [agentId, month, timezone, safeStart.toISOString(), safeEnd.toISOString()]);
     return rows.map(row => row.day);
   }
@@ -1620,6 +1697,7 @@ export class PostgresSessionStore {
   async listArchives({ agentId: rawAgentId, sessionId: rawSessionId, limit = 100 } = {}) {
     const agentId = required(rawAgentId, 'agentId'); const params = [agentId]; let where = 'agent_id=$1';
     if (rawSessionId != null) { params.push(required(rawSessionId, 'sessionId')); where += ` AND session_id=$${params.length}`; }
+    if (rawSessionId == null) where += ` AND NULLIF(metadata->'contextIsolation'->>'historySessionId','') IS NULL`;
     const unbounded = limit === null;
     if (!unbounded) params.push(limitValue(limit));
     const result = await this.pool.query(`SELECT archive_id,session_id,generation,kind,COALESCE((SELECT json_agg(e.entry ORDER BY e.ordinal) FROM conversation_archive_entries e WHERE e.agent_id=conversation_archives.agent_id AND e.session_id=conversation_archives.session_id AND e.source_id=conversation_archives.archive_id),'[]'::json) AS entries,metadata,created_at FROM conversation_archives WHERE ${where} ORDER BY generation DESC, created_at DESC, archive_id DESC${unbounded ? '' : ` LIMIT $${params.length}`}`, params);

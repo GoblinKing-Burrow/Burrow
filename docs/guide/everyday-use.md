@@ -1,6 +1,6 @@
 # Everyday use
 
-This guide follows the public **2026.10.19** release. The source links below are pinned to that release's public commit.
+Current implementation reviewed **25 October 2026**. [Source coverage](../project/source-map.md) records the exact build and verification limits. Existing commit-linked citations identify historical evidence; they are not links to the current development source.
 
 ## Find your way around
 
@@ -25,6 +25,14 @@ Use the paperclip, drag files into the composer, or paste an image. Review the a
 
 [Source: supported attachments](https://github.com/GoblinKing-Burrow/Burrow/blob/deec39818955db1711161b5310d5822e65fda39a/ui/src/App.tsx#L29) · [Source: attachment validation](https://github.com/GoblinKing-Burrow/Burrow/blob/deec39818955db1711161b5310d5822e65fda39a/ui/src/App.tsx#L160-L169) · [Source: browser budgets](https://github.com/GoblinKing-Burrow/Burrow/blob/deec39818955db1711161b5310d5822e65fda39a/ui/src/app/clientBudgets.ts#L1-L37)
 
+### Current session-routing controls
+
+Checked **24 October 2026**: the chat toolbar includes **A2A in default**, a per-agent toggle for incoming agent-to-agent conversation routing. Enabled is the default; turning it off routes new implicit A2A deliveries to that agent's separate `a2a` session, displayed as **A2A**. Explicit target sessions and runtime-attested replies keep their existing routes; an exchange already in flight is not redirected. This is a routing preference, not a deletion or migration of existing conversations. Refresh/select the intended session to inspect its history.
+
+Switchboard sessions receive readable Telegram/Discord labels in the session selector while retaining their actual session IDs. A label alone does not establish that the corresponding transport is configured or healthy; use the mod's own status and mapping controls.
+
+Implementation: `ChatPage.tsx` and the Core agent context configuration; current source pins are in [release coverage](../project/release-status.md).
+
 ### Choose a session
 
 - **New session** creates a named session. Enter a name and click **Create session**.
@@ -40,7 +48,7 @@ Type `/help` to see chat commands. The composer also offers `/context`, `/contex
 
 Use **Stop response**, then check the run's terminal status and reload the persisted transcript before retrying the request. Reset preserves archives but changes the active conversation generation; avoid treating it as a routine retry button while an important write may still be running.
 
-Newer Core/UI code reviewed on 21 October adds cancellation deadlines, reset-generation fencing and terminal transcript reconciliation. These are not part of the inspected public 2026.10.19 snapshot. They do not undo an external side effect already completed before cancellation. See [release status](../project/release-status.md).
+Current Core/UI implements cancellation deadlines, reset-generation fencing and terminal transcript reconciliation. These were absent from the historical 2026.10.19 snapshot. They do not undo an external side effect already completed before cancellation. See [release status](../project/release-status.md).
 
 ## Read and edit workspace files
 

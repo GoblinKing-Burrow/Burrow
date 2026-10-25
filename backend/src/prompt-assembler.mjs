@@ -373,6 +373,12 @@ function renderRuntimeHostContext(context = null) {
     'Authoritative host provenance for this turn. This describes execution placement only; it does not select a project, path, task, or authorization.',
     `Agent host: ${agentHost}`,
     `Selected host: ${selectedHost}`,
+    ...(context.hostMetadata ? [
+      `Selected host metadata (execution provider report, observed ${context.hostMetadata.observedAt}; recent at prompt build, not reachability proof):`,
+      `Hostname: ${context.hostMetadata.hostname || 'unknown'}; platform: ${context.hostMetadata.platform || 'unknown'}`,
+      ...context.hostMetadata.addresses.map(entry => `Address: ${entry.address} (${entry.family}, ${entry.interfaceKind}, interface ${entry.interface})`),
+      'Interface hints are classifications, not a guarantee that an address is reachable or on the operator LAN.',
+    ] : []),
   ].join('\n');
 }
 
@@ -456,7 +462,7 @@ export async function assemblePrompt({
   availableSkills = [],
 } = {}) {
   if (!rootDir) throw new Error('rootDir is required');
-  if (!task || typeof task !== 'string') throw new Error('task is required');
+  if (typeof task !== 'string' || (!task && !attachments.length && !attachmentManifest.length && !currentAttachmentManifest.length)) throw new Error('task is required');
 
   const logger = traceLogger || (persistBuildTrace ? createTraceLogger({ rootDir: await resolveRuntimeTraceRoot(rootDir), runId }) : null);
   // Skill instructions are loaded only by an explicit agent choice. The compact

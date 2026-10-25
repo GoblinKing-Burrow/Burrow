@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { KeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { modsChangedEvent } from '../../app/modPanels';
 import { modContributionsChangedEvent } from '../../app/apiTargets';
 import { Field } from './SettingsPrimitives';
-import { defaultSourceRefresh, isModBusyError, loadModManagement, loadSourceRefreshConfig, modLifecyclePath, modManagementAction, saveSourceRefreshConfig, type ModRecord, type ModSource, type NormalizedModManagement, type SourceRefreshConfig } from './modManagementApi';
+import { defaultSourceRefresh, isModBusyError, loadModManagement, loadSecretReferences, loadSourceRefreshConfig, modLifecyclePath, modManagementAction, saveSourceRefreshConfig, type ModRecord, type ModSource, type NormalizedModManagement, type SecretReference, type SourceRefreshConfig } from './modManagementApi';
 
 type ModsSection = 'installed' | 'sources' | 'automatic-checks';
 type Props = { section?: ModsSection; overflowTarget?: HTMLElement | null };
@@ -41,12 +42,53 @@ function formatDuration(milliseconds: number) {
   return `${draft.value} ${draft.unit}`;
 }
 
+const compatibleCredentialTypes = new Set(['credential', 'secret', 'token', 'password']);
+
+function sourceIdentity(value: string) {
+  try {
+    const url = new URL(value);
+    return { host: url.hostname.toLowerCase(), owner: url.pathname.split('/').filter(Boolean)[0]?.toLowerCase() ?? '' };
+  } catch { return { host: '', owner: '' }; }
+}
+
+function credentialText(item: SecretReference) {
+  return [item.label, item.type, item.username, item.url, item.service].filter(Boolean).join(' ').toLowerCase();
+}
+
+export function rankSecretReferences(items: SecretReference[], query: string, sourceUrl: string, username: string) {
+  const terms = query.trim().toLowerCase().split(/\s+/u).filter(Boolean);
+  const { host, owner } = sourceIdentity(sourceUrl);
+  const expectedUsername = username.trim().toLowerCase();
+  return items
+    .filter((item) => compatibleCredentialTypes.has(item.type))
+    .filter((item) => terms.every((term) => credentialText(item).includes(term)))
+    .map((item) => {
+      const text = credentialText(item);
+      let score = 0;
+      if (host && (text.includes(host) || text.includes(host.replace(/^www\./u, '')))) score += 12;
+      if (owner && text.includes(owner)) score += 6;
+      if (expectedUsername && item.username?.toLowerCase() === expectedUsername) score += 4;
+      if (item.type === 'token' || item.type === 'password') score += 2;
+      return { item, score };
+    })
+    .sort((a, b) => b.score - a.score || a.item.label.localeCompare(b.item.label))
+    .map(({ item }) => item);
+}
+
 export function ModsSettings({ section = 'installed', overflowTarget }: Props) {
   const [state, setState] = useState<NormalizedModManagement>({ mods: [], sources: [], restartRequired: false, sourceRefresh: defaultSourceRefresh });
   const [selectedModId, setSelectedModId] = useState<string | null>(null);
   const [sourceUrl, setSourceUrl] = useState('');
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [sourceUsername, setSourceUsername] = useState('');
+  const [secretReferences, setSecretReferences] = useState<SecretReference[]>([]);
+  const [selectedSecretReference, setSelectedSecretReference] = useState<SecretReference | null>(null);
+  const [secretReferenceError, setSecretReferenceError] = useState<string | null>(null);
+  const [credentialPickerOpen, setCredentialPickerOpen] = useState(false);
+  const [credentialQuery, setCredentialQuery] = useState('');
+  const [activeCredentialIndex, setActiveCredentialIndex] = useState(0);
+  const credentialPickerRef = useRef<HTMLDivElement>(null);
+  const credentialSearchRef = useRef<HTMLInputElement>(null);
   const sourceSecretRef = useRef<HTMLInputElement>(null);
   // Do not retain the secret in React state or browser storage. Wipe the DOM field on unmount.
   useEffect(() => {
@@ -86,7 +128,21 @@ export function ModsSettings({ section = 'installed', overflowTarget }: Props) {
     }
   }, []);
   useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    if (section !== 'sources') return;
+    setSecretReferenceError(null);
+    void loadSecretReferences().then(setSecretReferences).catch((cause) => {
+      setSecretReferences([]);
+      setSecretReferenceError(cause instanceof Error ? cause.message : 'Stored credentials are unavailable.');
+    });
+  }, [section]);
   useEffect(() => { if (section === 'automatic-checks') void loadRefreshConfiguration(); }, [section, loadRefreshConfiguration]);
+  useEffect(() => {
+    if (!credentialPickerOpen) return;
+    const close = (event: PointerEvent) => { if (!credentialPickerRef.current?.contains(event.target as Node)) setCredentialPickerOpen(false); };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [credentialPickerOpen]);
 
   useEffect(() => {
     if (!state.mods.some((mod) => mod.id === selectedModId)) setSelectedModId(state.mods[0]?.id ?? null);
@@ -95,6 +151,37 @@ export function ModsSettings({ section = 'installed', overflowTarget }: Props) {
   const selectedSource = state.sources.find((source) => source.id === selectedSourceId) ?? null;
   useEffect(() => { if (selectedSourceId && !selectedSource) setSelectedSourceId(null); }, [selectedSourceId, selectedSource]);
   const sourceRefresh = state.sourceRefresh ?? defaultSourceRefresh;
+  const rankedSecretReferences = useMemo(() => rankSecretReferences(
+    secretReferences,
+    credentialQuery,
+    selectedSource?.url ?? sourceUrl,
+    sourceUsername,
+  ), [credentialQuery, secretReferences, selectedSource?.url, sourceUrl, sourceUsername]);
+  const visibleSecretReferences = rankedSecretReferences.slice(0, 100);
+  useEffect(() => { setActiveCredentialIndex(0); }, [credentialQuery, sourceUrl, sourceUsername]);
+
+  const chooseSecretReference = (item: SecretReference) => {
+    setSelectedSecretReference(item);
+    if (!sourceUsername && item.username) setSourceUsername(item.username);
+    if (sourceSecretRef.current) sourceSecretRef.current.value = '';
+    setCredentialPickerOpen(false);
+    setCredentialQuery('');
+  };
+  const openCredentialPicker = (focusSearch = true) => {
+    setCredentialPickerOpen(true);
+    if (focusSearch) window.setTimeout(() => credentialSearchRef.current?.focus(), 0);
+  };
+  const credentialPickerKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Escape') { event.preventDefault(); setCredentialPickerOpen(false); sourceSecretRef.current?.focus(); return; }
+    if (!visibleSecretReferences.length) return;
+    if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      event.preventDefault();
+      setActiveCredentialIndex((index) => event.key === 'Home' ? 0 : event.key === 'End' ? visibleSecretReferences.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + visibleSecretReferences.length) % visibleSecretReferences.length);
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      chooseSecretReference(visibleSecretReferences[activeCredentialIndex]);
+    }
+  };
 
   const run = async (key: string, path: string, init?: RequestInit, onSubmitted?: () => void) => {
     setBusy(key);
@@ -144,22 +231,41 @@ export function ModsSettings({ section = 'installed', overflowTarget }: Props) {
   const lifecycle = (mod: ModRecord, action: 'uninstall' | 'enable' | 'disable') => {
     void run(mod.id, modLifecyclePath(mod.id, action), { method: 'POST' });
   };
+  const removeStoredCredential = async () => {
+    if (!selectedSource?.credential?.configured) return;
+    setBusy('source-credential');
+    setError(null);
+    try {
+      await modManagementAction(`/api/mod-management/sources/${encodeURIComponent(selectedSource.id)}/credential`, { method: 'DELETE' });
+      setSelectedSecretReference(null);
+      setSourceUsername('');
+      if (sourceSecretRef.current) sourceSecretRef.current.value = '';
+      setState(await loadModManagement());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not remove the stored credential.');
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const addSource = async () => {
     const url = selectedSource?.url ?? sourceUrl.trim();
     if (!url) return;
     const username = sourceUsername.trim();
     const secret = sourceSecretRef.current?.value ?? '';
-    if (username || secret) {
+    const credential = secret || selectedSecretReference?.reference || '';
+    const resolvedUsername = username || selectedSecretReference?.username || '';
+    if (resolvedUsername || credential) {
       if (!/^https:\/\/[^/]+/i.test(url)) {
         setError('Private repository credentials are supported only for HTTPS Git URLs. Configure SSH access on the Core service account instead.');
         return;
       }
-      if (username && !secret) {
+      if (resolvedUsername && !credential) {
         setError('Enter a password or access token when specifying a private repository username.');
         return;
       }
     }
-    const body = JSON.stringify({ url, ...(secret ? { auth: { ...(username ? { username } : {}), token: secret } } : {}) });
+    const body = JSON.stringify({ url, ...(credential ? { auth: { ...(resolvedUsername ? { username: resolvedUsername } : {}), token: credential } } : {}) });
     setBusy('source');
     setError(null);
     let submitted = false;
@@ -175,6 +281,7 @@ export function ModsSettings({ section = 'installed', overflowTarget }: Props) {
     if (submitted) {
       if (!selectedSource) setSourceUrl('');
       setSourceUsername('');
+      setSelectedSecretReference(null);
       if (sourceSecretRef.current) sourceSecretRef.current.value = '';
     }
     try {
@@ -224,7 +331,7 @@ export function ModsSettings({ section = 'installed', overflowTarget }: Props) {
 
   const sourceInventoryContents = state.sources.length === 0
     ? <p className="settings-empty">No custom sources configured.</p>
-    : <div className="memory-connection-list">{state.sources.map((source: ModSource) => <article className="memory-connection" key={source.id}><button type="button" className="memory-connection-select" aria-label={`Edit ${source.url}`} aria-pressed={source.id === selectedSourceId} onClick={() => { const selecting = selectedSourceId !== source.id; setSelectedSourceId(selecting ? source.id : null); setSourceUrl(selecting ? source.url : ''); setSourceUsername(''); if (sourceSecretRef.current) sourceSecretRef.current.value = ''; }}><strong>{source.url}</strong><small>{source.status || 'Unknown'}{source.lastCheckedAt ? ` · Checked ${formatCheckedTime(source.lastCheckedAt)}` : ''}{source.error ? ` · ${source.error}` : ''}</small></button><div className="memory-connection-actions"><button className="danger memory-edit" type="button" disabled={busy !== null} onClick={() => void run(source.id, `/api/mod-management/sources/${encodeURIComponent(source.id)}`, { method: 'DELETE' }, () => { if (source.id === selectedSourceId) { setSelectedSourceId(null); setSourceUrl(''); setSourceUsername(''); if (sourceSecretRef.current) sourceSecretRef.current.value = ''; } })}>Remove</button></div></article>)}</div>;
+    : <div className="memory-connection-list">{state.sources.map((source: ModSource) => <article className="memory-connection" key={source.id}><button type="button" className="memory-connection-select" aria-label={`Edit ${source.url}`} aria-pressed={source.id === selectedSourceId} onClick={() => { const selecting = selectedSourceId !== source.id; setSelectedSourceId(selecting ? source.id : null); setSourceUrl(selecting ? source.url : ''); setSourceUsername(''); setSelectedSecretReference(null); setCredentialPickerOpen(false); if (sourceSecretRef.current) sourceSecretRef.current.value = ''; }}><strong>{source.url}</strong><small>{source.status || 'Unknown'}{source.lastCheckedAt ? ` · Checked ${formatCheckedTime(source.lastCheckedAt)}` : ''}{source.error ? ` · ${source.error}` : ''}</small></button><div className="memory-connection-actions"><button className="danger memory-edit" type="button" disabled={busy !== null} onClick={() => void run(source.id, `/api/mod-management/sources/${encodeURIComponent(source.id)}`, { method: 'DELETE' }, () => { if (source.id === selectedSourceId) { setSelectedSourceId(null); setSourceUrl(''); setSourceUsername(''); if (sourceSecretRef.current) sourceSecretRef.current.value = ''; } })}>Remove</button></div></article>)}</div>;
   const sourceInventory = overflowTarget
     ? <div className="settings-overflow-content memory-saved" aria-label="Configured mod sources">{sourceInventoryContents}</div>
     : <details className="memory-saved saved-accordion" open><summary><h3>Configured sources</h3><span>{state.sources.length}</span></summary>{sourceInventoryContents}</details>;
@@ -251,8 +358,25 @@ export function ModsSettings({ section = 'installed', overflowTarget }: Props) {
         : 'Background source checks are disabled.'}</p>
     <Field label="Git repository URL"><input value={selectedSource?.url ?? sourceUrl} readOnly={!!selectedSource} onChange={(event) => setSourceUrl(event.target.value)} placeholder="https://git.example.com/team/mod.git" /></Field>
     <Field label="Private repository username (optional)"><input value={sourceUsername} onChange={(event) => setSourceUsername(event.target.value)} autoComplete="off" /></Field>
-    <Field label="Password or access token (optional)"><input ref={sourceSecretRef} type="password" autoComplete="new-password" /></Field>
-    <p className="settings-help">Public repositories need only a URL. Credentials are for HTTPS Git repositories only and are stored encrypted by Core, not shown here again. For SSH, configure keys and host trust on the Core service account.</p>
+    {selectedSource?.credential?.configured && !selectedSecretReference && <div className="credential-configured" role="status">
+      <span className="credential-configured-icon" aria-hidden="true">🔒</span>
+      <span><strong>Stored credential configured</strong><small>Leave the password or token empty to keep using it.</small></span>
+      <button className="danger" type="button" aria-label="Remove stored credential" disabled={busy !== null} onClick={() => void removeStoredCredential()}>{busy === 'source-credential' ? 'Removing…' : 'Remove'}</button>
+    </div>}
+    <div className="credential-picker" ref={credentialPickerRef}>
+      <div className="field"><label htmlFor="mod-source-secret">Password or access token (optional)</label><div className="credential-entry"><input id="mod-source-secret" ref={sourceSecretRef} type="password" autoComplete="new-password" placeholder={selectedSecretReference ? 'Stored credential selected' : "Paste a credential or type {{gss:…}}"} aria-haspopup={secretReferences.length ? 'listbox' : undefined} aria-expanded={secretReferences.length ? credentialPickerOpen : undefined} aria-controls={credentialPickerOpen ? 'mod-source-credentials' : undefined} onChange={(event) => { const exact = secretReferences.find(item => item.reference === event.target.value) || null; setSelectedSecretReference(exact); if (event.target.value === '{{' && secretReferences.length) openCredentialPicker(); }} />{secretReferences.length > 0 && <button className="credential-browse" type="button" disabled={busy !== null} aria-label="Browse stored credentials" aria-expanded={credentialPickerOpen} aria-controls="mod-source-credentials" onClick={() => credentialPickerOpen ? setCredentialPickerOpen(false) : openCredentialPicker()}>Browse</button>}</div></div>
+      {selectedSecretReference && <div className="credential-selection" role="status" title={selectedSecretReference.reference}><span aria-hidden="true">🔒</span><span><strong>{selectedSecretReference.label}</strong><small>{[selectedSecretReference.service, selectedSecretReference.username].filter(Boolean).join(' · ') || 'Stored credential'}</small></span><button type="button" aria-label={`Clear ${selectedSecretReference.label}`} onClick={() => { setSelectedSecretReference(null); if (sourceSecretRef.current) { sourceSecretRef.current.value = ''; sourceSecretRef.current.focus(); } }}>×</button></div>}
+      {credentialPickerOpen && <div className="credential-picker-panel">
+        <input ref={credentialSearchRef} className="credential-search" type="search" role="combobox" aria-label="Search stored credentials" aria-autocomplete="list" aria-expanded="true" aria-controls="mod-source-credentials" aria-activedescendant={visibleSecretReferences.length ? `mod-source-credential-${activeCredentialIndex}` : undefined} value={credentialQuery} onChange={(event) => setCredentialQuery(event.target.value)} onKeyDown={credentialPickerKeyDown} placeholder="Search credentials" />
+        <div id="mod-source-credentials" className="credential-options" role="listbox" aria-label="Stored credentials">
+          {visibleSecretReferences.map((item, index) => <button type="button" role="option" id={`mod-source-credential-${index}`} aria-selected={selectedSecretReference?.reference === item.reference} className={activeCredentialIndex === index ? 'active' : ''} key={item.reference} onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setActiveCredentialIndex(index)} onClick={() => chooseSecretReference(item)}><span aria-hidden="true">🔒</span><span><strong>{item.label}</strong><small>{[item.service, item.username, item.type].filter(Boolean).join(' · ')}</small></span></button>)}
+          {visibleSecretReferences.length === 0 && <p className="credential-empty">No compatible credentials match.</p>}
+        </div>
+        {rankedSecretReferences.length > visibleSecretReferences.length && <p className="credential-limit">Showing 100 of {rankedSecretReferences.length}. Refine your search.</p>}
+      </div>}
+    </div>
+    {secretReferenceError && <p className="settings-help">Stored credentials unavailable. You can still paste a credential or enter a secret reference.</p>}
+    <p className="settings-help">Public repositories need only a URL. Credentials are for HTTPS Git repositories only. Stored-secret references are resolved only by Core; the browser never receives their values. For SSH, configure keys and host trust on the Core service account.</p>
     <div className="model-actions"><button className="secondary" type="button" disabled={busy !== null} onClick={() => void run('refresh', '/api/mod-management/refresh', { method: 'POST' })}>{busy === 'refresh' ? 'Refreshing…' : 'Refresh sources'}</button><button className="primary" type="button" disabled={(!selectedSource && !sourceUrl.trim()) || busy !== null} onClick={() => void addSource()}>{busy === 'source' ? (selectedSource ? 'Updating…' : 'Adding…') : selectedSource ? 'Update source' : 'Add source'}</button></div>
   </section>;
 

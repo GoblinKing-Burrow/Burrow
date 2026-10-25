@@ -15,6 +15,7 @@ let systemController = null;
 const handlers = new Map();
 const toolHandlers = new Map();
 const protectedResolvers = new Map();
+const secretReferenceProviders = new Map();
 const activeInvocations = new Map();
 const cancelledInvocations = new Set();
 let diagnosticHandlers = null;
@@ -23,7 +24,11 @@ const pendingCapabilities = new Map();
 const invocationScope = new AsyncLocalStorage();
 function capabilityRequest(method, input, { signal } = {}) {
   if (stopping || !process.connected) return Promise.reject(new Error("mod_capability_unavailable"));
-  const invocationSignal = invocationScope.getStore()?.signal;
+  const inheritedInvocation = invocationScope.getStore();
+  const activeInvocation = inheritedInvocation && activeInvocations.get(inheritedInvocation.invocationId)?.signal === inheritedInvocation.signal
+    ? inheritedInvocation
+    : null;
+  const invocationSignal = activeInvocation?.signal;
   signal = signal && invocationSignal ? AbortSignal.any([signal, invocationSignal]) : signal || invocationSignal;
   if (signal?.aborted) return Promise.reject(new Error("mod_capability_cancelled"));
   const requestId = `cap-${process.pid}-${++sequence}`;
@@ -35,7 +40,7 @@ function capabilityRequest(method, input, { signal } = {}) {
     };
     signal?.addEventListener("abort", cancel, { once: true });
     pendingCapabilities.set(requestId, { resolve, reject, signal, cancel });
-    send({ type: "capability-request", requestId, method, input, parentInvocationId: invocationScope.getStore()?.invocationId || null }, (error) => {
+    send({ type: "capability-request", requestId, method, input, parentInvocationId: activeInvocation?.invocationId || null }, (error) => {
       if (error && pendingCapabilities.delete(requestId)) { signal?.removeEventListener("abort", cancel); reject(new Error("mod_capability_unavailable")); }
     });
     if (signal?.aborted) cancel();
@@ -152,6 +157,10 @@ function registrar(modId) {
       if (resolveProtectedReference) protectedResolvers.set(name, resolveProtectedReference);
       tools.push({ name, description, inputSchema: schema, availability });
     } }),
+    secretReferences: Object.freeze({ register({ scheme, list, resolve }) {
+      if (!registrationOpen || typeof scheme !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/.test(scheme) || secretReferenceProviders.has(scheme) || typeof list !== 'function' || typeof resolve !== 'function') throw new Error('mod_secret_reference_provider_invalid');
+      secretReferenceProviders.set(scheme, { list, resolve });
+    } }),
     diagnostics: Object.freeze({ register(adapter) {
       if (diagnosticHandlers || !adapter || typeof adapter.listJobs !== "function" || typeof adapter.getJob !== "function") throw new Error("mod_diagnostics_invalid");
       diagnosticHandlers = { listJobs: adapter.listJobs, getJob: adapter.getJob };
@@ -186,13 +195,14 @@ async function activate(message) {
     api: registration.api,
     tools: registration.toolsApi,
     diagnostics: registration.diagnostics,
+    secretReferences: registration.secretReferences,
     runtimeDiagnostics: Object.freeze({ read: (input, options) => capabilityRequest("readRuntimeDiagnostics", input, options) }),
     settings: settingsApi(),
     secrets: secretsApi(),
     conversations: Object.freeze({ list: (input) => capabilityRequest("listConversations", input), read: (input, options) => capabilityRequest("readConversation", input, options) }),
     models: Object.freeze({ list: () => capabilityRequest("listModels", {}), generateText: (input, options) => capabilityRequest("generateText", input, options), generations: Object.freeze({ submit: (input) => capabilityRequest("submitGeneration", input), read: (jobId) => capabilityRequest("readGeneration", { jobId }) }) }),
     forge: Object.freeze({ images: Object.freeze({ status: () => capabilityRequest("getForgeImageStatus", {}), create: (input) => capabilityRequest("createForgeImage", input) }), jobs: Object.freeze({ read: (jobId) => capabilityRequest("readForgeImageJob", { jobId }) }) }),
-    agents: Object.freeze({ list: () => capabilityRequest("listAgents", {}), turns: Object.freeze({ submit: (input) => capabilityRequest("submitExternalTurn", input), read: (turnId) => capabilityRequest("readExternalTurn", { turnId }) }) }),
+    agents: Object.freeze({ sessions: Object.freeze({ create: input => capabilityRequest("createExternalSession", input), model: input => capabilityRequest("readExternalSessionModel", input), setModel: input => capabilityRequest("setExternalSessionModel", input) }), list: () => capabilityRequest("listAgents", {}), turns: Object.freeze({ submit: (input) => capabilityRequest("submitExternalTurn", input), read: (turnId) => capabilityRequest("readExternalTurn", { turnId }), cancel: (turnId) => capabilityRequest("cancelExternalTurn", { turnId }) }) }),
     operator: Object.freeze({ timezone: () => capabilityRequest("getOperatorTimezone", {}), displayIdentity: () => capabilityRequest("getOperatorIdentity", {}) }),
     scheduler: Object.freeze({ list: (input = {}) => capabilityRequest("listScheduledJobs", input), read: (jobId) => capabilityRequest("readScheduledJob", { jobId }), create: (input) => capabilityRequest("createScheduledJob", input), update: (jobId, patch) => capabilityRequest("updateScheduledJob", { jobId, patch }), delete: (jobId) => capabilityRequest("deleteScheduledJob", { jobId }), runs: (jobId, input = {}) => capabilityRequest("listScheduledJobRuns", { ...input, jobId }), trigger: (jobId) => capabilityRequest("triggerScheduledJob", { jobId }) }),
     logger: logger(modId),
@@ -227,11 +237,13 @@ async function activate(message) {
   const result = await module.activate(Object.freeze(context));
   registration.closeRegistration();
   cleanup = typeof result === 'function' ? result : result && typeof result.close === 'function' ? () => result.close() : null;
-  send({ type: 'activated', routes: registration.routes, tools: registration.tools, diagnostics: Boolean(diagnosticHandlers) });
+  send({ type: 'activated', routes: registration.routes, tools: registration.tools, diagnostics: Boolean(diagnosticHandlers), secretReferenceSchemes: [...secretReferenceProviders.keys()] });
 }
 
 async function invoke(message) {
-  const handler = message.routeId?.startsWith("protected:") ? protectedResolvers.get(message.routeId.slice(10)) : message.routeId?.startsWith("tool:") ? toolHandlers.get(message.routeId.slice(5)) : message.routeId === "diagnostic-list" ? diagnosticHandlers?.listJobs : message.routeId === "diagnostic-detail" ? diagnosticHandlers?.getJob : handlers.get(message.routeId);
+  const secretListScheme = message.routeId?.startsWith("secret-reference-list:") ? message.routeId.slice(22) : null;
+  const secretResolveScheme = message.routeId?.startsWith("secret-reference-resolve:") ? message.routeId.slice(25) : null;
+  const handler = secretListScheme ? secretReferenceProviders.get(secretListScheme)?.list : secretResolveScheme ? secretReferenceProviders.get(secretResolveScheme)?.resolve : message.routeId?.startsWith("protected:") ? protectedResolvers.get(message.routeId.slice(10)) : message.routeId?.startsWith("tool:") ? toolHandlers.get(message.routeId.slice(5)) : message.routeId === "diagnostic-list" ? diagnosticHandlers?.listJobs : message.routeId === "diagnostic-detail" ? diagnosticHandlers?.getJob : handlers.get(message.routeId);
   if (!handler) throw new Error('mod_route_handler_not_found');
   const controller = new AbortController();
   activeInvocations.set(message.requestId, controller);
@@ -276,6 +288,20 @@ process.on('message', async (message) => {
       send({ type: 'system-controller-configuration-result', protocol: SYSTEM_PROTOCOL, controllerInstanceId, requestId: message.requestId, ok: true, result }, () => {});
     } catch (error) {
       send({ type: 'system-controller-configuration-result', protocol: SYSTEM_PROTOCOL, controllerInstanceId, requestId: message.requestId, ok: false, error: opaqueCode(error, 'remote_configuration_failed') }, () => {});
+    }
+    return;
+  }
+  if (message?.type === 'system-controller-describe-host') {
+    if (!validSystemMessage(message, 'system-controller-describe-host', { operation: false })
+      || typeof message.targetId !== 'string' || !message.targetId || stopping) return;
+    try {
+      const result = typeof systemController?.describeHost === 'function'
+        ? await systemController.describeHost(message.targetId) : null;
+      send({ type: 'system-controller-host-description-result', protocol: SYSTEM_PROTOCOL, controllerInstanceId,
+        requestId: message.requestId, targetId: message.targetId, ok: true, result: result ?? null }, () => {});
+    } catch {
+      send({ type: 'system-controller-host-description-result', protocol: SYSTEM_PROTOCOL, controllerInstanceId,
+        requestId: message.requestId, targetId: message.targetId, ok: false }, () => {});
     }
     return;
   }

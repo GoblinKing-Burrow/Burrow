@@ -1,3 +1,4 @@
+import { UnsavedChangesProvider, useUnsavedNavigation } from './app/UnsavedChanges';
 import { useBrowserTabTitle } from './app/browserTab';
 import { readAttachment } from './app/readAttachment';
 import { isWithinAttachmentBudget } from './features/chat/attachmentValidation';
@@ -38,6 +39,7 @@ import { Forge } from './features/forge/ForgePage';
 
 function AppContent() {
   useBrowserTabTitle();
+  const navigate = useUnsavedNavigation();
   const [runtimeVersion, setRuntimeVersion] = useState<string | null>(null);
   useEffect(() => { let live = true; void api<RuntimeHealth>('/api/health').then((health) => { if (live) setRuntimeVersion(health.version ?? null); }).catch(() => {}); return () => { live = false; }; }, []);
   const previewFirstRun = new URLSearchParams(window.location.search).get('previewFirstRun') === '1';
@@ -133,7 +135,19 @@ function AppContent() {
   const writeModelSelection = useModelSelectionWriter(savedProviders,
     (id, patch) => setAgents(all => all.map(agent => agent.id === id ? { ...agent, ...patch } : agent)), reportError);
   const updateAgent = async (patch: Partial<Agent>) => {
-    if (selected) await writeModelSelection(selected, patch);
+    if (!selected) return;
+    if (patch.contextConfig) {
+      const contextConfig = { a2aInDefault: patch.contextConfig.a2aInDefault };
+      try {
+        await api(`/api/agents/${encodeURIComponent(selected.resourceId ?? selected.id)}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ contextConfig }) });
+        setAgents((all) => all.map((agent) => agent.id === selected.id ? { ...agent, contextConfig: { ...agent.contextConfig, ...contextConfig } } : agent));
+        await refreshSessions(selected.id).catch((error: Error) => reportError(`A2A routing saved, but could not refresh sessions: ${error.message}`));
+      } catch (error) {
+        reportError(error instanceof Error ? `Could not update A2A routing: ${error.message}` : 'Could not update A2A routing.');
+      }
+      return;
+    }
+    await writeModelSelection(selected, patch);
   };
 
   const confirmDiscard = useConfirm();
@@ -198,19 +212,22 @@ function AppContent() {
     return <div className="panel-body"><p className="hint">No panel selected.</p></div>;
   };
   const changePage = (nextPage: Page) => {
-    if (nextPage === 'settings' && !previewFirstRun) setSettingsTab('general');
-    setActiveModId(null);
-    setPage(nextPage);
-    if (nextPage === 'chat' && page !== 'chat') {
-      void Promise.all([refreshSessions(), refreshConversation()]).catch((error: Error) => reportError(`Could not refresh chat: ${error.message}`));
-    }
+    if (!activeMod && nextPage === page) return;
+    navigate(() => {
+      if (nextPage === 'settings' && !previewFirstRun) setSettingsTab('general');
+      setActiveModId(null);
+      setPage(nextPage);
+      if (nextPage === 'chat' && page !== 'chat') {
+        void Promise.all([refreshSessions(), refreshConversation()]).catch((error: Error) => reportError(`Could not refresh chat: ${error.message}`));
+      }
+    });
   };
   return <main className={`cockpit ${page === 'tasks' || page === 'archive' || page === 'brains' ? 'tasks-mode' : page === 'forge' ? 'forge-mode' : page === 'settings' ? `settings-mode${settingsNavigationVisible ? ' settings-top-navigation' : ''}` : activeMod ? 'mod-mode' : ''}`} data-theme={theme} style={style}>
     <div className="app-navigation-stack">
     <header className="app-header">
       <nav className="page-tabs" aria-label="Primary navigation">
         {(['chat', 'tasks', 'archive', 'brains', 'forge'] as Page[]).map((item) => <button className={!activeMod && page === item ? 'active' : ''} onClick={() => changePage(item)} key={item} aria-current={!activeMod && page === item ? 'page' : undefined}>{item === 'brains' ? 'Brains' : item === 'forge' ? 'Forge' : item}</button>)}
-        {modPanels.map((mod) => <button type="button" key={mod.modId} className={activeModId === mod.modId ? 'active' : ''} aria-current={activeModId === mod.modId ? 'page' : undefined} onClick={() => setActiveModId(mod.modId)}>{mod.name}</button>)}
+        {modPanels.map((mod) => <button type="button" key={mod.modId} className={activeModId === mod.modId ? 'active' : ''} aria-current={activeModId === mod.modId ? 'page' : undefined} onClick={() => navigate(() => setActiveModId(mod.modId))}>{mod.name}</button>)}
         <button className={!activeMod && page === 'settings' ? 'active' : ''} onClick={() => changePage('settings')} aria-current={!activeMod && page === 'settings' ? 'page' : undefined}>settings</button>
       </nav>
     </header>
@@ -224,5 +241,5 @@ function AppContent() {
   </main>;
 }
 
-export const App = AppContent;
+export function App() { return <UnsavedChangesProvider><AppContent /></UnsavedChangesProvider>; }
 

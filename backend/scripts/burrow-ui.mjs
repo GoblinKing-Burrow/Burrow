@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isInternalContextSession } from '../src/model-context-boundary.mjs';
 import { createModGenerationDispatcher } from '../src/mod-generations.mjs';
 import { createModTextGenerator } from '../src/mod-capabilities.mjs';
 import { migrateLegacyExecutionProviderApproval } from '../src/execution-provider-approval.mjs';
@@ -22,7 +23,8 @@ import { browserTabSettings, saveBrowserTabSettings } from '../src/browser-tab-s
 import { otelSettings, readOtelRuntimeConfig, saveOtelSettings } from '../src/otel-settings.mjs';
 import { createReconfigurableOtelRuntime } from '../src/otel-runtime.mjs';
 import { artifactResponseHeaders } from '../src/artifact-response-policy.mjs';
-import { postgresTransactionContext, withPostgresTransaction } from '../src/postgres-foundation.mjs';
+import { postgresConfig, postgresTransactionContext, withPostgresTransaction } from '../src/postgres-foundation.mjs';
+import { acquirePostgresRuntimeOwnership } from '../src/postgres-runtime-ownership.mjs';
 import { readJsonBody } from '../src/request-resource-budgets.mjs';
 import { operatorTimezone, saveOperatorTimezone } from '../src/timezone.mjs';
 import { ensureDefaultGlobalWorkspace } from '../src/runtime-workspace-defaults.mjs';
@@ -69,7 +71,7 @@ import { createExecutionProviderRegistry } from '../src/process-execution-router
 import { buildChatSupportStatus, buildWorkbenchStatus } from '../src/workbench-status.mjs';
 import { allowedNextSteps, appendWorkItemStep, archiveWorkItem, createWorkItem, listWorkItems, readWorkItem, workItemEligibility } from '../src/work-item-store.mjs';
 import { searchBurrowSessionEvidence, searchSessionEvidence } from '../src/session-search.mjs';
-import { CODEX_CLIENT_VERSION_CACHE_TTL_MS, discoverModels, refreshCodexClientVersionCache } from '../src/model-settings-store.mjs';
+import { CODEX_CLIENT_VERSION_CACHE_TTL_MS, isProviderPool, assertConnection, assertProviderPoolMembers, providerPoolModels, discoverModels, refreshCodexClientVersionCache } from '../src/model-settings-store.mjs';
 import { claudeCredentialAuthPayload, detectClaudeCliCredential } from '../src/claude-cli-credentials.mjs';
 import { cancelClaudeCodeLogin, getClaudeCodeLogin, importClaudeCodeLoginCredential, startClaudeCodeLogin, submitClaudeCodeLoginCode } from '../src/claude-code-login.mjs';
 import { cancelOpenAiOAuthLogin, getOpenAiOAuthLogin, startOpenAiOAuthLogin, submitOpenAiOAuthCode } from '../src/openai-oauth-login.mjs';
@@ -115,6 +117,7 @@ import { cleanupMods, createModRoute, discoverMods, loadMods } from '../src/mod-
 import { activeManagedSkillDeclarations, createManagedSkillSynchronizer, inspectManagedSkills, reconcileManagedSkills } from '../src/managed-skills.mjs';
 import { createModManagement } from '../src/mod-management.mjs';
 import { createModDistribution, createModManagementRoute } from '../src/mod-distribution.mjs';
+import { listSecretReferences, resolveSecretReference } from '../src/secret-references.mjs';
 import { MAX_OVERVIEW_CHILD_CONTEXTS, normalizeOverviewBody, overviewSessionIds } from '../src/agent-overview.mjs';
 
 function isChatMessage(entry) {
@@ -183,7 +186,14 @@ const OPENAI_OAUTH_USAGE_URL = process.env.BURROW_OPENAI_OAUTH_USAGE_URL || 'htt
 const runtimeRoot = process.env.BURROW_RUNTIME_ROOT || process.env.BURROW_DATA_ROOT || '/mnt/local/burrow';
 // PostgreSQL owns server persistence; startup fails if composition is unavailable.
 const serverLogger = createRuntimeServerLogger({ runtimeRoot });
+const runtimePostgresConfig = postgresConfig();
+// Acquire before composition starts any producers, and before orphan repair.
+// Keep the dedicated session through shutdown and store teardown until exit.
+let runtimeOwnership;
+try { runtimeOwnership = await acquirePostgresRuntimeOwnership({ config: runtimePostgresConfig }); }
+catch (error) { console.error(`Burrow UI startup refused: ${String(error?.message || error)}`); process.exit(1); }
 const postgresApplication = await createPostgresApplication({
+  poolConfig: runtimePostgresConfig,
   encryptionKey: settingsKeyFromEnvironment(),
   runtimeRoot,
   resolveAgent: async (agentId) => resolveAgentRuntime(agentId),
@@ -197,10 +207,9 @@ await hydrateMcpProviderStates({ runtimeRoot: process.env.BURROW_MCPORTER_ROOT |
 const runtimeMetrics = createRuntimeMetricsCollector({ runtimeRoot });
 const otelRuntime = createReconfigurableOtelRuntime({ serviceVersion: releaseVersion });
 await otelRuntime.apply(await readOtelRuntimeConfig({ store: postgresApplication.stores.opentelemetry, metadata: postgresApplication.stores.metadata }));
-await postgresApplication.stores.externalTurns.interruptIncomplete('core_restart_before_completion');
-await postgresApplication.stores.generations.interruptIncomplete('core_restart_before_completion');
+await runtimeOwnership.reconcileModJobs(postgresApplication.stores);
 const generationDispatcher = createModGenerationDispatcher({ store: postgresApplication.stores.generations, generateText: createModTextGenerator({ models: postgresApplication.stores.models }) });
-const externalTurnDispatcher = createModExternalTurnDispatcher({ store: postgresApplication.stores.externalTurns, stores: postgresApplication.stores, resolveAgentRuntime, rootDir: projectRoot, telemetry: otelRuntime });
+const externalTurnDispatcher = createModExternalTurnDispatcher({ store: postgresApplication.stores.externalTurns, stores: postgresApplication.stores, resolveAgentRuntime, rootDir: projectRoot, registerActiveRun: registerRuntimeActiveRun, telemetry: otelRuntime });
 async function applyOtelConfigurationToNodeGoblins() {
   const configuration = otelRuntime.remoteConfiguration();
   try { return await executionProviders.configure('node-goblin', configuration); }
@@ -282,7 +291,7 @@ function installerStagingScheduler() {
 
 function taskExecutionMessage(task, project) {
   return [
-    'Task-board execution request. Work this task now and report concise evidence, blockers, and any changed files. Before changing this board task’s status, fields, assignment, or metadata, confirm the intended board update with Rob; do not infer it from work completion alone.',
+    'Task-board execution request. Work this task now and report concise evidence, blockers, and any changed files. Keep this task’s status aligned with your work: move it to `in_progress` when you begin execution and to `review` when the work is complete and ready for operator review. These transitions do not require confirmation. The operator owns the final move to `done`; do not mark tasks done yourself. Confirm other changes to task fields, assignment, or metadata with the operator unless already authorized.',
     `Task ID: ${task.id}`,
     `Task execution project: ${project.name} (${project.id})`,
     project.description ? `Project description: ${project.description}` : null,
@@ -303,7 +312,6 @@ async function executeBoardTask(taskId) {
     if (!task) return { ok: false, error: 'task_not_found' };
     if (!task.assignedAgentId) return { ok: false, error: 'task_assigned_agent_required', task };
     if (['done', 'cancelled'].includes(task.status)) return { ok: false, error: 'task_not_executable', task };
-    const project = await store.getProject(task.projectId);
     const agentRuntime = await resolveAgentRuntime(task.assignedAgentId);
     // Board tasks deliberately execute where Rob works: the assigned agent's
     // main/default conversation. The task record, not a task-specific session,
@@ -311,8 +319,44 @@ async function executeBoardTask(taskId) {
     const sessionId = 'default';
     const runId = createChatTurnRunId({ sessionId, prefix: 'task' });
     lifecycle?.signal.throwIfAborted();
-    const updated = await store.startExecution(task.id, { agentId: agentRuntime.agentId, sessionId, runId }, { actor: { type: 'operator', id: 'default' } });
-    return { ok: true, task, project, agentRuntime, sessionId, runId, updated };
+    let updated;
+    try {
+      updated = await store.startExecution(task.id, { agentId: agentRuntime.agentId, sessionId, runId }, { actor: { type: 'operator', id: 'default' } });
+    } catch (error) {
+      if (['task_execution_running', 'task_not_executable', 'task_assigned_agent_required', 'task_assigned_agent_changed'].includes(error?.message))
+        return { ok: false, error: error.message };
+      throw error;
+    }
+    if (!updated) return { ok: false, error: 'task_not_found' };
+    // Only a successful durable claim may register or enqueue work. Use the
+    // locked task snapshot rather than the preflight read for the prompt.
+    // A task can move projects while the claim waits for its row lock.
+    let project;
+    try {
+      project = await store.getProject(updated.projectId);
+    } catch (error) {
+      // No turn has been registered or dispatched. Release only this known
+      // failed admission via the existing owner CAS; never reset other claims.
+      const message = String(error?.message || error);
+      try {
+        await store.recordExecution(updated.id, { agentId: agentRuntime.agentId, sessionId, runId, ok: false, error: message, result: { answerText: null, blockers: [message], verification: null, completionEvidence: null } }, { actor: { type: 'agent', id: agentRuntime.agentId } });
+      } catch (recoveryError) {
+        // Persistence is unavailable: retain the fail-closed claim and surface
+        // both failures instead of claiming the task is safe to retry.
+        const failure = new AggregateError([error, recoveryError], 'task_execution_pre_dispatch_recovery_failed', { cause: error });
+        // Preserve only diagnostic fields, not arbitrary error properties or
+        // credentials. The request logger applies its normal bounds/redaction;
+        // keep this separate from `details`, which is exposed over HTTP.
+        const diagnostic = (error) => ({ name: String(error?.name || 'Error'), message: String(error?.message || error), ...(error?.code != null ? { code: String(error.code) } : {}) });
+        failure.taskExecutionDiagnostics = {
+          taskId: updated.id, runId, agentId: agentRuntime.agentId, sessionId,
+          projectReadError: diagnostic(error), recoveryWriteError: diagnostic(recoveryError),
+        };
+        throw failure;
+      }
+      throw error;
+    }
+    return { ok: true, task: updated, project, agentRuntime, sessionId, runId, updated };
   });
   if (!dispatch.ok) return dispatch;
   const { task, project, agentRuntime, sessionId, runId, updated } = dispatch;
@@ -354,7 +398,7 @@ async function executeBoardTask(taskId) {
       verification: result.verification ? { required: Boolean(result.verification.required), ok: result.verification.ok ?? null, reason: result.verification.reason || null } : null,
       completionEvidence: result.completionEvidence || null,
     };
-    await withTaskBoard((store) => store.recordExecution(task.id, { agentId: agentRuntime.agentId, sessionId, runId: result.runId || runId, decision: result.decision || null, ok: Boolean(result.ok), executedAt: new Date().toISOString(), traceDir: result.traceDir || null, error: result.ok ? null : (result.error || null), result: taskResult }, { actor: { type: 'agent', id: agentRuntime.agentId } }));
+    await withTaskBoard((store) => store.recordExecution(task.id, { agentId: agentRuntime.agentId, sessionId, runId, decision: result.decision || null, ok: Boolean(result.ok), executedAt: new Date().toISOString(), traceDir: result.traceDir || null, error: result.ok ? null : (result.error || null), result: taskResult }, { actor: { type: 'agent', id: agentRuntime.agentId } }));
   }).catch(async (error) => {
     await withTaskBoard((store) => store.recordExecution(task.id, { agentId: agentRuntime.agentId, sessionId, runId, ok: false, error: String(error?.message || error), result: { answerText: null, blockers: [String(error?.message || error)], verification: null, completionEvidence: null } }, { actor: { type: 'agent', id: agentRuntime.agentId } }));
   }).finally(() => {
@@ -746,7 +790,8 @@ async function archiveSummaryForSession({ agentId, rootDir, sessionId } = {}) {
 async function archiveSummaryForReset({ agentId, rootDir, sessionId, archiveId = null, archivedPath = null } = {}) {
   if (!archiveId) return null;
   const store = postgresApplication.stores.conversations;
-  const snapshot = await store.readArchive({agentId,sessionId,archiveId});
+  const transcript = await store.exportArchiveTranscript({agentId,sessionId,archiveId});
+  const snapshot = transcript ? { entries: transcript.entries, metadata: transcript.session.metadata } : null;
   if (!snapshot) return null;
   const modelConfig = await archiveSummaryModelConfig(agentId);
   if (!modelConfig) return null;
@@ -912,6 +957,18 @@ async function discoverModelConnection(body = {}) {
   const apiType = body.apiType || existing?.apiType;
   const priorModels = body.models || existing?.models || [];
   try {
+    if (isProviderPool({ apiType })) {
+      const connection = { ...assertConnection({ ...existing, ...body, apiType }), id: existing?.id };
+      const members = await Promise.all(connection.pool.memberConnectionIds.map(id => store.get(id)));
+      assertProviderPoolMembers(connection, members.filter(Boolean));
+      const catalogs = await Promise.all(members.map(async member => {
+        const models = await store.discoverModels({ id: member.id, useModelsDev: true, signal: AbortSignal.timeout(15_000) });
+        await store.persistDiscoveredModels(member.id, models);
+        return { ...member, models };
+      }));
+      const discovered = providerPoolModels(catalogs);
+      return { ok: true, models: discovered, discovery: { status: discovered.length ? 'discovered' : 'manual_only', count: discovered.length } };
+    }
     if (existing && auth?.type === 'oauth' && /openai/i.test(String(auth.provider || existing.provider || '')) && /chatgpt\.com\/backend-api/i.test(String(baseUrl || ''))) auth = { ...auth, ...(await store.resolveAuth(existing.id)) };
     const apiKey = String(body.apiKey || '').trim() || (auth?.token ? String(auth.token).trim() : '') || (auth?.apiKey ? String(auth.apiKey).trim() : '') || (auth?.accessToken ? String(auth.accessToken).trim() : '') || (existing ? await store.apiKey(existing.id) : null);
     const hasCredential = Boolean(apiKey || auth?.token || auth?.apiKey || auth?.accessToken);
@@ -1022,7 +1079,14 @@ async function createAgent(body = {}) {
 }
 
 async function updateAgent(id, body = {}) {
-  try { return { ok: true, agent: await agentsStore().update(id, body) }; }
+  try {
+    const agent = await agentsStore().update(id, body);
+    // Materialize the visible inbox before acknowledging Off, even when empty.
+    if (agent.contextConfig?.a2aInDefault === false) {
+      await postgresApplication.stores.conversations.updateMetadata({ agentId: agent.id, sessionId: 'a2a', update: (metadata) => metadata });
+    }
+    return { ok: true, agent };
+  }
   catch (error) { return { ok: false, status: String(error?.message || error) === 'agent_not_found' ? 404 : 400, error: String(error?.message || error) }; }
 }
 
@@ -1891,13 +1955,13 @@ function validateBoundaryBody(kind, input = {}) {
     normalizeOverviewBody(body);
   }
   if (kind === 'agent-patch') { for (const field of ['name', 'enabled', 'availableCapabilities', 'contextConfig']) if (body[field] !== undefined && !['string', 'boolean', 'object'].includes(typeof body[field])) throw Object.assign(new Error(`${field}_invalid`), { statusCode: 400 }); }
-  if (kind === 'chat') { const hasMessage = typeof body.message === 'string' && body.message.trim(); const hasImage = Array.isArray(body.attachments) && body.attachments.some((item) => String(item?.type || item?.mimeType || '').toLowerCase().startsWith('image/')); if (!hasMessage && !hasImage) throw Object.assign(new Error('message_required'), { statusCode: 400 }); }
+  if (kind === 'chat') { const hasMessage = typeof body.message === 'string' && body.message.trim(); const hasAttachment = Array.isArray(body.attachments) && body.attachments.length > 0; if (!hasMessage && !hasAttachment) throw Object.assign(new Error('message_required'), { statusCode: 400 }); }
   if (kind === 'workspace-write') { requireStringField(body, 'path'); if (typeof body.content !== 'string') throw Object.assign(new Error('content_required'), { statusCode: 400 }); }
   if (kind === 'project-create') requireStringField(body, 'name');
   if (kind === 'task-create') { requireStringField(body, 'projectId'); requireStringField(body, 'title'); }
   if (kind === 'scheduled-job-create') for (const field of ['agentId', 'name', 'prompt', 'cron']) requireStringField(body, field);
   if (kind === 'group-create') { requireStringField(body, 'name'); if (!Array.isArray(body.participantAgentIds) || !body.participantAgentIds.length || body.participantAgentIds.some((id) => typeof id !== 'string' || !id.trim())) throw Object.assign(new Error('group_participants_required'), { statusCode: 400 }); }
-  if (kind === 'group-message') requireStringField(body, 'message');
+  if (kind === 'group-message') { const hasMessage = typeof body.message === 'string' && body.message.trim(); const hasAttachment = Array.isArray(body.attachments) && body.attachments.length > 0; if (!hasMessage && !hasAttachment) throw Object.assign(new Error('message_required'), { statusCode: 400 }); }
   return body;
 }
 
@@ -1936,7 +2000,7 @@ async function listSessions({ rootDir, rootDirs = null, agentId = null, includeA
   agentId ||= (await resolveAgentRuntime()).agentId;
   const rows = await postgresApplication.stores.conversations.listSessions({ agentId, includeArchived });
   const since = updatedSince && !Number.isNaN(Date.parse(updatedSince)) ? String(updatedSince) : null;
-  return rows.filter((item) => !query || JSON.stringify(item).toLowerCase().includes(String(query).toLowerCase())).filter((item) => !since || String(item.updatedAt || "") > since).slice(0, resolvedLimit ?? undefined).map((item) => ({ ...item, id: item.sessionId }));
+  return rows.filter((item) => !isInternalContextSession(item)).filter((item) => !query || JSON.stringify(item).toLowerCase().includes(String(query).toLowerCase())).filter((item) => !since || String(item.updatedAt || "") > since).slice(0, resolvedLimit ?? undefined).map((item) => ({ ...item, id: item.sessionId }));
 }
 
 function activityItemFromTraceCard(card = {}) {
@@ -3117,6 +3181,7 @@ const modDistribution = createModDistribution({
   runtimeRoot: modsRuntimeRoot,
   repositoryFactory: postgresApplication.modDistributionRepositoryFactory,
   onLifecycleChange: transitionMod,
+  resolveSecretReference: reference => resolveSecretReference(loadedMods, reference),
 });
 // Complete durable uninstall reconciliation before accepting requests. The
 // callback above is self-contained and does not call back into the distribution,
@@ -3137,6 +3202,7 @@ await coreModManagement.ready;
 const modAuthorityRoute = createModAuthorityRoute({ authority: modAuthority, getMods: () => loadedMods, readJsonBody, sendJson });
 const modManagementDistribution = {
   ...modDistribution,
+  listSecretReferences: scheme => listSecretReferences(loadedMods, { scheme }),
   async list() {
     const result = await modDistribution.list();
     const workspaceRoot = (await runtimeConfig()).runtimeState.workspaceRoot;
@@ -3325,7 +3391,7 @@ async function handleRequest(req, res) {
     return sendJson(res, 404, { ok: false, error: 'not_found' });
   } catch (error) {
     const status = Number(error?.statusCode) >= 400 && Number(error.statusCode) < 500 ? Number(error.statusCode) : 500;
-    void serverLogger.event('request_error', { method: req.method || null, path: req.url || null, status, error: String(error?.message || error), durationMs: Date.now() - startedAt });
+    void serverLogger.event('request_error', { method: req.method || null, path: req.url || null, status, error: String(error?.message || error), ...(error?.message === 'task_execution_pre_dispatch_recovery_failed' && error.taskExecutionDiagnostics ? { taskExecution: error.taskExecutionDiagnostics } : {}), durationMs: Date.now() - startedAt });
     return sendJson(res, status, { ok: false, error: String(error?.message || error), ...(error?.details ? { details: error.details } : {}), stack: process.env.NODE_ENV === 'development' ? error?.stack : undefined });
   }
 }

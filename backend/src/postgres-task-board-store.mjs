@@ -1,3 +1,4 @@
+import { taskArchiveState } from './task-archive-state.mjs';
 import { normalizePostgresPool } from './postgres-foundation.mjs';
 import { randomUUID } from "node:crypto";
 import { TASK_STATUSES, TASK_PRIORITIES } from "./task-board-store.mjs";
@@ -87,7 +88,7 @@ function pathRow(r) {
     }
   );
 }
-function taskRow(r) {
+function taskRow(r, at = new Date()) {
   if (!r) return null;
   const metadata = parseJson(r.metadata_json);
   return {
@@ -103,6 +104,7 @@ function taskRow(r) {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     terminalAt: metadata.terminalAt || null,
+    ...taskArchiveState({ status: r.status, terminalAt: metadata.terminalAt, updatedAt: r.updated_at, createdAt: r.created_at }, at),
   };
 }
 function taskInput(input = {}, partial = false) {
@@ -337,13 +339,13 @@ export class PostgresTaskBoardStore {
         assignedAgentId || null,
       ],
     );
-    return r.rows.map(taskRow);
+    return r.rows.map((row) => taskRow(row, this.clock()));
   }
   async getTask(taskId, client = this.pool) {
     const r = await client.query("SELECT * FROM task_board_tasks WHERE id=$1", [
       id(taskId, "task_id"),
     ]);
-    return taskRow(r.rows[0]);
+    return taskRow(r.rows[0], this.clock());
   }
   async createTask(input = {}, audit = {}) {
     const t = taskInput(input),
@@ -357,6 +359,7 @@ export class PostgresTaskBoardStore {
         audit.actor?.type === 'agent' ? audit.actor.id : null,
         stamp,
       );
+      if (["done", "cancelled"].includes(t.status)) metadata.terminalAt = stamp;
       await c.query(
         "INSERT INTO task_board_tasks(id,project_id,title,description,status,priority,assigned_agent_id,metadata_json,execution_json,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$10)",
         [
@@ -390,11 +393,14 @@ export class PostgresTaskBoardStore {
       const stamp = this.clock(),
         status = t.status ?? current.status,
         metadata = { ...(t.metadata ?? current.metadata) };
+      if (status === current.status && ["done", "cancelled"].includes(status) && current.terminalAt)
+        metadata.terminalAt = current.terminalAt;
       if (
         ["done", "cancelled"].includes(status) &&
-        !["done", "cancelled"].includes(current.status)
+        status !== current.status
       )
         metadata.terminalAt = stamp;
+      if (!["done", "cancelled"].includes(status)) delete metadata.terminalAt;
       const fields = [
         "projectId",
         "title",
@@ -449,12 +455,26 @@ export class PostgresTaskBoardStore {
     return withPostgresTransaction(this.pool, async (c) => {
       const current = await this.lockTask(c, taskId);
       if (!current) return null;
+      // The row lock is the claim authority, not the dispatcher's earlier read.
+      // A running receipt owns this task even while its turn is queued.
+      if (["done", "cancelled"].includes(current.status))
+        throw new Error("task_not_executable");
+      if (!current.assignedAgentId)
+        throw new Error("task_assigned_agent_required");
+      if (text(execution.agentId) !== current.assignedAgentId)
+        throw new Error("task_assigned_agent_changed");
+      if (["running", "queued"].includes(current.execution?.status))
+        throw new Error("task_execution_running");
+      const runId = text(execution.runId);
+      if (!runId) throw new Error("task_execution_run_id_required");
+      if (runId === current.execution?.runId)
+        throw new Error("task_execution_run_id_already_used");
       const stamp = this.clock(),
         receipt = {
           taskId: current.id,
-          agentId: text(execution.agentId) || current.assignedAgentId || null,
+          agentId: current.assignedAgentId,
           sessionId: text(execution.sessionId) || "default",
-          runId: text(execution.runId) || null,
+          runId,
           status: "running",
           dispatchedAt: stamp,
           traceDir: execution.traceDir || null,
@@ -476,13 +496,21 @@ export class PostgresTaskBoardStore {
     return withPostgresTransaction(this.pool, async (c) => {
       const current = await this.lockTask(c, taskId);
       if (!current) return null;
+      // Compare-and-set under the same task lock as startExecution. A late or
+      // repeated completion must not replace a newer attempt (or its result).
+      const owner = current.execution || {};
+      if (owner.status !== "running" || !text(execution.runId) ||
+          owner.runId !== text(execution.runId) ||
+          (execution.agentId != null && owner.agentId !== text(execution.agentId)) ||
+          (execution.sessionId != null && owner.sessionId !== text(execution.sessionId)))
+        return null;
       const stamp = this.clock(),
         receipt = {
-          ...(current.execution || {}),
+          ...owner,
           taskId: current.id,
-          agentId: text(execution.agentId) || current.assignedAgentId || null,
-          sessionId: text(execution.sessionId) || "default",
-          runId: text(execution.runId) || null,
+          agentId: owner.agentId,
+          sessionId: owner.sessionId,
+          runId: owner.runId,
           status: execution.status || (execution.ok ? "completed" : "failed"),
           executedAt: execution.executedAt || stamp,
           completedAt: stamp,
@@ -515,6 +543,6 @@ export class PostgresTaskBoardStore {
       "SELECT * FROM task_board_tasks WHERE id=$1 FOR UPDATE",
       [id(taskId, "task_id")],
     );
-    return taskRow(r.rows[0]);
+    return taskRow(r.rows[0], this.clock());
   }
 }
