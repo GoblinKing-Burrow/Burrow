@@ -1,5 +1,7 @@
+import { useUnsavedNavigation } from '../../app/UnsavedChanges';
 import { useEffect, useState } from 'react';
 import type { Agent } from '../../app/types';
+import { isAgentEnabled } from '../../app/agentCatalog';
 import { FirstRunSetup } from './FirstRunSetup';
 import { NewAgentDialog } from './NewAgentDialog';
 
@@ -9,6 +11,7 @@ export type AgentToolbarProps = { agents: Agent[]; selectedId: string; onSelect:
 /** Setup state is explicit; an empty registry is not a first-run signal. */
 export function AgentToolbar(props: AgentToolbarProps) {
   const { agents, selectedId, onSelect, firstRun = false } = props;
+  const navigate = useUnsavedNavigation();
   const [showNewAgent, setShowNewAgent] = useState(false);
   // Setup status becomes ready before the existing five-second finale ends.
   // Retain that owner until its completion callback, not merely while status is fresh.
@@ -16,9 +19,9 @@ export function AgentToolbar(props: AgentToolbarProps) {
   useEffect(() => { if (firstRun) setSetupOpen(true); }, [firstRun]);
   return <>
     <div className="agent-toolbar" aria-label="Agent configuration selector">
-      <button className="primary" type="button" onClick={() => setShowNewAgent(true)}>New Agent</button>
+      <button className="primary" type="button" onClick={() => navigate(() => setShowNewAgent(true))}>New Agent</button>
       <div className="agent-toolbar-selector" role="group" aria-label="Configured agents">
-        {agents.map(agent => <button className={agent.id === selectedId ? 'active' : ''} type="button" onClick={() => onSelect(agent.id)} key={agent.id} aria-pressed={agent.id === selectedId}>{agent.name}</button>)}
+        {agents.map(agent => <button className={[agent.id === selectedId ? 'active' : '', !isAgentEnabled(agent) ? 'agent-disabled' : ''].filter(Boolean).join(' ')} type="button" onClick={() => { if (agent.id !== selectedId) navigate(() => onSelect(agent.id)); }} key={agent.id} aria-pressed={agent.id === selectedId}>{agent.name}</button>)}
       </div>
     </div>
     {setupOpen ? <FirstRunSetup {...props} onFirstRunComplete={() => { setSetupOpen(false); props.onFirstRunComplete?.(); }} /> : showNewAgent ? <NewAgentDialog onClose={() => setShowNewAgent(false)} onSelect={onSelect} onAgentsChanged={props.onAgentsChanged} /> : null}

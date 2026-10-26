@@ -1,3 +1,5 @@
+import { POSTGRES_PROVIDER_POOL_METRICS_SQL } from './postgres-provider-pool-metrics.mjs';
+import { POSTGRES_FORGE_ARCHIVE_SQL } from './postgres-forge-archive.mjs';
 import { POSTGRES_COMPACTION_PROJECTIONS_SQL } from './postgres-compaction-projections.mjs';
 import { POSTGRES_MOD_GENERATION_SCHEMA_SQL } from './postgres-mod-generation-store.mjs';
 import { POSTGRES_MOD_EXTERNAL_TURN_SCHEMA_SQL } from './postgres-mod-external-turn-store.mjs';
@@ -171,4 +173,11 @@ ALTER TABLE mod_external_turns ALTER COLUMN display_message SET NOT NULL;
 ALTER TABLE scheduled_jobs ADD COLUMN context_mode TEXT NOT NULL DEFAULT 'continue' CHECK (context_mode IN ('continue','fresh'));
 ` },
   { version: 69, name: 'provider-pool-connections-and-routing-state', sql: POSTGRES_PROVIDER_POOL_SCHEMA_SQL },
+  { version: 70, name: 'dream-memory-promotion-toggle', sql: 'ALTER TABLE dream_settings ADD COLUMN IF NOT EXISTS promote_to_memory BOOLEAN NOT NULL DEFAULT TRUE;' },
+  { version: 71, name: 'retained-forge-execution-history', sql: POSTGRES_FORGE_ARCHIVE_SQL },
+  { version: 72, name: 'native-openai-pool-metrics', sql: POSTGRES_PROVIDER_POOL_METRICS_SQL },
+  { version: 73, name: 'dream-memory-expression-controls', sql: `
+ALTER TABLE dream_settings ADD COLUMN memory_emphasis INTEGER NOT NULL DEFAULT 50 CHECK (memory_emphasis BETWEEN 0 AND 100);
+ALTER TABLE dream_settings ADD COLUMN memory_prompt_override TEXT CHECK (char_length(memory_prompt_override) <= 20000);
+` },
 ]);

@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { createDreamMemoryPreviewService } from '../src/dream-memory-preview.mjs';
+import { readDreamPromotion, saveDreamPromotion } from '../src/dream-promotion-settings.mjs';
 import { isInternalContextSession } from '../src/model-context-boundary.mjs';
 import { createModGenerationDispatcher } from '../src/mod-generations.mjs';
 import { createModTextGenerator } from '../src/mod-capabilities.mjs';
@@ -43,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 import { inspectSessionContext, inspectSessionContextStatus } from '../src/context-engine.mjs';
 import { activeConversationLimits } from '../src/context-preparation.mjs';
 import { beginRuntimeSessionExecutionSupersession, chatTurnInputFromBody, createChatTurnRunId, finishRuntimeSessionExecutionSupersession, runChatTurnFromBody, runChatTurnFromWorkbenchContinuation, chatTurnResponse, chatTurnProgressResponse, chatTurnErrorResponse, loadRuntimeConfig } from '../src/chat-turn-controller.mjs';
-import { resolveModelConfig, resolveRuntimeTracePath } from '../src/config.mjs';
+import { resolveModelConfig, resolveRuntimeTracePath, resolveRuntimeTraceRoot } from '../src/config.mjs';
 import { API_TOKEN_SCOPES } from '../src/api-token-store.mjs';
 import { loadEffectiveSkillCatalog, skillManifest } from '../src/skill-catalog.mjs';
 import { collectTraceObservability } from '../src/trace-observability.mjs';
@@ -201,7 +203,7 @@ const postgresApplication = await createPostgresApplication({
   connections: async (filter) => postgresApplication.stores.models.list(filter),
   resolveConfig: (connectionId, modelId) => resolveModelConfig({ stores: postgresApplication.stores, modelConnectionId: connectionId, model: modelId }),
 });
-const { anthropicOauthUsage, openaiOauthUsage } = createProviderUsageService({ modelLookup: modelsStore, authSecretToken, fetchImpl: globalThis.fetch, clock: Date.now, openaiUsageUrl: OPENAI_OAUTH_USAGE_URL });
+const { anthropicOauthUsage, openaiOauthUsage, openaiResetCredits, consumeOpenaiResetCredit } = createProviderUsageService({ modelLookup: modelsStore, authSecretToken, fetchImpl: globalThis.fetch, clock: Date.now, openaiUsageUrl: OPENAI_OAUTH_USAGE_URL });
 configureMcpProviderStateStore(postgresApplication.stores.mcpProviderStates);
 await hydrateMcpProviderStates({ runtimeRoot: process.env.BURROW_MCPORTER_ROOT || path.join(runtimeRoot, 'integrations', 'mcporter') }).catch((error) => serverLogger.event('mcp_provider_state_hydration_failed', { error: String(error?.message || error) }));
 const runtimeMetrics = createRuntimeMetricsCollector({ runtimeRoot });
@@ -273,11 +275,11 @@ function retentionPolicyScheduler() {
         await runRetentionCleanup({ dataRoot: runtime.runtimeState.agentDataRoot, traceRoot: path.join(runtime.runtimeState.cacheRoot, 'traces'), retention: { traceMaxAgeDays: policy.operationalDays }, confirm: true });
       }
       for (const agent of await stores.agents.list({ includeDisabled: true })) {
-        const runtime = await resolveAgentRuntime(agent.id);
+        const runtime = await resolveAgentContext(agent.id);
         if (!runtime) continue;
         await runRetentionCleanup({ dataRoot: runtime.agentDataRoot, traceRoot: path.join(runtime.agentDataRoot, 'traces'), conversationStore: stores.conversations, taskStore: stores.tasks, agentId: agent.id, retention: { conversationDays: policy.conversationDays }, confirm: true });
       }
-      await cleanupAgentAttachments({ agentStore: stores.agents, retentionDays: policy.attachmentDays, resolveAgentWorkspaceRoot: async (id) => (await resolveAgentRuntime(id))?.agentWorkspaceRoot || null });
+      await cleanupAgentAttachments({ agentStore: stores.agents, retentionDays: policy.attachmentDays, resolveAgentWorkspaceRoot: async (id) => (await resolveAgentContext(id))?.agentWorkspaceRoot || null });
     },
     runCleanup: async (policy) => retentionCleanup({ policy, confirm: true, includeAttachments: true }),
   });
@@ -470,7 +472,8 @@ function refreshCodexClientVersionNow() {
   if (versionRefreshLifecycle.stopped) return;
   void versionRefreshLifecycle.track(async () => {
     versionRefreshLifecycle.signal.throwIfAborted();
-    await refreshCodexClientVersionCache({ store: modelsStore(), signal: AbortSignal.any([versionRefreshLifecycle.signal, AbortSignal.timeout(15_000)]) });
+    await refreshCodexClientVersionCache({ store: modelsStore(), signal: AbortSignal.any([versionRefreshLifecycle.signal, AbortSignal.timeout(15_000)]) }).catch(() => {});
+    await modelsStore().refreshOAuthCatalogs({ useModelsDev: true, signal: versionRefreshLifecycle.signal });
   }).catch(() => {});
 }
 function startCodexClientVersionRefresh() {
@@ -509,6 +512,7 @@ async function saveMcpConnection(body = {}) { try {
   const { existing, next } = await prepared;
   const previousApiKey = existing ? await store.apiKey(existing.id) : null;
   const nextApiKey = body.apiKey === undefined || !String(body.apiKey || '').trim() ? previousApiKey : String(body.apiKey).trim();
+  const previousHeaders = existing ? await store.secretHeaders(existing.id) : {};
   const previousEnvironmentVariables = existing ? await store.secretEnvironment(existing.id) : {};
   const nextEnvironmentVariables = Array.isArray(body.environmentVariables) ? Object.fromEntries(body.environmentVariables.map((entry) => [String(entry?.name || '').trim(), entry?.value === undefined || !String(entry.value).trim() ? previousEnvironmentVariables[String(entry?.name || '').trim()] : String(entry.value).trim()]).filter(([name, value]) => name && value)) : previousEnvironmentVariables;
   // Persist configuration and scoped secrets before touching a running daemon.
@@ -516,7 +520,7 @@ async function saveMcpConnection(body = {}) { try {
   // a failed save (and lose the operator's replacement secret).
   const connection = await store.save(body);
   try {
-    await reconcilePersistentMcpConnection(existing, next, { previousApiKey, nextApiKey, previousEnvironmentVariables, nextEnvironmentVariables });
+    await reconcilePersistentMcpConnection(existing, connection, { previousApiKey, nextApiKey, previousEnvironmentVariables, nextEnvironmentVariables, previousHeaders, nextHeaders: await store.secretHeaders(connection.id) });
   } catch (error) {
     console.warn(`MCP connection ${connection.id} was saved but its prior keep-alive daemon could not be stopped: ${String(error?.message || error)}`);
   }
@@ -527,15 +531,15 @@ async function removeMcpConnection(id) {
     const store = mcpStore();
     const connection = await store.get(id);
     if (!connection) return false;
-    await reconcilePersistentMcpConnection(connection, null, { previousApiKey: await store.apiKey(connection.id), previousEnvironmentVariables: await store.secretEnvironment(connection.id) });
+    await reconcilePersistentMcpConnection(connection, null, { previousApiKey: await store.apiKey(connection.id), previousHeaders: await store.secretHeaders(connection.id), previousEnvironmentVariables: await store.secretEnvironment(connection.id) });
     return await store.remove(id);
   } catch (error) { throw error; }
 }
-async function discoverMcpConnection(body = {}) { try { const connection = await mcpStore().get(body.connectionId); if (!connection) return { ok: false, status: 404, error: 'mcp_connection_not_found' }; const tools = await discoverMcpTools(connection, { apiKey: await mcpStore().apiKey(connection.id), environmentVariables: await mcpStore().secretEnvironment(connection.id) }); return { ok: true, connection: await mcpStore().refreshTools(connection.id, tools), tools }; } catch (error) { return { ok: false, status: 400, error: String(error?.message || error) }; } }
+async function discoverMcpConnection(body = {}) { try { const connection = await mcpStore().get(body.connectionId); if (!connection) return { ok: false, status: 404, error: 'mcp_connection_not_found' }; const tools = await discoverMcpTools(connection, { apiKey: await mcpStore().apiKey(connection.id), headers: await mcpStore().secretHeaders(connection.id), environmentVariables: await mcpStore().secretEnvironment(connection.id) }); return { ok: true, connection: await mcpStore().refreshTools(connection.id, tools), tools }; } catch (error) { return { ok: false, status: 400, error: String(error?.message || error) }; } }
 async function diagnoseMcpConnection(body = {}) {
   const connection = await mcpStore().get(body.connectionId);
   if (!connection) return { ok: false, status: 404, error: 'mcp_connection_not_found' };
-  const result = await diagnoseMcpConnectionRuntime(connection, { apiKey: await mcpStore().apiKey(connection.id), environmentVariables: await mcpStore().secretEnvironment(connection.id), toolName: typeof body.toolName === 'string' && body.toolName.trim() ? body.toolName.trim() : null, arguments: body.arguments && typeof body.arguments === 'object' && !Array.isArray(body.arguments) ? body.arguments : {} });
+  const result = await diagnoseMcpConnectionRuntime(connection, { apiKey: await mcpStore().apiKey(connection.id), headers: await mcpStore().secretHeaders(connection.id), environmentVariables: await mcpStore().secretEnvironment(connection.id), toolName: typeof body.toolName === 'string' && body.toolName.trim() ? body.toolName.trim() : null, arguments: body.arguments && typeof body.arguments === 'object' && !Array.isArray(body.arguments) ? body.arguments : {} });
   return { ...result, ...(result.ok ? {} : { status: 400 }) };
 }
 async function agentMcpTools(agentId) { try { await resolveAgentRuntime(agentId); return { ok: true, agentId, tools: await mcpStore().agentTools(agentId) }; } catch (error) { return { ok: false, status: error?.statusCode || 400, error: String(error?.message || error) }; } }
@@ -555,7 +559,7 @@ function mergeDiscoveredModels(discovered = [], existing = []) {
       ...(Array.isArray(priorModel.acceptedOutputOverride) ? { acceptedOutputOverride: priorModel.acceptedOutputOverride } : {}),
       ...(priorModel.contextWindowOverride !== undefined ? { contextWindowOverride: priorModel.contextWindowOverride } : {}),
     } : {};
-    merged.push({ ...model, ...operatorOverrides, selected: priorModel?.selected === true, manual: false });
+    merged.push({ ...model, ...operatorOverrides, selected: priorModel?.selected !== false, manual: false });
     prior.delete(model.id);
   }
   for (const model of prior.values()) merged.push({ ...model, selected: model.selected !== false, manual: Boolean(model.manual) });
@@ -963,7 +967,7 @@ async function discoverModelConnection(body = {}) {
       assertProviderPoolMembers(connection, members.filter(Boolean));
       const catalogs = await Promise.all(members.map(async member => {
         const models = await store.discoverModels({ id: member.id, useModelsDev: true, signal: AbortSignal.timeout(15_000) });
-        await store.persistDiscoveredModels(member.id, models);
+
         return { ...member, models };
       }));
       const discovered = providerPoolModels(catalogs);
@@ -973,7 +977,9 @@ async function discoverModelConnection(body = {}) {
     const apiKey = String(body.apiKey || '').trim() || (auth?.token ? String(auth.token).trim() : '') || (auth?.apiKey ? String(auth.apiKey).trim() : '') || (auth?.accessToken ? String(auth.accessToken).trim() : '') || (existing ? await store.apiKey(existing.id) : null);
     const hasCredential = Boolean(apiKey || auth?.token || auth?.apiKey || auth?.accessToken);
     if (!hasCredential) return { ok: false, status: 400, error: 'api_key_required' };
-    const discovered = await discoverModels({ baseUrl, provider: body.provider || existing?.provider || auth?.provider, useModelsDev: true, apiType, apiKey, auth, store, signal: AbortSignal.timeout(15_000) });
+    const discovered = existing && auth.type === 'oauth' && !body.auth && !body.apiKey && baseUrl === existing.baseUrl && apiType === existing.apiType
+      ? await store.discoverModels({ id: existing.id, useModelsDev: true, signal: AbortSignal.timeout(15_000) })
+      : await discoverModels({ baseUrl, provider: body.provider || existing?.provider || auth?.provider, useModelsDev: true, apiType, apiKey, auth, store, signal: AbortSignal.timeout(15_000) });
     return { ok: true, models: mergeDiscoveredModels(discovered, priorModels), discovery: { status: discovered.length ? 'discovered' : 'manual_only', count: discovered.length } };
   } catch (error) {
     return { ok: true, models: mergeDiscoveredModels([], priorModels), discovery: { status: 'manual_only', count: 0, error: String(error?.message || error) } };
@@ -1029,7 +1035,7 @@ async function runtimeConfig(agentId = 'hatchet') {
   return loadRuntimeConfig({ rootDir: projectRoot, args: { agent_id: String(agentId || 'hatchet') }, stores: postgresApplication.stores, tolerateModelResolutionError: true });
 }
 
-// Settings management needs identity/context, not permission to execute a turn.
+// Settings and retention maintenance need identity/context, not permission to execute a turn.
 async function resolveAgentContext(agentId = null) {
   const runtime = await runtimeConfig();
   const id = String(agentId || runtime.runtimeState.agentId || 'hatchet').trim();
@@ -1146,6 +1152,18 @@ async function agentDreamDiary(agentId, body = null, query = {}) {
   } finally { await store.close(); }
 }
 
+let memoryPreviewService;
+async function agentDreamMemoryPreview(agentId, body = {}) {
+  try {
+    memoryPreviewService ||= createDreamMemoryPreviewService({ stores: postgresApplication.stores,
+      traceRoot: agentId => resolveRuntimeTraceRoot(projectRoot, { agent_id: agentId }) });
+    return await memoryPreviewService(agentId, body);
+  } catch (error) {
+    const message = String(error?.message || error);
+    return { ok: false, status: message === 'agent_not_found' ? 404 : 400, error: message };
+  }
+}
+
 async function agentDreamMemoryConsolidate(agentId, body = {}) {
   try {
     return await consolidateDreamMemoryAsync({ agentId, workingMemoryStore: postgresApplication.stores.workingMemory, profileStore: postgresApplication.stores.profiles, limit: body.limit, generatedAt: body.generatedAt });
@@ -1166,142 +1184,11 @@ async function agentDreamCycle(agentId, body = null, query = {}) {
   }
 }
 
-function codexLbOriginFromModelConfig(modelConfig = {}) {
-  if (!modelConfig?.baseUrl) return null;
-  try {
-    return new URL(modelConfig.baseUrl).origin;
-  } catch {
-    return null;
-  }
-}
-
 function authSecretToken(auth = {}) {
   if (auth.type === 'oauth') return auth.accessToken || auth.token || '';
   if (auth.type === 'token' || auth.type === 'bearer_token') return auth.token || '';
   if (auth.type === 'api_key') return auth.apiKey || auth.token || '';
   return '';
-}
-
-function codexLbConnectionCandidate(connection = {}) {
-  const provider = String(connection.provider || '').toLowerCase();
-  const baseUrl = String(connection.baseUrl || '').toLowerCase();
-  return provider.includes('codex-lb') || provider.includes('codex lb') || baseUrl.includes('codex-lb') || baseUrl.includes(':2455/');
-}
-
-async function resolveCodexLbAccountSource() {
-  const store = modelsStore();
-  const connection = (await store.list()).find(codexLbConnectionCandidate);
-  if (connection) {
-    const origin = codexLbOriginFromModelConfig(connection);
-    const token = authSecretToken(await store.resolveAuth(connection.id));
-    if (origin && token) return { origin, token, source: 'model-connection', connectionId: connection.id };
-  }
-  // Legacy fallback only: older deployments used the active runtime model config.
-  // The Codex-LB account panel must not disappear just because chat is currently
-  // routed through a different model adapter.
-  const runtime = await runtimeConfig();
-  const model = runtime.modelConfig || {};
-  if (codexLbConnectionCandidate({ provider: model.provider || model.providerName, baseUrl: model.baseUrl })) {
-    const origin = codexLbOriginFromModelConfig(model);
-    if (origin && model.apiKey) return { origin, token: model.apiKey, source: 'active-model-config', connectionId: model.connectionId || null };
-  }
-  return null;
-}
-
-function finitePercent(value) {
-  if (value === null || value === undefined || value === '') return null;
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  return Math.max(0, Math.min(100, Math.round(n)));
-}
-
-function accountPlanLabel(planType = '') {
-  const normalized = String(planType || '').trim().toLowerCase();
-  if (normalized === 'prolite') return 'Prolite';
-  if (normalized === 'team') return 'Team';
-  if (normalized === 'plus') return 'Plus';
-  if (normalized === 'pro') return 'Pro';
-  return normalized ? normalized.replace(/\b\w/g, (letter) => letter.toUpperCase()) : 'Unknown';
-}
-
-function statusLabel(status = '') {
-  const normalized = String(status || '').trim().toLowerCase().replace(/[_-]+/g, ' ');
-  if (!normalized) return 'Unknown';
-  return normalized.replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-function finiteQuotaNumber(value) {
-  if (value === null || value === undefined || value === '') return null;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-function quotaWindow(account = {}, usage = {}, kind = 'secondary') {
-  const suffix = kind === 'monthly' ? 'Monthly' : kind === 'primary' ? 'Primary' : 'Secondary';
-  const windowMinutes = finiteQuotaNumber(account[`windowMinutes${suffix}`]);
-  return {
-    kind,
-    label: kind === 'monthly' || (windowMinutes !== null && windowMinutes >= 40000) ? 'Monthly' : windowMinutes === 10080 ? 'Weekly' : windowMinutes === 300 ? '5-hour' : suffix,
-    percent: finitePercent(usage[`${kind}RemainingPercent`]),
-    resetAt: account[`resetAt${suffix}`] || null,
-    windowMinutes,
-    capacityCredits: finiteQuotaNumber(account[`capacityCredits${suffix}`]),
-    remainingCredits: finiteQuotaNumber(account[`remainingCredits${suffix}`]),
-  };
-}
-
-function usableQuotaWindow(window = {}) {
-  return window.percent !== null || window.resetAt || window.windowMinutes !== null || window.remainingCredits !== null;
-}
-
-function selectedAccountWindow(account = {}) {
-  const usage = account.usage || {};
-  const windows = ['monthly', 'primary', 'secondary'].map((kind) => quotaWindow(account, usage, kind));
-  return windows.find(usableQuotaWindow) || windows[2];
-}
-
-function sanitizeCodexLbAccount(account = {}, index = 0) {
-  const selectedWindow = selectedAccountWindow(account);
-  const quotaWindows = {
-    primary: quotaWindow(account, account.usage || {}, 'primary'),
-    secondary: quotaWindow(account, account.usage || {}, 'secondary'),
-  };
-  return {
-    id: `account-${index + 1}`,
-    name: account.alias || account.displayName || `Account ${index + 1}`,
-    type: accountPlanLabel(account.planType || account.accountType || account.type),
-    status: statusLabel(account.status),
-    usagePercent: selectedWindow.percent,
-    resetAt: selectedWindow.resetAt,
-    window: selectedWindow,
-    quotaWindows,
-    availableResetCredits: Number.isFinite(Number(account.availableResetCredits)) ? Number(account.availableResetCredits) : null,
-    resetCreditNearestExpiresAt: account.resetCreditNearestExpiresAt || null,
-  };
-}
-
-async function codexLbAccounts() {
-  const source = await resolveCodexLbAccountSource();
-  if (!source?.origin || !source?.token) return { ok: false, status: 503, error: 'codex_lb_model_config_missing', accounts: [] };
-  try {
-    const response = await fetch(`${source.origin}/api/accounts`, {
-      headers: { accept: 'application/json', authorization: `Bearer ${source.token}` },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!response.ok) return { ok: false, status: response.status, error: `codex_lb_accounts_failed:${response.status}`, accounts: [] };
-    const data = await response.json();
-    const rawAccounts = Array.isArray(data) ? data : data?.accounts;
-    if (!Array.isArray(rawAccounts)) return { ok: false, status: 502, error: 'codex_lb_accounts_invalid_response', accounts: [] };
-    return {
-      ok: true,
-      source: 'codex-lb',
-      connectionSource: source.source,
-      connectionId: source.connectionId || null,
-      accounts: rawAccounts.map(sanitizeCodexLbAccount),
-    };
-  } catch (error) {
-    return { ok: false, status: 502, error: 'codex_lb_accounts_unavailable', detail: String(error?.message || error), accounts: [] };
-  }
 }
 
 async function runtimeDataRoot() {
@@ -1412,7 +1299,7 @@ function bearerToken(req) {
 function apiTokenScopeForRequest(req, url) {
   if (req.method !== 'GET') return null;
   const pathname = url.pathname;
-  if (pathname === '/api/health' || pathname === '/api/status' || pathname === '/api/metrics' || pathname === '/api/diagnostics/inventory' || pathname === '/api/diagnostics/postgres' || pathname === '/api/diagnostics/brains' || pathname === '/api/diagnostics/brains/memories' || pathname === '/api/diagnostics/brains/embedding-jobs' || pathname === '/api/diagnostics/forge/jobs' || /^\/api\/diagnostics\/forge\/jobs\/[0-9a-f-]{36}$/i.test(pathname) || pathname === '/api/diagnostics/mods' || /^\/api\/diagnostics\/mods\/[a-z0-9-]+\/pending$/.test(pathname) || /^\/api\/diagnostics\/mods\/[a-z0-9-]+\/jobs(?:\/[A-Za-z0-9_-]+)?$/.test(pathname) || pathname === '/api/agents' || pathname === '/api/agent-status' || pathname === '/api/sessions' || /^\/api\/sessions\/[^/]+$/.test(pathname) || pathname === '/api/session/context' || pathname === '/api/session/context-status' || pathname === '/api/context' || pathname === '/api/chat/runs/active' || pathname === '/api/traces' || pathname.startsWith('/api/traces/') || pathname === '/api/archive/calendar' || pathname === '/api/archive/runs' || pathname.startsWith('/api/archive/runs/') || pathname === '/api/archive/sessions' || pathname.startsWith('/api/archive/sessions/')) return 'diagnostics:read';
+  if (pathname === '/api/health' || pathname === '/api/status' || pathname === '/api/metrics' || pathname === '/api/metrics/provider-pools' || pathname === '/api/diagnostics/inventory' || pathname === '/api/diagnostics/postgres' || pathname === '/api/diagnostics/brains' || pathname === '/api/diagnostics/brains/memories' || pathname === '/api/diagnostics/brains/embedding-jobs' || pathname === '/api/diagnostics/forge/jobs' || /^\/api\/diagnostics\/forge\/jobs\/[0-9a-f-]{36}$/i.test(pathname) || pathname === '/api/diagnostics/mods' || /^\/api\/diagnostics\/mods\/[a-z0-9-]+\/pending$/.test(pathname) || /^\/api\/diagnostics\/mods\/[a-z0-9-]+\/jobs(?:\/[A-Za-z0-9_-]+)?$/.test(pathname) || pathname === '/api/agents' || pathname === '/api/agent-status' || pathname === '/api/sessions' || /^\/api\/sessions\/[^/]+$/.test(pathname) || pathname === '/api/session/context' || pathname === '/api/session/context-status' || pathname === '/api/context' || pathname === '/api/chat/runs/active' || pathname === '/api/traces' || pathname.startsWith('/api/traces/') || pathname === '/api/archive/calendar' || pathname === '/api/archive/runs' || pathname.startsWith('/api/archive/runs/') || pathname === '/api/archive/sessions' || pathname.startsWith('/api/archive/sessions/')) return 'diagnostics:read';
   return null;
 }
 
@@ -1624,6 +1511,10 @@ async function applyImport(decoded, { conflictPolicy = 'error' } = {}) {
       await write('settings:retention-policy', () => postgresApplication.stores.retentionSettings.savePolicy(categories.settings.retentionPolicy));
       imported.push('settings:retention-policy');
     }
+    if (categories.settings.brainMemory !== undefined) {
+      await write('settings:brain-memory', () => saveDreamPromotion(metadataStore(), categories.settings.brainMemory));
+      imported.push('settings:brain-memory');
+    }
     if (categories.settings.workingMemoryRetention !== undefined) {
       await write('settings:working-memory-retention', () => postgresApplication.stores.workingMemoryRetention.save(categories.settings.workingMemoryRetention));
       imported.push('settings:working-memory-retention');
@@ -1795,6 +1686,7 @@ async function exportSnapshot(categories = []) {
       timezone: await operatorTimezone(postgresApplication.stores.metadata),
       retentionPolicy: await postgresApplication.stores.retentionSettings.readPolicy(),
       workingMemoryRetention: await postgresApplication.stores.workingMemoryRetention.read(),
+      brainMemory: await readDreamPromotion(metadataStore()),
       brainEmbeddings: await postgresApplication.stores.brainEmbeddings.settings().then(s => ({ enabled: s.enabled, connectionId: s.connection_id, model: s.model })),
       browserOrigin: (await browserOriginSettings({ metadata: metadataStore() })).settings,
       executionBoundaries: await readExecutionBoundaries({ metadataStore: postgresApplication.stores.metadata, }),
@@ -1823,7 +1715,7 @@ async function exportSnapshot(categories = []) {
     const store = mcpStore();
     data['mcp-connections'] = {
       schema: 'burrow.mcp-connections/v3',
-      connections: await Promise.all((await store.list()).filter(connection => connection.transport !== 'mod' && !connection.id.startsWith('mod.')).map(async (connection) => ({ ...connection, apiKey: await store.apiKey(connection.id), environmentVariables: (connection.environmentVariables || []).map(({ name }) => ({ name, configured: true })) }))),
+      connections: await Promise.all((await store.list()).filter(connection => connection.transport !== 'mod' && !connection.id.startsWith('mod.')).map(async (connection) => ({ ...connection, apiKey: await store.apiKey(connection.id), headers: await store.secretHeaders(connection.id), environmentVariables: (connection.environmentVariables || []).map(({ name }) => ({ name, configured: true })) }))),
     };
   }
   if (categories.includes('ui-auth')) {
@@ -1877,6 +1769,10 @@ function publicChatProgress(record = {}) {
       data: {
         tool: payload.tool || null,
         rawTool: payload.tool || null,
+        provider: payload.provider || null,
+        mcpToolName: payload.mcpToolName || null,
+        skillId: payload.skillId || null,
+        skillName: payload.skillName || null,
         activityId: payload.activityId || null,
         ok: payload.ok ?? null,
         status: payload.status || null,
@@ -2372,7 +2268,7 @@ async function retentionCleanup(body = {}) {
   if (body.confirm === true && !policy.enabled && body.requireEnabled !== false) return { ok: false, status: 409, error: 'retention_policy_disabled', policy };
   try {
     const result = await runRetentionCleanup({ taskStore: postgresApplication.stores.tasks, conversationStore: postgresApplication.stores.conversations, agentId: runtime.runtimeState.agentId, dataRoot: runtime.runtimeState.agentDataRoot, traceRoot: path.join(runtime.runtimeState.cacheRoot, 'traces'), retention: policy, confirm: body.confirm === true });
-    const attachments = body.confirm === true && body.includeAttachments === true ? await cleanupAgentAttachments({ agentStore: postgresApplication.stores.agents, retentionDays: (await postgresApplication.stores.albdruck.readRetention()).attachmentDays, resolveAgentWorkspaceRoot: async (agentId) => (await resolveAgentRuntime(agentId))?.agentWorkspaceRoot || null }) : null;
+    const attachments = body.confirm === true && body.includeAttachments === true ? await cleanupAgentAttachments({ agentStore: postgresApplication.stores.agents, retentionDays: (await postgresApplication.stores.albdruck.readRetention()).attachmentDays, resolveAgentWorkspaceRoot: async (agentId) => (await resolveAgentContext(agentId))?.agentWorkspaceRoot || null }) : null;
     const state = body.confirm === true ? await writeRetentionPolicyState(retentionPolicySuccessState({ policy, result, previous: await readRetentionPolicyState({ store: postgresApplication.stores.retentionSettings }) }), { store: postgresApplication.stores.retentionSettings }) : await readRetentionPolicyState({ store: postgresApplication.stores.retentionSettings });
     return { ok: true, policy, state, ...result, attachments };
   } catch (error) {
@@ -2978,7 +2874,8 @@ async function currentActiveChatRunSummaries({ agentId = null, sessionId = null 
     catch (error) { if (error.statusCode !== 404) throw error; run.steering = []; }
   }
   const childRecords = [];
-  const runtimes = agentId ? [await resolveAgentRuntime(agentId)] : await Promise.all((await agentsStore().list()).map((agent) => resolveAgentRuntime(agent.id)));
+  // Observability reads stored identity/data, not permission to execute a turn.
+  const runtimes = agentId ? [await resolveAgentContext(agentId)] : await Promise.all((await agentsStore().list({ includeDisabled: true })).map((agent) => resolveAgentContext(agent.id)));
   for (const agentRuntime of runtimes) {
     const records = await listSubagentRecords({ dataRoot: agentRuntime.agentDataRoot, includeFinal: false, limit: 100 });
     for (const record of records) {
@@ -3004,7 +2901,7 @@ const workbenchRoute = createWorkbenchRoutes({ readJsonBody, sendJson, selectedA
 const forgeStoreFactory = () => postgresApplication.stores.forge;
 configureForgeStoreFactory(forgeStoreFactory);
 const forgeRoute = createForgeRoutes({ store: forgeStoreFactory, readJsonBody, sendJson, sendStaticFile });
-const dreamRoute = createDreamRoutes({ readJsonBody, sendJson, agentDreamSettings, agentDreamDiary, agentDreamMemoryConsolidate, agentDreamCycle });
+const dreamRoute = createDreamRoutes({ readJsonBody, sendJson, agentDreamSettings, agentDreamDiary, agentDreamMemoryConsolidate, agentDreamMemoryPreview, agentDreamCycle });
 const skillGitSync = new SkillGitSync({ pool: postgresApplication.pool, skills: postgresApplication.stores.skills, sources: postgresApplication.stores.skillSources, packageRoot: path.join(runtimeRoot,'skill-packages'), onError: error => { void serverLogger.event('skill_sync_error',{error: error.statusCode ? error.message : 'skill_sync_failed'}); } });
 const skillSourceRoute = createSkillSourceRoutes({ sources: postgresApplication.stores.skillSources, skills: postgresApplication.stores.skills, sync: skillGitSync, pool: postgresApplication.pool, readJsonBody, sendJson });
 const skillStoreCall = async (operation) => operation(postgresApplication.stores.skills);
@@ -3025,9 +2922,9 @@ const { archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, arc
   isChatMessage, compactChatTurn, summarizeSessionTurns, boundedInteger,
 });
 const sessionRoute = createSessionRoutes({ rootDir: projectRoot, readJsonBody, sendJson, resolveAgentRuntime, runtimeAgentWorkspaceRoot, runtimeDataRoot, runtimeSessionRoot, runtimeConfig, activeConversationLimits, inspectSessionContext, inspectSessionContextStatus, activeChatRuns, searchSessionEvidence, searchBurrowSessionEvidence, agentsStore, agentRuntimeContext, archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveContinuityCards, archiveContinuityCardDetail, listSessions, sessionDetail, sessionWriteHandoff, sessionContinuityScope, setSessionContinuityScope, clearSessionContinuityScope, sessionReadHandoff, sessionWriteHandoffCandidate, archiveSummaryForReset, archiveSummaryForSession, supersedeSessionRuns, beginSessionAdmissionsReset, finishSessionAdmissionsReset, latestAuthorityExplanationForSession, listAuthorityExplanationsForSession, conversationStore: postgresApplication.stores.conversations });
-const brainRoute = createBrainRoutes({ store: postgresApplication.stores.brains, embeddings: postgresApplication.stores.brainEmbeddings, readJsonBody, sendJson });
+const brainRoute = createBrainRoutes({ store: postgresApplication.stores.brains, metadata: metadataStore(), embeddings: postgresApplication.stores.brainEmbeddings, readJsonBody, sendJson });
 const generalSettingsRoute = createGeneralSettingsRoutes({ readJsonBody, sendJson, chatIdentities, saveChatIdentity, curatorSettings, saveCuratorSettings, tiddleSettings: async (agentId) => tiddleStatus({ agentId, stores: postgresApplication.stores, }), tiddleCards: async (query) => listTiddleCards({ ...query, stores: postgresApplication.stores, }), tiddleHistory: async (query) => tiddleHistory({ ...query, stores: postgresApplication.stores, }), uiAuthSettings, saveUiAuthSettings, browserOriginSettings: () => browserOriginSettings({ metadata: metadataStore() }), saveBrowserOriginSettings: body => saveBrowserOriginSettings(body, { metadata: metadataStore() }), browserTabSettings: () => browserTabSettings({ metadata: metadataStore() }), saveBrowserTabSettings: body => saveBrowserTabSettings(body, { metadata: metadataStore() }), otelSettings: () => otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }), saveOtelSettings: async body => { let result = await saveOtelSettings(body, { store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); if (result.ok) { try { await otelRuntime.apply(await readOtelRuntimeConfig({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore() })); await applyOtelConfigurationToNodeGoblins(); } catch (error) { serverLogger.event('otel_configuration_apply_failed', { error: String(error?.message || 'configuration_failed') }); return { ok: false, status: 500, error: 'opentelemetry_configuration_apply_failed' }; } result = await otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); } return result; }, executionBoundarySettings, saveExecutionBoundarySettings, retentionPolicySettings, saveRetentionPolicySettings, retentionCleanup });
-const observabilityRoute = createObservabilityRoutes({ readJsonBody, sendJson, validateBoundaryBody, runtimeStatus, runtimeMetrics, codexLbAccounts, anthropicOauthUsage, openaiOauthUsage, currentActiveChatRunSummaries, selectedAgentRuntime, resolveAgentRuntime, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, listTraces, runtimeConfig, traceRootForRun, conversationStore: postgresApplication.stores.conversations, summarizeTrace, authorityExplanationFromTraceSummary, projectRoot });
+const observabilityRoute = createObservabilityRoutes({ providerPoolMetrics: () => postgresApplication.stores.models.providerPoolMetrics.summary(), readJsonBody, sendJson, validateBoundaryBody, runtimeStatus, runtimeMetrics, anthropicOauthUsage, openaiOauthUsage, openaiResetCredits, consumeOpenaiResetCredit, currentActiveChatRunSummaries, selectedAgentRuntime, resolveAgentRuntime, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, listTraces, runtimeConfig, traceRootForRun, conversationStore: postgresApplication.stores.conversations, summarizeTrace, authorityExplanationFromTraceSummary, projectRoot });
 const scheduledChannelRoute = createScheduledChannelRoutes({ readJsonBody, sendJson, validateBoundaryBody, withScheduledJobs, scheduler, listGroupChannels, createGroupChannel, readGroupChannelTurns, groupChannelRuns, startGroupChannelMessage, cancelGroupChannelRun, runtimeDataRoot, conversationStore: postgresApplication.stores.conversations });
 const authRoute = createAuthRoutes({ runtimeConfig, oidcLoginUrl, setOidcStateCookie, completeOidcCallback, sendOidcSessionCookie, clearOidcCookies, oidcCookieClearHeader, oidcSessionFromRequest, sendJson });
 const chatRoute = createChatRoutes({ handleChat, readJsonBody, sendJson, selectedAgentRuntime, cancelChatRun, steerChatRun, listChatSteering });

@@ -1265,7 +1265,7 @@ export class PostgresSessionStore {
   }
 
   async patchArchiveMetadata({ agentId, sessionId, archiveId, metadata = {} } = {}) {
-    const result = await this.pool.query(`UPDATE conversation_archives SET metadata=metadata || $4::jsonb WHERE agent_id=$1 AND session_id=$2 AND archive_id=$3 RETURNING metadata`, [required(agentId,'agentId'),required(sessionId,'sessionId'),required(archiveId,'archiveId'),JSON.stringify(metadata)]);
+    const result = await this.pool.query(`UPDATE conversation_archives SET metadata=CASE WHEN $4::jsonb ? 'resetGeneration' AND metadata->'resetGeneration' IS DISTINCT FROM $4::jsonb->'resetGeneration' THEN (metadata || $4::jsonb) - 'archiveTranscriptTurnCount' ELSE metadata || $4::jsonb END WHERE agent_id=$1 AND session_id=$2 AND archive_id=$3 RETURNING metadata`, [required(agentId,'agentId'),required(sessionId,'sessionId'),required(archiveId,'archiveId'),JSON.stringify(metadata)]);
     return result.rows[0]?.metadata || null;
   }
 
@@ -1339,13 +1339,65 @@ export class PostgresSessionStore {
     });
   }
 
-  async reset({ agentId: rawAgentId, sessionId: rawSessionId, metadata = {} } = {}) {
+  // The named history row is the cross-process family lock. Reservations are
+  // durable even before a continuity head exists; an unfinished exchange is not
+  // inferred closed merely because its most recent reply returned.
+  async prepareA2AHistory({ agentId, sessionId, executionSessionId, sourceAgentId, sourceSessionId, sourceRunId }) {
+    if (sessionId === 'default') throw new Error('context_boundary_named_session_required');
+    await this.updateMetadata({ agentId, sessionId: executionSessionId, update: metadata => ({
+      ...metadata, contextIsolation: { ...metadata.contextIsolation, historySessionId: sessionId },
+      a2aExchange: metadata.a2aExchange || { state: 'open', sourceAgentId, sourceSessionId, sourceRunId },
+    }) });
+    return this.reset({ agentId, sessionId, freshExecutionSessionId: executionSessionId, a2aReservation: true });
+  }
+
+  async reset({ agentId: rawAgentId, sessionId: rawSessionId, metadata = {}, freshExecutionSessionId = null, a2aReservation = false } = {}) {
     const agentId = required(rawAgentId, 'agentId'); const sid = required(rawSessionId, 'sessionId'); const now = this.clock();
     return withPostgresTransaction(this.pool, async (client) => {
       await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [migrationLockKey(`burrow-session-boundary:${JSON.stringify([agentId,sid])}`)]);
       await client.query(`INSERT INTO conversation_sessions(agent_id,session_id,metadata,created_at,updated_at) VALUES($1,$2,'{}'::jsonb,$3,$3) ON CONFLICT DO NOTHING`, [agentId, sid, now]);
       const session = await client.query('SELECT metadata FROM conversation_sessions WHERE agent_id=$1 AND session_id=$2 FOR UPDATE', [agentId, sid]);
       const prior = session.rows[0]?.metadata || {};
+      if (freshExecutionSessionId) {
+        if (sid === 'default') throw new Error('context_boundary_named_session_required');
+        const execution = await client.query('SELECT metadata FROM conversation_sessions WHERE agent_id=$1 AND session_id=$2 FOR UPDATE', [agentId, freshExecutionSessionId]);
+        const executionMetadata = execution.rows[0]?.metadata;
+        if (executionMetadata?.contextIsolation?.historySessionId !== sid) throw new Error('context_history_reset_execution_required');
+        // Durable per-execution receipt: retrying any older run must not erase
+        // its own projected turns (or a newer run's visible history).
+        if (executionMetadata.contextIsolation.historyReset) return { ok: true, replay: true };
+        if (a2aReservation) {
+          const open = await client.query(`SELECT s.session_id FROM conversation_sessions s
+            WHERE s.agent_id=$1 AND s.session_id<>$3 AND s.metadata->'contextIsolation'->>'historySessionId'=$2
+            AND s.metadata->'a2aExchange'->>'state'='open'
+            AND NOT EXISTS (SELECT 1 FROM continuity_log parent
+              WHERE parent.agent_id=s.metadata->'a2aExchange'->>'sourceAgentId'
+              AND parent.session_id=s.metadata->'a2aExchange'->>'sourceSessionId'
+              AND parent.head->>'runId'=s.metadata->'a2aExchange'->>'sourceRunId'
+              AND parent.head->>'state'='completed') LIMIT 1`, [agentId, sid, freshExecutionSessionId]);
+          await client.query(`UPDATE conversation_sessions SET metadata=metadata ||
+            jsonb_build_object('a2aExchange',metadata->'a2aExchange' || jsonb_build_object('state','open')) WHERE agent_id=$1 AND session_id=$2`, [agentId, freshExecutionSessionId]);
+          if (open.rows.length) {
+            await client.query(`UPDATE conversation_sessions SET metadata=jsonb_set(metadata,'{contextIsolation,historyReset}','true'::jsonb)
+              WHERE agent_id=$1 AND session_id=$2`, [agentId, freshExecutionSessionId]);
+            return { ok: true, deferred: true };
+          }
+        }
+        const busy = await client.query(`SELECT s.session_id FROM conversation_sessions s
+          LEFT JOIN continuity_state c USING(agent_id,session_id)
+          WHERE s.agent_id=$1 AND (s.session_id=$2 OR s.metadata->'contextIsolation'->>'historySessionId'=$2)
+          AND (c.head_state IN ('running','finalizing','interrupted') OR c.queue_status IN ('pending','running')
+            OR c.manifest->>'status'='interrupted'
+            OR (s.metadata->'contextIsolation'->>'historyReset'='true' AND c.head_state IS NULL)) LIMIT 1`, [agentId, sid]);
+        if (busy.rows.length) {
+          if (!a2aReservation) throw new Error('context_history_reset_busy');
+          await client.query(`UPDATE conversation_sessions SET metadata=jsonb_set(metadata,'{contextIsolation,historyReset}','true'::jsonb)
+            WHERE agent_id=$1 AND session_id=$2`, [agentId, freshExecutionSessionId]);
+          return { ok: true, deferred: true };
+        }
+        await client.query(`UPDATE conversation_sessions SET metadata=jsonb_set(metadata,'{contextIsolation,historyReset}','true'::jsonb),updated_at=$3
+          WHERE agent_id=$1 AND session_id=$2`, [agentId, freshExecutionSessionId, now]);
+      }
       // Keep the head generation monotonic, but revoke all old ownership and recovery.
       await client.query(`UPDATE continuity_state SET head=(head::jsonb || jsonb_build_object('state','reset','ownerId',NULL))::json,
         head_state='reset',owner_id=NULL,manifest=NULL,queue=NULL,queue_status=NULL,auto_resume=false,queued_at=NULL,updated_at=$3
@@ -1355,7 +1407,25 @@ export class PostgresSessionStore {
       const rows = await client.query('SELECT entry FROM conversation_entries WHERE agent_id=$1 AND session_id=$2 ORDER BY sequence', [agentId, sid]);
       const archiveId = rows.rows.length ? randomUUID() : null;
       const generation = Number(prior.generation || 0) + 1;
-      if (archiveId) await client.query('INSERT INTO conversation_archives(agent_id,session_id,archive_id,generation,kind,metadata,created_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)', [agentId, sid, archiveId, generation - 1, 'reset', JSON.stringify({ ...prior, ...metadata }), now]);
+      // Materialize the reconstructed count once at reset, not on every Archive
+      // listing page. This uses the same occurrence identity/window as the legacy
+      // listing fallback, including id-less duplicates and compacted overlaps.
+      const archiveTranscriptTurnCount = archiveId ? Number((await client.query(`
+        SELECT count(DISTINCT identity) AS count FROM (
+          SELECT COALESCE(CASE WHEN e.has_payload_id THEN 'payload:' || NULLIF(burrow_history_key(e.entry_key),'') END,
+            'occurrence:' || e.entry_id, 'row:' || e.source_id || ':' || e.ordinal::text) AS identity
+          FROM conversation_archive_entries e JOIN conversation_archives a
+            ON a.agent_id=e.agent_id AND a.session_id=e.session_id AND a.archive_id=e.source_id
+          WHERE a.agent_id=$1 AND a.session_id=$2 AND a.kind='compacted'
+            AND a.generation<=$3::bigint AND a.generation>=COALESCE($4::bigint,
+              (SELECT max(r.generation)+1 FROM conversation_archives r
+                WHERE r.agent_id=$1 AND r.session_id=$2 AND r.kind='reset' AND r.generation<$3::bigint),0)
+          UNION ALL
+          SELECT COALESCE(CASE WHEN e.has_payload_id THEN 'payload:' || NULLIF(burrow_history_key(e.entry_key),'') END,
+            'occurrence:' || e.entry_id, 'row:live:' || e.sequence::text)
+          FROM conversation_entries e WHERE e.agent_id=$1 AND e.session_id=$2
+        ) occurrences`, [agentId, sid, generation - 1, prior.resetGeneration ?? null])).rows[0].count) : null;
+      if (archiveId) await client.query('INSERT INTO conversation_archives(agent_id,session_id,archive_id,generation,kind,metadata,created_at) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)', [agentId, sid, archiveId, generation - 1, 'reset', JSON.stringify({ ...prior, ...metadata, archiveTranscriptTurnCount }), now]);
       if (archiveId) await client.query(`INSERT INTO conversation_archive_entries
         (agent_id,session_id,source_store,source_id,ordinal,entry_key,entry,search_projection,created_at,archive_kind,generation,entry_id,idempotency_key)
         SELECT agent_id,session_id,'archive',$3,sequence,to_json(entry_id)::text,entry,
@@ -1650,8 +1720,12 @@ export class PostgresSessionStore {
       AND ($5::text IS NULL OR to_char(burrow_legacy_instant(updated_at::text) AT TIME ZONE $6,'YYYY-MM')=$5)
       AND ($7::timestamptz IS NULL OR (burrow_legacy_instant(updated_at::text),agent_id || ':' || id)<($7::timestamptz,$8::text))
       ORDER BY updated_at DESC,agent_id || ':' || id DESC LIMIT $9
-    ) SELECT bounded.*,
-      CASE WHEN archive_snapshot THEN (SELECT count(*) FROM (
+    ), missing AS MATERIALIZED (
+      SELECT * FROM bounded WHERE archive_snapshot
+        AND NOT COALESCE(metadata->>'archiveTranscriptTurnCount' ~ '^[0-9]+$',false)
+    ), counts AS MATERIALIZED (
+      SELECT missing.agent_id,missing.session_id,missing.id,
+        (SELECT count(*) FROM (
         SELECT DISTINCT COALESCE(
           CASE WHEN e.has_payload_id THEN 'payload:' || NULLIF(burrow_history_key(e.entry_key),'') END,
           'occurrence:' || e.entry_id,
@@ -1660,20 +1734,37 @@ export class PostgresSessionStore {
           ON a.agent_id=target.agent_id AND a.session_id=target.session_id
         JOIN conversation_archive_entries e ON e.agent_id=a.agent_id
           AND e.session_id=a.session_id AND e.source_id=a.archive_id
-        WHERE target.agent_id=bounded.agent_id AND target.session_id=bounded.session_id AND target.archive_id=bounded.id
+        WHERE target.agent_id=missing.agent_id AND target.session_id=missing.session_id AND target.archive_id=missing.id
           AND (a.archive_id=target.archive_id OR (a.kind='compacted' AND a.generation<=target.generation
             AND a.generation>=COALESCE((target.metadata->>'resetGeneration')::bigint,
               (SELECT max(r.generation)+1 FROM conversation_archives r
                 WHERE r.agent_id=target.agent_id AND r.session_id=target.session_id
                   AND r.kind='reset' AND r.generation<target.generation),0)))
-      ) occurrences)
-      WHEN metadata->>'turnCount' ~ '^[0-9]+$' THEN (metadata->>'turnCount')::bigint ELSE 0 END AS turn_count
-      FROM bounded ORDER BY updated_at DESC,identity DESC`,
+      ) occurrences) AS turn_count FROM missing
+    ), cached AS (
+      UPDATE conversation_archives target SET metadata=jsonb_set(target.metadata,
+        '{archiveTranscriptTurnCount}',to_jsonb(counts.turn_count),true)
+      FROM counts JOIN missing ON missing.agent_id=counts.agent_id AND missing.session_id=counts.session_id AND missing.id=counts.id
+      WHERE target.agent_id=counts.agent_id AND target.session_id=counts.session_id
+        AND target.archive_id=counts.id AND target.kind='reset'
+        AND target.metadata->'resetGeneration' IS NOT DISTINCT FROM missing.metadata->'resetGeneration'
+        AND NOT COALESCE(target.metadata->>'archiveTranscriptTurnCount' ~ '^[0-9]+$',false)
+      RETURNING target.agent_id,target.session_id,target.archive_id,target.metadata
+    ) SELECT bounded.*,
+      CASE WHEN archive_snapshot THEN COALESCE(
+        CASE WHEN cached.metadata->>'archiveTranscriptTurnCount' ~ '^[0-9]+$' THEN (cached.metadata->>'archiveTranscriptTurnCount')::bigint END,
+        CASE WHEN bounded.metadata->>'archiveTranscriptTurnCount' ~ '^[0-9]+$' THEN (bounded.metadata->>'archiveTranscriptTurnCount')::bigint END,
+        counts.turn_count)
+      WHEN bounded.metadata->>'turnCount' ~ '^[0-9]+$' THEN (bounded.metadata->>'turnCount')::bigint ELSE 0 END AS turn_count,
+      COALESCE(cached.metadata,bounded.metadata) AS projected_metadata
+      FROM bounded LEFT JOIN counts ON counts.agent_id=bounded.agent_id AND counts.session_id=bounded.session_id AND counts.id=bounded.id
+        LEFT JOIN cached ON cached.agent_id=bounded.agent_id AND cached.session_id=bounded.session_id AND cached.archive_id=bounded.id
+      ORDER BY updated_at DESC,identity DESC`,
     [agentId, Boolean(includeArchived), search, date, month, timezone, boundary?.t || null, boundary?.i || null, size + 1, windowStart?.toISOString() || null, windowEnd?.toISOString() || null]);
     const hasMore = rows.length > size;
     return { rows: (hasMore ? rows.slice(0, size) : rows).map(row => ({
       id: row.id, sessionId: row.id, sourceSessionId: row.source_session_id,
-      archiveSnapshot: row.archive_snapshot ? 'reset' : null, metadata: row.metadata,
+      archiveSnapshot: row.archive_snapshot ? 'reset' : null, metadata: row.projected_metadata,
       turnCount: Number(row.turn_count), createdAt: row.created_at, updatedAt: row.updated_at,
       identity: row.identity,
     })), hasMore };

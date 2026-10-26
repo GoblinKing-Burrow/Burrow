@@ -1,3 +1,4 @@
+import { toolActivityPresentation } from './tool-activity-labels.mjs';
 import { appendRuntimeActivity, appendRuntimeSessionEntry, appendRuntimeSessionTurn } from './runtime-session-writer.mjs';
 import { appendValidatedRuntimeReceipt, validateCompletedRuntimeInvariantsBeforeSideEffects, validateRuntimeInvariantsBeforeSideEffects } from './runtime-receipt-finalizer.mjs';
 import { buildOutcome, skippedActionsFromChatToolLoop, summarizeToolResults } from './runtime-result-shapes.mjs';
@@ -44,6 +45,7 @@ export function compactChatToolLoop(loop = null) {
 
 function activityLabel(result = {}) {
   const tool = String(result.tool || '').trim();
+  if (tool === 'mcp_call' || tool === 'load_skill') return toolActivityPresentation(result).label;
   const filePath = String(result.filePath || result.path || '').trim();
   const command = String(result.command || '').trim();
   if (tool === 'files_read' && filePath) return `Reading ${filePath.split('/').pop()}`;
@@ -65,6 +67,7 @@ function activityLabel(result = {}) {
 }
 
 function activityDetail(result = {}) {
+  if (result.tool === 'mcp_call' || result.tool === 'load_skill') return toolActivityPresentation(result).detail || '';
   return String(result.filePath || result.path || result.dirPath || result.command || result.error || '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -73,6 +76,8 @@ function activityDetail(result = {}) {
 function activityGroupKey(result = {}) {
   const tool = String(result.tool || '').trim();
   const target = String(result.filePath || result.path || result.dirPath || result.cwd || result.command || result.mcpToolName || '').replace(/\s+/g, ' ').trim();
+  if (tool === 'mcp_call') return `${tool}|${result.provider || ''}|${result.mcpToolName || ''}`;
+  if (tool === 'load_skill') return `${tool}|${result.skill?.id || result.skillId || ''}`;
   return `${tool}|${target || activityDetail(result)}`;
 }
 
@@ -176,6 +181,9 @@ export async function appendChatToolLoopEntries({ stores = null, agentId = 'hatc
     });
     for (const result of iteration.proposalExecution?.toolResults || []) {
       const normalizedResult = summarizeToolResults([result])[0] || result;
+      // Manifest readers use metadata.attachments. Copy the byte-free records:
+      // metadata redaction intentionally truncates repeated object identities.
+      const attachments = normalizedResult.attachments?.map(item => ({ ...item })) || [];
       await appendRuntimeSessionEntry({
         stores, agentId, sessionRoot,
         dataRoot,
@@ -187,7 +195,7 @@ export async function appendChatToolLoopEntries({ stores = null, agentId = 'hatc
         traceDir: logger.traceDir,
         visibility: 'debug',
         entersPrompt: false,
-        metadata: { decision: 'chat_tool_result', canonicalExecution: true, iteration: iteration.iteration, tool: result.tool || null, callId: result.activityId || null, ok: result.ok ?? null, normalizedResult },
+        metadata: { decision: 'chat_tool_result', canonicalExecution: true, iteration: iteration.iteration, tool: result.tool || null, callId: result.activityId || null, ok: result.ok ?? null, normalizedResult, ...(attachments.length ? { attachments } : {}) },
       });
     }
   }

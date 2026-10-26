@@ -1,3 +1,4 @@
+import { enabledAgents } from '../../app/agentCatalog';
 import { useUnsavedNavigation } from '../../app/UnsavedChanges';
 import { OpenTelemetrySettings } from './OpenTelemetrySettings';
 import { BrowserTabSettings } from './BrowserTabSettings';
@@ -42,7 +43,7 @@ export function Settings({ navigationTarget, tab, setTab, agents, selected, save
   const navigate = useUnsavedNavigation();
   const [settingsAgentId, setSettingsAgentId] = useState(selected.id);
   const [agentSection, setAgentSection] = useState<'details' | 'profile-documents' | 'mcp-tools' | 'cron-jobs' | 'dreams' | 'skills'>('details');
-  const [generalSection, setGeneralSection] = useState<'opentelemetry' | 'browser-tab' | 'operator-timezone' | 'operator-profile' | 'execution-boundaries' | 'trace-retention' | 'brain-memory' | 'global-documents' | 'export' | 'rail-panels' | 'tiddle-signal' | 'appearance'>('operator-profile');
+  const [generalSection, setGeneralSection] = useState<'opentelemetry' | 'browser-tab' | 'operator-profile' | 'execution-boundaries' | 'trace-retention' | 'brain-memory' | 'global-documents' | 'export' | 'rail-panels' | 'tiddle-signal' | 'appearance'>('operator-profile');
   const [connectionSection, setConnectionSection] = useState<'authentication' | 'browser-origin' | 'model-providers' | 'load-balancing' | 'mcp-servers' | 'api-tokens'>('authentication');
   const [skillsSection, setSkillsSection] = useState<'installed' | 'repo' | 'text'>('installed');
   const [modsSection, setModsSection] = useState<'installed' | 'sources' | 'automatic-checks'>('installed');
@@ -61,10 +62,10 @@ export function Settings({ navigationTarget, tab, setTab, agents, selected, save
     validate: isBoolean,
     decodeLegacy: (raw) => raw === 'true' ? true : raw === 'false' ? false : undefined,
   }));
-  const settingsSelected = agents.find((agent) => agent.id === settingsAgentId) ?? selected;
+  const settingsSelected = agents.find((agent) => agent.id === settingsAgentId) ?? agents[0] ?? selected;
 
   useEffect(() => {
-    if (!agents.some((agent) => agent.id === settingsAgentId)) setSettingsAgentId(selected.id);
+    if (!agents.some((agent) => agent.id === settingsAgentId)) setSettingsAgentId(agents[0]?.id ?? selected.id);
   }, [agents, selected.id, settingsAgentId]);
   useEffect(() => {
     let cancelled = false;
@@ -109,11 +110,10 @@ export function Settings({ navigationTarget, tab, setTab, agents, selected, save
       {tab === 'agents' && <div className="settings-prototype-agent-selector"><AgentToolbar agents={agents} selectedId={settingsSelected.id} onSelect={setSettingsAgentId} onAgentsChanged={onAgentsChanged} onModelConnectionsChanged={onModelConnectionsChanged} onOperatorProfileChanged={onOperatorProfileChanged} onFirstRunComplete={onFirstRunComplete} onSetupComplete={completeFirstRun} firstRun={previewFirstRun || setupStatus?.wizardStep === 'fresh' || setupStatus?.wizardStep === 'incomplete'} /></div>}
 
       <section className="settings-blank-column settings-prototype-sections">
-        {tab === 'skills' && <nav className="settings-prototype-section-items" aria-label="Skills settings sections">{([['installed', 'Installed skills'], ['repo', 'Import from repository'], ['text', 'New text skill']] as const).map(([id,label]) => <button type="button" key={id} className={skillsSection === id ? 'active' : ''} aria-current={skillsSection === id ? 'page' : undefined} onClick={() => setSkillsSection(id)}>{label}</button>)}</nav>}
+        {tab === 'skills' && <nav className="settings-prototype-section-items" aria-label="Skills settings sections">{([['installed', 'Installed skills'], ['repo', 'Import from repository'], ['text', 'New text skill']] as const).map(([id,label]) => <button type="button" key={id} className={skillsSection === id ? 'active' : ''} aria-current={skillsSection === id ? 'page' : undefined} onClick={() => { if (skillsSection !== id) navigate(() => setSkillsSection(id)); }}>{label}</button>)}</nav>}
         {tab === 'general' && <nav className="settings-prototype-section-items" aria-label="General settings sections">
           {([
             ['operator-profile', 'Operator profile'],
-            ['operator-timezone', 'Operator timezone'],
             ['browser-tab', 'Browser tab'],
             ['opentelemetry', 'OpenTelemetry'],
             ['execution-boundaries', 'Execution boundaries'],
@@ -134,7 +134,7 @@ export function Settings({ navigationTarget, tab, setTab, agents, selected, save
             ['cron-jobs', 'Cron jobs'],
             ['dreams', 'Dreams'],
             ['skills', 'Skills'],
-          ] as const).map(([id, label]) => <button type="button" className={agentSection === id ? 'active' : ''} aria-current={agentSection === id ? 'page' : undefined} onClick={() => setAgentSection(id)} key={id}>{label}</button>)}
+          ] as const).map(([id, label]) => <button type="button" className={agentSection === id ? 'active' : ''} aria-current={agentSection === id ? 'page' : undefined} onClick={() => { if (agentSection !== id) navigate(() => setAgentSection(id)); }} key={id}>{label}</button>)}
         </nav>}
         {tab === 'connections' && <nav className="settings-prototype-section-items" aria-label="Connection settings sections">
           {([
@@ -158,8 +158,11 @@ export function Settings({ navigationTarget, tab, setTab, agents, selected, save
       <section className="settings-blank-column settings-prototype-configuration">
         {tab === 'general' && generalSection === 'opentelemetry' && <OpenTelemetrySettings />}
         {tab === 'general' && generalSection === 'browser-tab' && <BrowserTabSettings />}
-        {tab === 'general' && generalSection === 'operator-timezone' && <OperatorTimezone />}
-        {tab === 'general' && generalSection === 'operator-profile' && <OperatorProfile onSaved={onOperatorProfileChanged} />}
+        {tab === 'general' && generalSection === 'operator-profile' && <>
+          <OperatorProfile onSaved={onOperatorProfileChanged} />
+          <hr className="operator-profile-divider" />
+          <OperatorTimezone />
+        </>}
         {tab === 'general' && generalSection === 'execution-boundaries' && <ExecutionBoundaries overflowTarget={overflowColumn} />}
         {tab === 'general' && generalSection === 'trace-retention' && <RetentionSettings />}
         {tab === 'general' && generalSection === 'brain-memory' && <BrainEmbeddingSettings savedProviders={savedProviders} />}
@@ -169,7 +172,7 @@ export function Settings({ navigationTarget, tab, setTab, agents, selected, save
         {tab === 'general' && generalSection === 'tiddle-signal' && <CuratorSettings savedProviders={savedProviders} />}
         {tab === 'general' && generalSection === 'appearance' && <SettingSection title="Appearance"><fieldset className="theme-picker"><legend>Theme</legend><div>{themes.map((option) => <button type="button" className={theme === option ? 'active' : ''} onClick={() => setTheme(option)} aria-pressed={theme === option} key={option}><i className={`theme-swatch ${option}`} aria-hidden="true" /><span><b>{themeDetails[option].label}</b><small>{themeDetails[option].description}</small></span></button>)}</div></fieldset></SettingSection>}
         {tab === 'agents' && (agents.length === 0 ? <SettingSection title="Agent setup"><p className="hint">No agents configured yet. Create your first agent to unlock the rest of the agent settings.</p></SettingSection> : agentSection === 'skills' ? <SkillsSettings agentView agents={agents} agentId={settingsSelected.id} overflowTarget={overflowColumn} /> : agentSection === 'mcp-tools' ? <AgentMcpTools agentId={settingsSelected.id} overflowTarget={overflowColumn} /> : <AgentSettings selected={settingsSelected} savedProviders={savedProviders} onAgentsChanged={onAgentsChanged} section={agentSection} overflowTarget={overflowColumn} />)}
-        {tab === 'skills' && <SkillsSettings agents={agents} agentId={settingsSelected.id} section={skillsSection} onSectionChange={setSkillsSection} overflowTarget={overflowColumn} />}
+        {tab === 'skills' && <SkillsSettings agents={enabledAgents(agents)} agentId={settingsSelected.id} section={skillsSection} onSectionChange={setSkillsSection} overflowTarget={overflowColumn} />}
         {tab === 'connections' && connectionSection === 'authentication' && <AuthenticationSettings />}
         {tab === 'connections' && connectionSection === 'browser-origin' && <BrowserOriginSettings />}
         {tab === 'connections' && connectionSection === 'model-providers' && <ModelConnections key="models" savedProviders={savedProviders} onModelConnectionsChanged={onModelConnectionsChanged} mcpConnections={null} overflowTarget={overflowColumn} />}
@@ -177,10 +180,10 @@ export function Settings({ navigationTarget, tab, setTab, agents, selected, save
         {tab === 'connections' && connectionSection === 'mcp-servers' && <McpConnections overflowTarget={overflowColumn} />}
         {tab === 'connections' && connectionSection === 'api-tokens' && <ApiTokensSettings overflowTarget={overflowColumn} />}
         {tab === 'mods' && <ModsSettings section={modsSection} overflowTarget={overflowColumn} />}
-        {selectedContribution?.settingsUrl && <ModSettingsHost key={`${selectedContribution.modId}:${selectedContribution.version ?? ''}`} modId={selectedContribution.modId} settingsUrl={`${selectedContribution.settingsUrl}${selectedContribution.version ? `?v=${encodeURIComponent(selectedContribution.version)}` : ''}`} agents={agents} onAgentsChanged={onAgentsChanged} navigationTarget={modNavigationColumn} overflowTarget={overflowColumn} selectedSectionId={selectedModSettings?.id} onSectionChange={selectedContribution.settings?.length ? (sectionId) => setTab(modSettingsTab(selectedContribution.modId, sectionId)) : undefined} />}
+        {selectedContribution?.settingsUrl && <ModSettingsHost key={`${selectedContribution.modId}:${selectedContribution.version ?? ''}`} modId={selectedContribution.modId} settingsUrl={`${selectedContribution.settingsUrl}${selectedContribution.version ? `?v=${encodeURIComponent(selectedContribution.version)}` : ''}`} agents={enabledAgents(agents)} onAgentsChanged={onAgentsChanged} navigationTarget={modNavigationColumn} overflowTarget={overflowColumn} selectedSectionId={selectedModSettings?.id} onSectionChange={selectedContribution.settings?.length ? (sectionId) => setTab(modSettingsTab(selectedContribution.modId, sectionId)) : undefined} />}
       </section>
       <section className="settings-blank-column settings-prototype-overflow" ref={setOverflowColumn} aria-label="Additional settings">
-        {tab === 'general' && generalSection === 'rail-panels' && hasAgentsPanel && <div className="settings-overflow-content"><AgentSidebarSettings agents={agents} preferences={agentRailPreferences} setPreferences={setAgentRailPreferences} /></div>}
+        {tab === 'general' && generalSection === 'rail-panels' && hasAgentsPanel && <div className="settings-overflow-content"><AgentSidebarSettings agents={enabledAgents(agents)} preferences={agentRailPreferences} setPreferences={setAgentRailPreferences} /></div>}
       </section>
       <aside className="settings-utility-panel" aria-label="System statistics" aria-hidden={!utilityPanelOpen}>
         <header><span>System statistics</span><button type="button" onClick={() => setUtilityPanelOpen(false)} aria-label="Collapse system statistics"><Chevron direction="right" /></button></header>

@@ -94,6 +94,7 @@ export function summarizeToolResults(toolResults = []) {
     toolCallId: toolResult.toolCallId || null,
     ok: toolResult.ok ?? null,
     ...(toolResult.tool === 'mcp_call' ? {
+      attachments: Array.isArray(toolResult.attachments) ? toolResult.attachments.slice(0, RECEIPT_TEXT_LIMITS.list).map(({ id, artifactPath, name, type, size, storedAt }) => ({ id, artifactPath, name, type, size, storedAt })) : undefined,
       mcpToolName: toolResult.mcpToolName ? compactText(toolResult.mcpToolName, 240) : null,
       provider: toolResult.provider ? compactText(toolResult.provider, 120) : null,
       // Connection IDs and raw MCP output remain in trace-owned results. Keep
@@ -207,6 +208,7 @@ export function summarizeToolResults(toolResults = []) {
       : undefined,
     // Skill discovery must preserve the bounded capability cards that informed
     // the agent. Full loaded instructions remain native-result-only.
+    skillId: toolResult.tool === 'load_skill' && typeof toolResult.skillId === 'string' ? compactText(toolResult.skillId, 160) : undefined,
     skills: compactSkillCards(toolResult.skills),
     skill: toolResult.skill ? compactSkillCard(toolResult.skill) : undefined,
     entries: Array.isArray(toolResult.entries) ? toolResult.entries.slice(0, RECEIPT_TEXT_LIMITS.list).map((item) => ({ path: item?.path || null, type: item?.type || null })) : undefined,

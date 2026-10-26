@@ -314,3 +314,51 @@ it('keeps steering at submission time exactly once across delivery, later turns 
   check();
   expect(view.container.textContent).toContain('DELIVERED TO RUN');
 });
+
+it.each(['Hatchet', 'Smatchet'])('keeps %s name and avatar through pending, live and saved delegation', (name) => {
+  const owner = { ...parent, id: name.toLowerCase(), name, avatar: `https://example.invalid/${name}.png` };
+  const metadata = { kind: 'subagent-delegated-task', parentAgentId: owner.id, subagentId: child.id };
+  const props = { selected: child, parent: owner, operator: { name: 'Rob', avatar: 'R' }, isNewSession: true, isLoading: false, error: '', activeRunId: 'child-run', liveProgress: [], liveAnswer: '', runtimeUserMessage: 'Inspect hierarchy', runtimeUserMessageMetadata: metadata };
+  const view = render(<ChatTranscript {...props} turns={[]} isSending={false} />);
+  const check = () => {
+    expect(screen.getAllByLabelText(`${name} avatar`)).toHaveLength(1);
+    expect(screen.getByLabelText(`${name} avatar`).querySelector('img')?.getAttribute('src')).toBe(owner.avatar);
+    expect(screen.getAllByText('Inspect hierarchy')).toHaveLength(1);
+    expect(screen.queryByLabelText('Rob avatar')).toBeNull();
+  };
+  check();
+  view.rerender(<ChatTranscript {...props} turns={[]} isSending />);
+  check();
+  view.rerender(<ChatTranscript {...props} turns={[{ ...message('Inspect hierarchy', metadata), runId: 'child-run' }]} isSending={false} />);
+  check();
+  view.rerender(<ChatTranscript {...props} isNewSession={false} runtimeUserMessage="" turns={[{ ...message('Inspect hierarchy', metadata), runId: 'child-run' }, message('Actual operator followup')]} isSending={false} />);
+  expect(screen.getAllByLabelText('Rob avatar')).toHaveLength(1);
+  expect(screen.getByText('Actual operator followup')).toBeTruthy();
+});
+
+it('does not hide pending delegation behind identical text from a different run', () => {
+  render(<ChatTranscript selected={child} parent={parent} operator={{ name: 'Rob', avatar: 'R' }} isNewSession={false} turns={[{ ...message('Same request'), runId: 'operator-run' }]} isLoading={false} error="" isSending activeRunId="child-run" liveProgress={[]} liveAnswer="" runtimeUserMessage="Same request" runtimeUserMessageMetadata={{ kind: 'subagent-delegated-task', parentAgentId: parent.id }} />);
+  expect(screen.getAllByText('Same request')).toHaveLength(2);
+  expect(screen.getByLabelText('Rob avatar')).toBeTruthy();
+  expect(screen.getByLabelText('Hatchet avatar')).toBeTruthy();
+});
+
+it('keeps runtime operator followups in child sessions attributed to the operator', () => {
+  render(<ChatTranscript selected={child} parent={parent} operator={{ name: 'Rob', avatar: 'R' }} isNewSession={false} turns={[]} isLoading={false} error="" isSending activeRunId="operator-run" liveProgress={[]} liveAnswer="" runtimeUserMessage="Actual operator request" />);
+  expect(screen.getByLabelText('Rob avatar')).toBeTruthy();
+  expect(screen.queryByLabelText('Hatchet avatar')).toBeNull();
+});
+
+it('renders exact projected MCP and skill names live and after saving', () => {
+  const activity = { runId: 'r', items: [
+    { id: 'm', label: 'MCP · Goblin-DevTools · take_snapshot', detail: 'Goblin-DevTools · take_snapshot', status: 'ok' as const },
+    { id: 's', label: 'Load skill · react-review', detail: 'react-review · v2', status: 'pending' as const },
+  ] };
+  const props = { selected: parent, parent, operator: { name: 'Rob', avatar: 'R' }, isNewSession: false, isLoading: false, error: '', liveProgress: [], liveAnswer: '' };
+  const { container, rerender } = render(<ChatTranscript {...props} turns={[]} isSending activeRunId="r" activeToolActivity={activity} />);
+  expect(container.querySelector('.tool-activity summary')?.textContent).toContain('Load skill · react-review');
+  expect(screen.getByText('MCP · Goblin-DevTools · take_snapshot')).toBeTruthy();
+  rerender(<ChatTranscript {...props} turns={[{ role: 'assistant', type: 'message', content: 'Done', runId: 'r', metadata: { toolActivity: activity } }]} isSending={false} activeRunId="" />);
+  expect(screen.getByText('MCP · Goblin-DevTools · take_snapshot')).toBeTruthy();
+  expect(screen.getByText('Load skill · react-review')).toBeTruthy();
+});

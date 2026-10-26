@@ -1,3 +1,4 @@
+import { enabledAgents } from '../../app/agentCatalog';
 import { useEffect, useState, type PointerEvent, type ReactNode } from 'react';
 import type { Agent, FileNode, PanelId } from '../../app/types';
 import type { RailLayout } from '../../app/usePersistedLayout';
@@ -20,7 +21,7 @@ export function WorkspaceRail({ collapsed, topPanel, bottomPanel, singlePanel, l
 }
 
 export function AgentsPanel({ agents, view = 'regular', order = [], selectedStreamId, expandedAgents, onToggleAgent, onSelectAgent, onSelectSubagent }: Pick<WorkspacePanelContext, 'agents' | 'selectedStreamId' | 'expandedAgents' | 'onToggleAgent' | 'onSelectAgent' | 'onSelectSubagent'> & { view?: AgentRailView; order?: string[] }) {
- const orderedAgents = orderAgents(agents, order);
+ const orderedAgents = orderAgents(enabledAgents(agents), order);
  return <section className={`agent-pane ${view === 'compact' ? 'compact' : ''}`}>
    {orderedAgents.map((agent) => <AgentCard key={agent.id} agent={agent} selectedStreamId={selectedStreamId} expanded={expandedAgents.has(agent.id)} compact={view === 'compact'} onToggle={() => onToggleAgent(agent.id)} onSelect={() => onSelectAgent(agent)} onSelectSubagent={(subagentId) => onSelectSubagent(agent.id, subagentId)} />)}
  </section>;
@@ -55,7 +56,7 @@ export function SystemPanel({ provider, providerConnectionStatus }: { provider: 
  const heap = process?.heapUsedBytes == null || process?.heapTotalBytes == null ? 'Unavailable' : `${formatBytes(process.heapUsedBytes)} / ${formatBytes(process.heapTotalBytes)}`;
  const stats = [['CPU', process?.cpu.percent == null ? 'Unavailable' : `${process.cpu.percent.toFixed(1)}%`], ['RSS', formatBytes(process?.rssBytes)], ['Heap', heap], ['Uptime', formatUptime(process?.uptimeSeconds)], ['Trace storage', traces ? `${formatBytes(traces.logicalBytes)} · ${traces.count ?? '—'} runs` : runtimeStatus === 'checking' ? 'Loading…' : 'Unavailable']];
  const providerLabel = provider.trim() || 'Provider';
- const providerStatusLabel = providerConnectionStatus === 'checking' ? 'Checking provider connection' : providerConnectionStatus === 'connected' ? `${providerLabel} provider` : `${providerLabel} unavailable`;
+ const providerStatusLabel = providerConnectionStatus === 'unknown' ? `${providerLabel} connection unverified` : providerConnectionStatus === 'checking' ? 'Checking provider connection' : providerConnectionStatus === 'connected' ? `${providerLabel} provider` : `${providerLabel} unavailable`;
  return <section className="system-pane"><div className="system-clock">{now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div><div className="system-date">{now.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}</div><div className={`system-status ${runtimeStatus}`}><i /> <span>Local runtime</span> · {runtimeStatus === 'checking' ? 'Checking' : runtimeStatus === 'connected' ? 'Available' : 'Unavailable'}</div><div className={`system-provider-status ${providerConnectionStatus}`} title={providerStatusLabel}><i /> <span>{providerLabel}</span></div><div className="system-stats">{stats.map(([label, value]) => <div className="system-stat" key={label}><span>{label}</span><b>{value}</b></div>)}</div></section>;
 }
 

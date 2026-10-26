@@ -23,14 +23,10 @@ export function openAIEnvelopeError(data, mode) {
 }
 export function isChatGptBackendBaseUrl(value) { const raw=trimSlash(value); if (!raw) return false; try { const url=new URL(raw); const pathname=url.pathname.replace(/\/+$/,''); return url.hostname.toLowerCase()==='chatgpt.com' && ['/backend-api','/backend-api/v1','/backend-api/codex','/backend-api/codex/v1'].includes(pathname); } catch { return false; } }
 
-// Codex-LB is an OAuth-backed proxy for the same Codex backend contract. Its
-// origin is intentionally not chatgpt.com, so URL-only detection must also use
-// the trusted connection metadata supplied by the model settings store.
+// Native ChatGPT OAuth uses the Codex backend contract; generic compatible
+// endpoints must not acquire native affinity behavior from names or ports.
 export function isCodexBackendConfig(config = {}) {
-  if (isChatGptBackendBaseUrl(config.baseUrl || config.apiBaseUrl || config.url)) return true;
-  const provider = String(config.provider || config.providerName || '').toLowerCase();
-  const baseUrl = String(config.baseUrl || config.apiBaseUrl || config.url || '').toLowerCase();
-  return provider.includes('codex-lb') || provider.includes('codex lb') || baseUrl.includes('codex-lb') || /:\s*2455(?:\/|$)/.test(baseUrl);
+  return isChatGptBackendBaseUrl(config.baseUrl || config.apiBaseUrl || config.url);
 }
 function codexResponsesUrl(baseUrl) { const url=new URL(trimSlash(baseUrl)); url.pathname='/backend-api/codex/responses'; url.search=''; url.hash=''; return url.toString(); }
 export function completionUrl(config={}) { const baseUrl=trimSlash(config.baseUrl||config.apiBaseUrl||config.url); if(!baseUrl) throw new Error('model baseUrl is required'); if(isChatGptBackendBaseUrl(baseUrl)) return codexResponsesUrl(baseUrl); if(config.chatCompletionsPath) return `${baseUrl}/${String(config.chatCompletionsPath).replace(/^\/+/, '')}`; if(baseUrl.endsWith('/chat/completions')) return baseUrl; if(baseUrl.endsWith('/v1')||(isGoogleOpenAICompatible(config)&&baseUrl.endsWith('/openai'))) return `${baseUrl}/chat/completions`; return `${baseUrl}/v1/chat/completions`; }
@@ -286,12 +282,8 @@ async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_R
   const cancelStream = (stream) => {
     try { Promise.resolve(stream?.cancel?.()).catch(() => {}); } catch {}
   };
-  const limit = Math.max(1, Math.floor(Number(maxBytes) || DEFAULT_MAX_RESPONSE_BYTES));
-  const contentLength = Number(response?.headers?.get?.('content-length') || 0);
-  if (Number.isFinite(contentLength) && contentLength > limit) {
-    cancelStream(response?.body);
-    return { ok: false, bytes: contentLength, error: `model_response_too_large:${contentLength}>${limit}`, data: null, streamedTextChars: 0 };
-  }
+  // SSE is consumed incrementally. Cumulative wire traffic is not retained
+  // memory; event, carry, text and tool-argument bounds apply below instead.
   const reader = response?.body?.getReader?.();
   if (!reader) return { ok: false, bytes: 0, error: 'model_stream_unavailable', data: null, streamedTextChars: 0 };
   const decoder = new TextDecoder();
@@ -401,7 +393,7 @@ async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_R
     const choice = event?.choices?.[0];
     if (!choice) return;
     if (typeof choice.delta?.content === 'string') await emit(choice.delta.content);
-    // Codex-LB/OpenAI-compatible chat streams use these vendor-compatible
+    // OpenAI-compatible chat streams use these vendor-compatible
     // fields for the transient work/reasoning channel.
     if (typeof choice.delta?.reasoning_content === 'string') await emitThought(choice.delta.reasoning_content);
     if (typeof choice.delta?.reasoning === 'string') await emitThought(choice.delta.reasoning);
@@ -416,10 +408,6 @@ async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_R
       const { done, value } = await reader.read();
       if (done) break;
       bytes += value?.byteLength ?? value?.length ?? 0;
-      if (bytes > limit) {
-        cancelStream(reader);
-        return { ok: false, bytes, error: `model_response_too_large:${bytes}>${limit}`, data: null, streamedTextChars: text.length };
-      }
       buffer += decoder.decode(value, { stream: true });
       while (true) {
         const match = buffer.match(/\r?\n/);

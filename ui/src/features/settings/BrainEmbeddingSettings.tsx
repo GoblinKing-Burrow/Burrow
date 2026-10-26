@@ -1,3 +1,5 @@
+import { useUnsavedChanges } from '../../app/UnsavedChanges';
+import { DreamPromotionSettings } from './DreamPromotionSettings';
 import { providerOptionLabel } from './ProviderModelFields';
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../../app/api';
@@ -11,6 +13,7 @@ const root = '/api/settings/brain-embeddings';
 const json = (method: string, body?: unknown) => ({ method, headers: { 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 
 export function BrainEmbeddingSettings({ savedProviders }: { savedProviders: SavedProvider[] }) {
+  const [baseline, setBaseline] = useState({ enabled: false, connectionId: '', model: '' });
   const [status, setStatus] = useState<Status | null>(null);
   const [enabled, setEnabled] = useState(false);
   const [connectionId, setConnectionId] = useState('');
@@ -30,7 +33,7 @@ export function BrainEmbeddingSettings({ savedProviders }: { savedProviders: Sav
   const edit = () => { epoch.current++; setTested(''); setError(''); setBusy(''); };
   useEffect(() => {
     owner.current = {}; const t = ticket();
-    api<Status>(root).then(s => { if (!current(t)) return; accept(s); setEnabled(s.enabled); setConnectionId(s.connectionId ?? ''); setModel(s.model ?? ''); setBusy(''); }).catch(() => { if (current(t)) { setError('Could not load embedding settings. Reopen this section to retry. Brains CRUD remains available.'); setBusy(''); } });
+    api<Status>(root).then(s => { if (!current(t)) return; accept(s); setEnabled(s.enabled); setConnectionId(s.connectionId ?? ''); setModel(s.model ?? ''); setBaseline({ enabled: s.enabled, connectionId: s.connectionId ?? '', model: s.model ?? '' }); setBusy(''); }).catch(() => { if (current(t)) { setError('Could not load embedding settings. Reopen this section to retry. Brains CRUD remains available.'); setBusy(''); } });
     return () => { owner.current = null; epoch.current++; };
   }, []);
   useEffect(() => {
@@ -45,7 +48,8 @@ export function BrainEmbeddingSettings({ savedProviders }: { savedProviders: Sav
     try { const s = await api<Status>(root, { signal }); if (!cancelled() && current(t)) { accept(s); } }
     catch { if (!cancelled() && current(t)) setError('Could not refresh indexing status. Polling will retry; Brains CRUD remains available.'); }
   }, 3000, !!status && !busy, `${busy}:${status?.generation ?? ''}`);
-  const request = async (action: 'save' | 'test' | 'reindex') => {
+  const request = async (action: 'save' | 'test' | 'reindex'): Promise<boolean> => {
+    if (busy || !status) return false;
     epoch.current++; const t = ticket(); setBusy(action); setError('');
     const selection = { connectionId: connectionId || null, model: model.trim() || null };
     try {
@@ -54,15 +58,18 @@ export function BrainEmbeddingSettings({ savedProviders }: { savedProviders: Sav
         if (current(t)) setTested(`Test successful · ${result.dimensions} dimensions`);
       } else {
         const s = await api<Status>(action === 'save' ? root : `${root}/reindex`, json(action === 'save' ? 'PUT' : 'POST', action === 'save' ? { enabled, ...(enabled || (selection.connectionId && selection.model) ? selection : { connectionId: null, model: null }) } : undefined));
-        if (current(t)) accept(s);
+        if (current(t)) { accept(s); if (action === 'save') { const accepted = { enabled: s.enabled, connectionId: s.connectionId ?? '', model: s.model ?? '' }; setBaseline(accepted); setEnabled(accepted.enabled); setConnectionId(accepted.connectionId); setModel(accepted.model); } }
+        if (!current(t)) return false;
       }
-    } catch { if (current(t)) setError(`Could not ${action} embeddings. Check the saved connection, supported embedding model and provider availability, then retry. Saved memories are unchanged.`); }
+      return true;
+    } catch { if (current(t)) setError(`Could not ${action} embeddings. Check the saved connection, supported embedding model and provider availability, then retry. Saved memories are unchanged.`); return false; }
     finally { if (t.owner === owner.current && t.epoch === epoch.current) setBusy(''); }
   };
+  useUnsavedChanges({ dirty: !!status && (enabled !== baseline.enabled || connectionId !== baseline.connectionId || model !== baseline.model), busy: !!busy, save: () => request('save'), discard: () => { setEnabled(baseline.enabled); setConnectionId(baseline.connectionId); setModel(baseline.model); setTested(''); setError(''); } });
   const selected = !!connectionId && !!model.trim();
   const manual = !discovery?.models.some(m => m.id === model.trim());
   const locked = !!busy;
-  return <SettingSection title="Brain memory"><div className="curator-card">
+  return <SettingSection title="Brain memory"><DreamPromotionSettings /><div className="curator-card">
     <label><input type="checkbox" checked={enabled} disabled={locked || !status} onChange={e => { edit(); setEnabled(e.target.checked); }} /> Enable Brains embeddings globally</label>
     <div className="field-pair provider-model-fields"><Field label="Provider"><select value={connectionId} disabled={locked || !status} onChange={e => { edit(); setConnectionId(e.target.value); setModel(''); }}><option value="">Choose a connection</option>{connectionId && !savedProviders.some(p => p.id === connectionId) && <option value={connectionId}>Configured connection (unavailable)</option>}{savedProviders.map(p => <option key={p.id} value={p.id}>{providerOptionLabel(savedProviders, p)}</option>)}</select></Field>
     <Field label="Model"><select value={discovery?.models.some(m => m.id === model) ? model : ''} disabled={locked || !discovery} onChange={e => { edit(); setModel(e.target.value); }}><option value="">Choose an embedding model or enter ID below</option>{discovery?.models.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}</select></Field></div>
