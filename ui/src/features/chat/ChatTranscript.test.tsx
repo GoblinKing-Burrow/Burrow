@@ -362,3 +362,29 @@ it('renders exact projected MCP and skill names live and after saving', () => {
   expect(screen.getByText('MCP · Goblin-DevTools · take_snapshot')).toBeTruthy();
   expect(screen.getByText('Load skill · react-review')).toBeTruthy();
 });
+
+it.each(['CI', '', undefined])('attributes saved workflow input (%s) to GitHub, not the operator or delegated parent', (workflow) => {
+  show([message('Workflow completed', { source: 'workflow-event', completionEvent: { workflow }, parentAgentId: 'hatchet' }), message('Operator followup')]);
+  expect(screen.getByLabelText(`GitHub · ${workflow || 'workflow event'} avatar`)).toBeTruthy();
+  expect(screen.queryByLabelText('Hatchet avatar')).toBeNull();
+  expect(screen.getAllByLabelText('Rob avatar')).toHaveLength(1);
+});
+
+it.each(['Release', undefined])('attributes live workflow input (%s) to GitHub without requiring saved turns', (workflow) => {
+  render(<ChatTranscript selected={parent} parent={parent} operator={{ name: 'Rob', avatar: 'R' }} isNewSession={false} turns={[]} isLoading={false} error="" isSending activeRunId="workflow-run" liveProgress={[]} liveAnswer="" runtimeUserMessage="Workflow completed" runtimeUserMessageMetadata={{ source: 'workflow-event', completionEvent: { workflow } }} />);
+  expect(screen.getByLabelText(`GitHub · ${workflow || 'workflow event'} avatar`)).toBeTruthy();
+  expect(screen.queryByLabelText('Rob avatar')).toBeNull();
+});
+
+it('shows compaction status even alongside existing activity', () => {
+  render(<ChatTranscript selected={parent} parent={parent} operator={{ name: 'Rob', avatar: 'R' }} isNewSession={false} turns={[]} isLoading={false} error="" isSending activeRunId="run" activeToolActivity={{ runId: 'run', items: [{ id: 'tool', label: 'Earlier action', status: 'ok' }] }} liveProgress={[]} liveAnswer="" liveStage="compacting" />);
+  expect(screen.getByRole('status').textContent).toBe('Compacting context…');
+  expect(screen.getAllByText('Earlier action').length).toBeGreaterThan(0);
+});
+
+it('shows compact acknowledgement and receipt while retaining other command filtering', () => {
+  show([message('/compact'), { type: 'message', role: 'assistant', content: 'Context compacted.' }, message('/help')], parent);
+  expect(screen.getByText('/compact')).toBeTruthy();
+  expect(screen.getByText('Context compacted.')).toBeTruthy();
+  expect(screen.queryByText('/help')).toBeNull();
+});

@@ -47,7 +47,7 @@ function runtimeRunForSelection(run: ActiveChatRun | undefined, targetId: string
   if (!run) return null;
   const owner = run;
   run = { ...run, progress: (run.progress ?? []).filter((event) => (event.runId === undefined || event.runId === owner.runId) && (event.sessionId === undefined || event.sessionId === owner.sessionId)) };
-  return { targetId, runId: run.runId, agentId: run.agentId, sessionId: run.sessionId, steeringReady: run.steeringReady === true, answerText: typeof run.answerText === 'string' ? run.answerText : '', latestUserMessage: typeof run.latestUserMessage === 'string' ? run.latestUserMessage : '', stage: (run.progress ?? []).reduce<LiveStageProjection>((state, event) => ((event.runId !== undefined && event.runId !== run.runId) || (event.sessionId !== undefined && event.sessionId !== run.sessionId)) ? state : projectLiveStage(state, event), {}).stage, progress: runtimeRunProgress(run), toolActivity: runtimeToolActivity(run) };
+  return { targetId, ...(run.source === 'workflow-event' ? { userMessageMetadata: { source: 'workflow-event' as const, completionEvent: run.completionEvent } } : {}), runId: run.runId, agentId: run.agentId, sessionId: run.sessionId, steeringReady: run.steeringReady === true, answerText: typeof run.answerText === 'string' ? run.answerText : '', latestUserMessage: typeof run.latestUserMessage === 'string' ? run.latestUserMessage : '', stage: (run.progress ?? []).reduce<LiveStageProjection>((state, event) => ((event.runId !== undefined && event.runId !== run.runId) || (event.sessionId !== undefined && event.sessionId !== run.sessionId)) ? state : projectLiveStage(state, event), {}).stage, progress: runtimeRunProgress(run), toolActivity: runtimeToolActivity(run) };
 }
 
 function formatElapsed(from: string | null | undefined, to: number) {
@@ -106,7 +106,7 @@ export function projectChatActivity(response: ActiveChatRunsResponse, { agentId,
   // The active endpoint can retain terminal summaries; only live statuses own
   // the composer lock (and a terminal summary must not hide a newer live run).
   const liveRuns = (response.runs ?? []).filter((run) => run.status === 'running' || run.status === 'cancelling');
-  const selectedRuntimeRun = liveRuns.find((run) => run.agentId === agentId && run.sessionId === sessionId);
+  const selectedRuntimeRun = liveRuns.find((run) => run.lane !== 'side_question' && run.agentId === agentId && run.sessionId === sessionId);
   const matchingLiveSubagents = (response.subagents ?? []).filter((child) => {
     const traceChildSessionId = child.trace && 'childSessionId' in child.trace && typeof child.trace.childSessionId === 'string' ? child.trace.childSessionId : '';
     const childAgentId = child.agentId || '';

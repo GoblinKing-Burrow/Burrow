@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+import { createChatInputRunner } from '../src/chat-input-runner.mjs';
+import { createChatInputService } from '../src/chat-input-service.mjs';
+import { createCompletionEventSettings } from '../src/completion-event-settings.mjs';
+import { createCompletionEventRunner } from '../src/completion-event-runner.mjs';
+import { createCompletionEventRoutes } from './ui/completion-event-routes.mjs';
 import { createDreamMemoryPreviewService } from '../src/dream-memory-preview.mjs';
 import { readDreamPromotion, saveDreamPromotion } from '../src/dream-promotion-settings.mjs';
 import { isInternalContextSession } from '../src/model-context-boundary.mjs';
@@ -43,6 +48,9 @@ import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypt
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inspectSessionContext, inspectSessionContextStatus } from '../src/context-engine.mjs';
+import { runSessionCompression } from '../src/session-compression.mjs';
+import { conversationAuthority } from '../src/conversation-authority.mjs';
+import { createTraceLogger } from '../src/trace-logger.mjs';
 import { activeConversationLimits } from '../src/context-preparation.mjs';
 import { beginRuntimeSessionExecutionSupersession, chatTurnInputFromBody, createChatTurnRunId, finishRuntimeSessionExecutionSupersession, runChatTurnFromBody, runChatTurnFromWorkbenchContinuation, chatTurnResponse, chatTurnProgressResponse, chatTurnErrorResponse, loadRuntimeConfig } from '../src/chat-turn-controller.mjs';
 import { resolveModelConfig, resolveRuntimeTracePath, resolveRuntimeTraceRoot } from '../src/config.mjs';
@@ -211,6 +219,13 @@ const otelRuntime = createReconfigurableOtelRuntime({ serviceVersion: releaseVer
 await otelRuntime.apply(await readOtelRuntimeConfig({ store: postgresApplication.stores.opentelemetry, metadata: postgresApplication.stores.metadata }));
 await runtimeOwnership.reconcileModJobs(postgresApplication.stores);
 const generationDispatcher = createModGenerationDispatcher({ store: postgresApplication.stores.generations, generateText: createModTextGenerator({ models: postgresApplication.stores.models }) });
+const chatInputRunner = createChatInputRunner({ store: postgresApplication.stores.chatInputs, stores: postgresApplication.stores,
+  resolveAgentRuntime, rootDir: projectRoot, registerActiveRun: registerRuntimeActiveRun, telemetry: otelRuntime,
+  requestRecovery: () => recoveryContinuationScheduler?.wake() || Promise.resolve(),
+  admitMain: (job, operation, signal) => serializeSessionChat({ ...job, operation, signal }),
+});
+const chatInputs = createChatInputService({ stores: postgresApplication.stores, activeRuns: activeChatRuns, runner: chatInputRunner, resolveAgentRuntime });
+const completionEventRunner = createCompletionEventRunner({ store: postgresApplication.stores.completionEvents, stores: postgresApplication.stores, resolveAgentRuntime, rootDir: projectRoot, registerActiveRun: registerRuntimeActiveRun, telemetry: otelRuntime });
 const externalTurnDispatcher = createModExternalTurnDispatcher({ store: postgresApplication.stores.externalTurns, stores: postgresApplication.stores, resolveAgentRuntime, rootDir: projectRoot, registerActiveRun: registerRuntimeActiveRun, telemetry: otelRuntime });
 async function applyOtelConfigurationToNodeGoblins() {
   const configuration = otelRuntime.remoteConfiguration();
@@ -424,7 +439,7 @@ function updateContextUsageHighWater(previous, usage) {
 function registerRuntimeActiveRun(options) {
   const lifecycle = registerActiveAgentRun(activeChatRuns, options);
   lifecycle.cancellationGraceMs = RUN_CANCELLATION_GRACE_MS;
-  lifecycle.onCancellationDeadline = () => retireCancelledRun(lifecycle.record);
+  lifecycle.onCancellationDeadline = options.lane === 'side_question' ? null : () => retireCancelledRun(lifecycle.record);
   return lifecycle;
 }
 
@@ -836,7 +851,7 @@ function normalizeUiAuthRecord(record = {}) {
       insecureCookies: basic.insecureCookies === true,
     },
     oidc: {
-      issuer: String(record.oidc?.issuer || '').trim().replace(/\/+$/, ''),
+      issuer: String(record.oidc?.issuer || '').trim(),
       clientId: String(record.oidc?.clientId || '').trim(),
       clientSecret: String(record.oidc?.clientSecret || '').trim(),
       clientSecretConfigured: Boolean(record.oidc?.clientSecretConfigured),
@@ -1750,6 +1765,12 @@ function writeNdjson(res, event) {
 // in trace evidence; the progress stream exposes only operational state.
 function publicChatProgress(record = {}) {
   const payload = record.payload || {};
+  if (['context-compaction-started', 'context-compaction-completed', 'context-compaction-failed'].includes(record.type)) {
+    return { type: record.type.replace('context-compaction-', 'context.compaction.'), data: {
+      reason: payload.reason || null, compressed: payload.compressed === true,
+      ...(payload.error ? { error: String(payload.error).slice(0, 1000) } : {}),
+    } };
+  }
   if (record.type === 'router' && payload.stage === 'ask-chat-turn') {
     return { type: 'route.decided', data: { routeKind: payload.route?.kind || null, sessionKind: payload.runtimeTurn?.envelope?.route?.kind || null } };
   }
@@ -1959,7 +1980,7 @@ function compactChatTurn(turn = {}) {
     const attachments = turn.metadata.attachments.map(compactAttachmentMetadata).filter(Boolean);
     if (attachments.length) metadata.attachments = attachments;
   }
-  for (const key of ['fromAgentName', 'fromAgentId', 'messageMode', 'direction']) {
+  for (const key of ['fromAgentName', 'fromAgentId', 'messageMode', 'direction', 'chatInput', 'lane', 'steering']) {
     if (turn.metadata?.[key] !== undefined) metadata[key] = turn.metadata[key];
   }
   return {
@@ -1985,7 +2006,8 @@ async function sessionDetail(id, { rootDir, agentId = null } = {}) {
     postgresApplication.stores.conversations.projection({ agentId, sessionId: id, visibility: 'activity', limit: 20 }),
   ]);
   const chatTurns = chatEntries.filter(isChatMessage);
-  const turns = [...chatTurns, ...activityTurns].sort((a,b) => String(a.ts || '').localeCompare(String(b.ts || ''))).map(compactChatTurn);
+  const visibleTurns = chatEntries.filter(entry => isChatMessage(entry) || Boolean(entry.metadata?.chatInput && entry.role));
+  const turns = [...visibleTurns, ...activityTurns].sort((a,b) => String(a.ts || '').localeCompare(String(b.ts || ''))).map(compactChatTurn);
   return { id, turnCount: metadata.turnCount ?? turns.length, metadata, summary: metadata.summary || summarizeSessionTurns(chatTurns, { maxChars: 2000 }), turns, activities: activityTurns.filter((turn) => turn.metadata?.toolActivity).map((turn) => ({ ...turn.metadata.toolActivity, runId: turn.runId || null })) };
 }
 
@@ -2619,11 +2641,11 @@ function renderContextInspection({ inspection = {}, status = {}, agentRuntime, m
   ].join('\n\n');
 }
 
-async function handleChatCommand({ parsed, sessionId, agentRuntime } = {}) {
+async function handleChatCommand({ parsed, sessionId, agentRuntime, runId = null, onProgress = null } = {}) {
   if (parsed?.error) return { status: 400, response: chatCommandResponse({ command: null, sessionId, text: `Invalid command.\n\n${chatCommandHelpText()}`, receipt: { error: parsed.error }, ok: false }) };
   if (!parsed?.definition) return { status: 400, response: chatCommandResponse({ command: parsed?.command || null, sessionId, text: `Unknown command: /${parsed?.command || ''}\n\n${chatCommandHelpText()}`, receipt: { error: 'command_unknown' }, ok: false }) };
   if (parsed.args && !(parsed.command === 'context' && parsed.args === 'full')) return { status: 400, response: chatCommandResponse({ command: parsed.command, sessionId, text: `${parsed.definition.usage} does not accept arguments.`, receipt: { error: 'command_arguments_not_supported' }, ok: false }) };
-  if (parsed.command === 'help') return { status: 200, response: chatCommandResponse({ command: 'help', sessionId, text: chatCommandHelpText(), receipt: { available: ['help', 'context', 'status', 'new', 'stop'] } }) };
+  if (parsed.command === 'help') return { status: 200, response: chatCommandResponse({ command: 'help', sessionId, text: chatCommandHelpText(), receipt: { available: ['help', 'context', 'compact', 'status', 'new', 'stop'] } }) };
   if (parsed.command === 'new') {
     const resetBarrier = await beginSessionAdmissionsReset({ agentId: agentRuntime.agentId, sessionId });
     try {
@@ -2636,16 +2658,55 @@ async function handleChatCommand({ parsed, sessionId, agentRuntime } = {}) {
     } finally { finishSessionAdmissionsReset(resetBarrier); }
   }
   if (parsed.command === 'stop') {
-    const matchingRuns = [...activeChatRuns.values()].filter((run) => run.agentId === agentRuntime.agentId && run.sessionId === sessionId);
+    await postgresApplication.stores.chatInputs.holdSession({ agentId:agentRuntime.agentId, sessionId });
+    chatInputRunner.cancelSession({ agentId:agentRuntime.agentId, sessionId, mainOnly:true });
+    const matchingRuns = [...activeChatRuns.values()].filter((run) => run.agentId === agentRuntime.agentId && run.sessionId === sessionId && run.lane !== 'side_question');
     const active = matchingRuns.find((run) => !run.controller.signal.aborted) || matchingRuns.at(-1) || null;
     if (!active) return { status: 200, response: chatCommandResponse({ command: 'stop', sessionId, text: 'No active run in this session.', receipt: { status: 'idle' } }) };
     if (active.controller.signal.aborted) return { status: 200, response: chatCommandResponse({ command: 'stop', sessionId, text: `Run ${active.runId} is already cancelling.`, receipt: { status: 'cancelling', runId: active.runId, agentId: active.agentId, sessionId: active.sessionId, reason: active.reason || null } }) };
     const cancelled = await cancelChatRun(active.runId, { reason: 'stopped by /stop' }, agentRuntime);
     return { status: 200, response: chatCommandResponse({ command: 'stop', sessionId, text: `Stopped active run ${active.runId}.`, receipt: cancelled }) };
   }
+  if (parsed.command === 'compact') {
+    runId ||= createChatTurnRunId({ sessionId, prefix: 'compact' });
+    const lifecycle = { reason: 'manual', compressed: false };
+    await onProgress?.({ type: 'context.compaction.started', data: lifecycle });
+    let logger;
+    let receipt;
+    let text;
+    let ok = true;
+    try {
+      const runtime = await runtimeConfig(agentRuntime.agentId);
+      const traceRoot = resolveRuntimeTracePath({ ...runtime.runtimeState, agentId: agentRuntime.agentId, sessionId });
+      logger = createTraceLogger({ rootDir: traceRoot, runId, sessionId });
+      const result = await runSessionCompression({ rootDir: agentRuntime.agentWorkspaceRoot, sessionId, config: runtime.contextConfig, force: true, stores: postgresApplication.stores, agentId: agentRuntime.agentId, logger });
+      receipt = { reason: result.reason, compressed: Boolean(result.compressed) };
+      text = result.compressed ? 'Conversation context compacted. Original history remains archived.' : `No compaction performed: ${result.reason}.`;
+    } catch (error) {
+      receipt = { ...lifecycle, error: error?.message || String(error) };
+      text = `Compaction failed: ${receipt.error}`;
+      ok = false;
+    } finally {
+      await logger?.terminal?.();
+    }
+    // Append to the successor transcript after compaction, not the generation
+    // it may archive. Command feedback is visible history, never model input.
+    // Keep persistence outside the compression catch: a storage failure must
+    // not publish a terminal receipt claiming feedback was saved.
+    const authority = conversationAuthority({ store: postgresApplication.stores.conversations, agentId: agentRuntime.agentId });
+    for (const [role, content] of [['user', '/compact'], ['assistant', text]]) {
+      await authority.appendTurn({ sessionId, runId, role, content, visibility: 'chat', entersPrompt: false,
+        metadata: { command: 'compact', commandReceipt: receipt, ok } },
+      { idempotencyKey: `command:compact:${runId}:${role}` });
+    }
+    const response = chatCommandResponse({ command: 'compact', sessionId, text, receipt, ok });
+    response.result.runId = runId;
+    await onProgress?.({ type: ok ? 'context.compaction.completed' : 'context.compaction.failed', data: receipt });
+    return { status: ok ? 200 : 500, response };
+  }
   const runtime = await runtimeConfig(agentRuntime.agentId);
   const limits = activeConversationLimits({ modelConfig: runtime.modelConfig, contextConfig: runtime.contextConfig });
-  const matchingRuns = [...activeChatRuns.values()].filter((run) => run.agentId === agentRuntime.agentId && run.sessionId === sessionId);
+  const matchingRuns = [...activeChatRuns.values()].filter((run) => run.agentId === agentRuntime.agentId && run.sessionId === sessionId && run.lane !== 'side_question');
   const active = matchingRuns.find((run) => !run.controller.signal.aborted) || matchingRuns.at(-1) || null;
   const status = await inspectSessionContextStatus({ stores: postgresApplication.stores, agentId: agentRuntime.agentId, rootDir: projectRoot, dataRoot: agentRuntime.agentWorkspaceRoot, sessionId, limits, contextConfig: runtime.contextConfig, contextWindow: runtime.modelConfig?.contextWindow, contextTokens: runtime.modelConfig?.contextTokens, liveContext: active?.contextUsage || null });
   const context = status.context || {};
@@ -2678,6 +2739,11 @@ async function handleChat(req, res) {
   if (['stop', 'new', 'status'].includes(parseChatCommand(body.message)?.command)) {
     return handleSerializedChat({ req, res, body, agentRuntime, sessionId });
   }
+  const busy = [...activeChatRuns.values()].some(run => run.agentId === agentRuntime.agentId && run.sessionId === sessionId && run.lane !== 'side_question');
+  const pending = await postgresApplication.stores.chatInputs.list({ agentId: agentRuntime.agentId, sessionId });
+  if (busy || pending.inputs.some(input => input.intent === 'queue_next' && ['queued','held','running'].includes(input.status))) {
+    return sendJson(res, 409, { ok:false, error:'chat_session_busy_use_explicit_intent' });
+  }
   const admission = new AbortController();
   const disconnected = () => admission.abort(new Error('chat_admission_disconnected'));
   res.once('close', disconnected);
@@ -2685,7 +2751,9 @@ async function handleChat(req, res) {
   if (req.aborted || res.destroyed) disconnected();
   latencyTiming.httpQueuedMs = performance.now();
   try {
-    return await serializeSessionChat({ agentId: agentRuntime.agentId, sessionId, signal: admission.signal, operation: () => {
+    return await serializeSessionChat({ agentId: agentRuntime.agentId, sessionId, signal: admission.signal, operation: async () => {
+      const waiting = await postgresApplication.stores.chatInputs.list({ agentId: agentRuntime.agentId, sessionId });
+      if (waiting.inputs.some(input => input.intent === 'queue_next' && ['queued','held','running'].includes(input.status))) return sendJson(res,409,{ok:false,error:'chat_session_busy_use_explicit_intent'});
       latencyTiming.httpAdmittedMs = performance.now();
       // After admission preserve the existing detached-run policy.
       res.removeListener('close', disconnected);
@@ -2697,6 +2765,7 @@ async function handleChat(req, res) {
   } finally {
     res.removeListener('close', disconnected);
     req.removeListener('aborted', disconnected);
+    void chatInputRunner.wake().catch(() => {});
   }
 }
 
@@ -2705,10 +2774,12 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
   const streaming = acceptsNdjson(req);
   const command = parseChatCommand(body.message);
   if (command) {
-    const result = await handleChatCommand({ parsed: command, sessionId, agentRuntime });
+    const runId = body.runId ? String(body.runId) : createChatTurnRunId({ sessionId, prefix: 'command' });
+    // Compaction can take time: open the command stream before doing any work.
+    if (streaming) beginNdjson(res);
+    const onProgress = streaming ? (event) => writeNdjson(res, { ...event, runId, sessionId, ts: new Date().toISOString() }) : null;
+    const result = await handleChatCommand({ parsed: command, sessionId, agentRuntime, runId, onProgress });
     if (streaming) {
-      const runId = body.runId ? String(body.runId) : createChatTurnRunId({ sessionId, prefix: 'command' });
-      beginNdjson(res);
       writeNdjson(res, { type: result.response.ok ? 'run.completed' : 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: { ...result.response, result: { ...result.response.result, runId } } } });
       return res.end();
     }
@@ -2817,6 +2888,13 @@ async function cancelGroupChannelRun(channelId, runId, body = {}) {
 }
 
 async function cancelChatRun(runId, body = {}, agentRuntime = null) {
+  const requestedAgentId = agentRuntime?.agentId || body.agentId;
+  const matches = [...activeChatRuns.values()].filter(run => run.runId===runId);
+  const record = requestedAgentId ? activeChatRuns.get(activeChatRunKey(requestedAgentId,runId)) : matches.length===1 ? matches[0] : null;
+  if (record && record.lane !== 'side_question') {
+    await postgresApplication.stores.chatInputs.holdSession(record);
+    chatInputRunner.cancelSession({ ...record, mainOnly: true });
+  }
   return cancelActiveChatRun(activeChatRuns, runId, { body, agentId: agentRuntime?.agentId || null });
 }
 
@@ -2828,6 +2906,9 @@ async function supersedeSessionRuns({ agentId, sessionId, reason = 'superseded b
     const result = cancelActiveChatRun(activeChatRuns, run.runId, { body: { reason }, agentId });
     if (result.ok) superseded.push(...result.cancelledRuns);
     else if (run.controller.signal.aborted) superseded.push({ runId: run.runId, agentId: run.agentId, sessionId: run.sessionId });
+    // Reset supersedes this display/dispatch identity. Durable reset fences its
+    // old writes; an abort-ignoring provider must not block the fresh generation.
+    activeChatRuns.delete(activeChatRunKey(run.agentId,run.runId));
   }
   return superseded.filter((run, index, all) => all.findIndex((candidate) => candidate.agentId === run.agentId && candidate.runId === run.runId) === index);
 }
@@ -2836,7 +2917,12 @@ async function beginSessionAdmissionsReset({ agentId, sessionId } = {}) {
   const agentRuntime = await resolveAgentRuntime(agentId);
   const http = beginSessionAdmissionSupersession(sessionChatQueues, sessionChatQueueKey(agentId, sessionId));
   try {
-    return { http, runtime: beginRuntimeSessionExecutionSupersession({ rootDir: projectRoot, sessionId, agentRuntime }) };
+    const runtime = beginRuntimeSessionExecutionSupersession({ rootDir: projectRoot, sessionId, agentRuntime });
+    try {
+      await postgresApplication.stores.chatInputs.cancelGeneration({ agentId, sessionId });
+      chatInputRunner.cancelSession({ agentId, sessionId });
+      return { http, runtime };
+    } catch(error) { finishRuntimeSessionExecutionSupersession(runtime); throw error; }
   } catch (error) {
     finishSessionAdmissionSupersession(http);
     throw error;
@@ -2849,16 +2935,23 @@ function finishSessionAdmissionsReset(tokens = {}) {
 }
 
 async function steerChatRun(runId, body, agentRuntime) {
+  if (!agentRuntime) throw Object.assign(new Error('agent_id_required'),{statusCode:400});
   const input = chatTurnInputFromBody({ body });
   const identity = { agentId: agentRuntime.agentId, sessionId: input.sessionId, runId };
   const record = activeChatRuns.get(activeChatRunKey(identity.agentId, runId));
+  if (record && (record.sessionId !== input.sessionId || record.lane === 'side_question')) throw Object.assign(new Error('chat_run_not_found'),{statusCode:404});
   // Stop closes acceptance even while the provider is unwinding.
   if (!record || record.controller.signal.aborted) await postgresApplication.stores.steering.boundary(identity, { finish: true });
-  const steering = await postgresApplication.stores.steering.submit({ ...identity, idempotencyKey: body.idempotencyKey, message: input.message, attachments: input.args.attachments || [] });
+  if (body.promotedFrom) {
+    const side = await postgresApplication.stores.chatInputs.get({ ...identity, id: body.promotedFrom });
+    if (!side || side.intent !== 'side_question' || side.status !== 'succeeded') throw Object.assign(new Error('chat_input_promotion_source_invalid'),{statusCode:400});
+  }
+  const steering = await postgresApplication.stores.steering.submit({ ...identity, idempotencyKey: body.idempotencyKey, message: input.message, attachments: input.args.attachments || [], generation: body.generation, promotedFrom: body.promotedFrom });
   return { ok: true, runId, sessionId: identity.sessionId, steering };
 }
 
 async function listChatSteering(runId, body, agentRuntime) {
+  if (!agentRuntime) throw Object.assign(new Error('agent_id_required'),{statusCode:400});
   const identity = { agentId: agentRuntime.agentId, sessionId: String(body.sessionId || 'default'), runId };
   if (!activeChatRuns.has(activeChatRunKey(identity.agentId, runId))) {
     try { await postgresApplication.stores.steering.boundary(identity, { finish: true }); }
@@ -2870,6 +2963,7 @@ async function listChatSteering(runId, body, agentRuntime) {
 async function currentActiveChatRunSummaries({ agentId = null, sessionId = null } = {}) {
   const runs = activeChatRunSummaries(activeChatRuns, { agentId, sessionId });
   for (const run of runs) {
+    if (run.lane === 'side_question') { run.steering = []; continue; }
     try { run.steering = await postgresApplication.stores.steering.list(run); }
     catch (error) { if (error.statusCode !== 404) throw error; run.steering = []; }
   }
@@ -2896,6 +2990,8 @@ async function currentActiveChatRunSummaries({ agentId = null, sessionId = null 
 }
 
 const exportRoute = createExportRoutes({ readJsonBody, sendJson, exportCatalog, normalizeImportRequest, decodeExport, buildExport, exportSnapshot, importPreview, applyImport });
+const completionEventReceiverSettings = createCompletionEventSettings({ store: postgresApplication.stores.completionEventSettings });
+const completionEventRoute = createCompletionEventRoutes({ store: postgresApplication.stores.completionEvents, readJsonBody, sendJson, resolveAgentRuntime, wake: () => completionEventRunner.wake(), getWebhookSecret: () => completionEventReceiverSettings.secret(), receiverSettings: completionEventReceiverSettings });
 const taskBoardRoute = createTaskBoardRoutes({ readJsonBody, sendJson, validateBoundaryBody, withTaskBoard, taskStatuses: TASK_STATUSES, taskPriorities: TASK_PRIORITIES, executeBoardTask });
 const workbenchRoute = createWorkbenchRoutes({ readJsonBody, sendJson, selectedAgentRuntime, dataRootForAgent, listWorkItemSummaries, createWorkbenchItem, readWorkItem, runWorkbenchItemStep, continueWorkbenchItem, archiveWorkbenchItem, workbenchPlan, workbenchRun });
 const forgeStoreFactory = () => postgresApplication.stores.forge;
@@ -2927,7 +3023,7 @@ const generalSettingsRoute = createGeneralSettingsRoutes({ readJsonBody, sendJso
 const observabilityRoute = createObservabilityRoutes({ providerPoolMetrics: () => postgresApplication.stores.models.providerPoolMetrics.summary(), readJsonBody, sendJson, validateBoundaryBody, runtimeStatus, runtimeMetrics, anthropicOauthUsage, openaiOauthUsage, openaiResetCredits, consumeOpenaiResetCredit, currentActiveChatRunSummaries, selectedAgentRuntime, resolveAgentRuntime, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, listTraces, runtimeConfig, traceRootForRun, conversationStore: postgresApplication.stores.conversations, summarizeTrace, authorityExplanationFromTraceSummary, projectRoot });
 const scheduledChannelRoute = createScheduledChannelRoutes({ readJsonBody, sendJson, validateBoundaryBody, withScheduledJobs, scheduler, listGroupChannels, createGroupChannel, readGroupChannelTurns, groupChannelRuns, startGroupChannelMessage, cancelGroupChannelRun, runtimeDataRoot, conversationStore: postgresApplication.stores.conversations });
 const authRoute = createAuthRoutes({ runtimeConfig, oidcLoginUrl, setOidcStateCookie, completeOidcCallback, sendOidcSessionCookie, clearOidcCookies, oidcCookieClearHeader, oidcSessionFromRequest, sendJson });
-const chatRoute = createChatRoutes({ handleChat, readJsonBody, sendJson, selectedAgentRuntime, cancelChatRun, steerChatRun, listChatSteering });
+const chatRoute = createChatRoutes({ handleChat, readJsonBody, sendJson, selectedAgentRuntime, cancelChatRun, steerChatRun, listChatSteering, chatInputs });
 const modsRuntimeRoot = process.env.BURROW_RUNTIME_ROOT || process.env.BURROW_DATA_ROOT || '/mnt/local/burrow';
 const modAuthority = createModAuthority({ repositoryFactory: postgresApplication.modDistributionRepositoryFactory });
 await modAuthority.ready;
@@ -3141,7 +3237,9 @@ async function handleRequest(req, res) {
     if (await applyApiCors(req, res, url)) return;
     if (await authRoute({ req, res, url, origin })) return;
     if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/api/health')) return sendJson(res, 200, { ok: true, runtime: 'burrow', version: releaseVersion, buildIdentity: healthBuildIdentity, ...(healthReleaseProvenance ? { releaseProvenance: healthReleaseProvenance } : {}), ...(process.env.BURROW_SMOKE_TOKEN && req.headers['x-burrow-smoke-token'] === process.env.BURROW_SMOKE_TOKEN ? { smokeToken: process.env.BURROW_SMOKE_TOKEN } : {}) });
+    if (await completionEventRoute({ req, res, url, webhookOnly: true })) return;
     if (!(await authorizeRequest(req, res, url))) return;
+    if (await completionEventRoute({ req, res, url })) return;
     if (req.method === 'GET' && url.pathname === '/api/auth/validate') {
       const runtime = await runtimeConfig();
       const mode = runtime?.ui?.authMode || 'none';
@@ -3318,7 +3416,7 @@ const closeRuntimeResources = createCoordinatedShutdown({
     httpClosePromise = new Promise(resolve => server.close(() => resolve()));
     server.closeIdleConnections?.();
   },
-  producers: () => [skillSyncProducer, managedSkillSynchronizer, modDistributionProducer, externalTurnDispatcher, generationDispatcher, requestLifecycle, startupLifecycle, scheduledJobScheduler, dreamCycleScheduler, tiddleScheduler, retentionScheduler, installStagingCleanupScheduler, recoveryContinuationScheduler, versionRefreshProducer],
+  producers: () => [skillSyncProducer, managedSkillSynchronizer, modDistributionProducer, completionEventRunner, chatInputRunner, externalTurnDispatcher, generationDispatcher, requestLifecycle, startupLifecycle, scheduledJobScheduler, dreamCycleScheduler, tiddleScheduler, retentionScheduler, installStagingCleanupScheduler, recoveryContinuationScheduler, versionRefreshProducer],
   beforeDrain: async () => {
     try {
       await recordActiveRunInterruptions({ stores: postgresApplication.stores, activeRuns: activeChatRuns, resolveAgentRuntime, reason: shutdownReason });
@@ -3385,6 +3483,9 @@ server.listen(port, host, () => {
     void skillGitSync.start().catch(error => serverLogger.event('skill_sync_startup_failed',{error:'skill_sync_failed'}));
     const store = postgresApplication.stores.scheduledJobs;
     try { await store.markMissedRuns(); await store.markMissedSchedules({ activeOwnerModIds: loadedMods.filter((mod) => mod.status === 'loaded').map((mod) => mod.id) }); } finally { /* Shared application store remains open. */ }
+    if (shuttingDown) return;
+    await completionEventRunner.start();
+    await chatInputRunner.start();
     if (shuttingDown) return;
     await scheduler().start();
     if (shuttingDown) return;

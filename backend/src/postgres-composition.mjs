@@ -1,4 +1,7 @@
+import { PostgresChatInputStore } from './postgres-chat-input-store.mjs';
+import { PostgresCompletionEventSettingsStore } from './postgres-completion-event-settings-store.mjs';
 import { attemptResourceClosers } from './background-lifecycle.mjs';
+import { PostgresCompletionEventStore } from './postgres-completion-event-store.mjs';
 import { PostgresSkillSources } from './postgres-skill-sources.mjs';
 import { PostgresLiveRunSteering } from './postgres-live-run-steering.mjs';
 import { startOperatorInstantBackfill } from './postgres-operator-backfill.mjs';
@@ -90,6 +93,9 @@ export async function createPostgresApplication({
     uiAuthSecrets: new PostgresUiAuthSecretStore({ ...common, key: encryptionKey, ...(clock ? { clock } : {}) }),
     opentelemetry: new PostgresOtelSettingsStore({ ...common, key: encryptionKey, ...(clock ? { clock } : {}) }),
     metadata: new PostgresSettingsMetadataStore({ ...common, ...(clock ? { clock } : {}) }),
+    chatInputs: new PostgresChatInputStore({ ...common, ...(clock ? { clock } : {}) }),
+    completionEvents: new PostgresCompletionEventStore(common),
+    completionEventSettings: new PostgresCompletionEventSettingsStore({ ...common, key: encryptionKey, ...(clock ? { clock } : {}) }),
     conversations: new PostgresSessionStore({ ...common, ...(clock ? { clock } : {}) }),
     };
     stores.brainEmbeddings = new PostgresBrainEmbeddings({ pool: sharedPool, models: stores.models });
@@ -111,7 +117,9 @@ export async function createPostgresApplication({
       closePromise ||= attemptResourceClosers([
         () => operatorBackfill.close(),
         () => stores.brainEmbeddings.close(),
+        () => stores.chatInputs.close(),
         () => stores.conversations.close(),
+        () => stores.completionEvents.close(),
         ...(ownedPool ? [() => closePostgresPool(sharedPool)] : []),
       ]);
       return closePromise;

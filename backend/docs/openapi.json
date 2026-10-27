@@ -52,6 +52,10 @@
     },
     {
       "name": "Brains"
+    },
+    {
+      "name": "Completion events",
+      "description": "Operator-owned GitHub workflow_run completion watches and retained event execution receipts."
     }
   ],
   "paths": {
@@ -254,7 +258,7 @@
         ],
         "summary": "Run one chat turn",
         "operationId": "runChat",
-        "description": "May return a normal JSON response or an NDJSON stream depending on request headers and runtime behavior. The streaming event contract is intentionally separate from this REST document.",
+        "description": "May return a normal JSON response or an NDJSON stream depending on request headers and runtime behavior. The streaming event contract is intentionally separate from this REST document. When the main session is busy or has queued/held/running queue_next inputs, normal admission returns 409 chat_session_busy_use_explicit_intent; choose an explicit busy-chat intent.",
         "requestBody": {
           "$ref": "#/components/requestBodies/ChatRequest"
         },
@@ -266,6 +270,185 @@
             "$ref": "#/components/responses/ErrorResponse"
           },
           "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/chat/inputs": {
+      "get": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "List current-generation chat inputs",
+        "operationId": "listChatInputs",
+        "description": "Returns all durable inputs in accepted order for the selected agent/session and the current reset generation. Only side snapshot metadata is public; captured transcript and profile content are not returned. See docs/busy-chat-inputs.md.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AgentId"
+          },
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ChatInputListResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Submit an explicit busy-chat input",
+        "operationId": "submitChatInput",
+        "description": "Durably accept queue_next or side_question without waiting for execution. A side question targets an exact active main run and captures an immutable snapshot. Retry the same normalized request with the same key; do not automatically switch intent. See docs/busy-chat-inputs.md.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatInputRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "$ref": "#/components/responses/ChatInputResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "413": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/chat/inputs/{inputId}/cancel": {
+      "post": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Cancel a durable chat input",
+        "operationId": "cancelChatInput",
+        "description": "Cancel queued or held input, or request cancellation of running input. Cancelling a running queue_next input holds the whole main queue; cancelling a side question does not. A terminal input is returned unchanged.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PathInputId"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatInputActionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ChatInputResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/chat/inputs/{inputId}/resume": {
+      "post": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "Resume a held main queue",
+        "operationId": "resumeChatInput",
+        "description": "Requires an input currently held in the selected session and generation; clears the session hold and resumes all held queue_next inputs in FIFO order. Does not restart a cancelled input.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PathInputId"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatInputActionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ChatInputResumeResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "409": {
             "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {
@@ -327,7 +510,8 @@
           "404": {
             "$ref": "#/components/responses/ErrorResponse"
           }
-        }
+        },
+        "description": "Supplying the exact agentId of an active main run stops that run and holds its session main queue, including future queue_next submissions, until explicitly resumed. Omitting agentId uses legacy unique-run lookup but does not establish the queue hold. Stopping a side question does not hold the main queue."
       }
     },
     "/api/sessions": {
@@ -1359,7 +1543,7 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Page size (1\u2013200, default 100).",
+            "description": "Page size (1–200, default 100).",
             "schema": {
               "type": "integer",
               "minimum": 1,
@@ -6348,7 +6532,7 @@
         ],
         "summary": "Append user steering to an existing run",
         "operationId": "steerChatRun",
-        "description": "Append-only steering is consumed at the next model boundary of the same run. A terminal race retains follow_up input without starting a run. See docs/live-run-steering.md.",
+        "description": "Append-only steering is consumed at the next model boundary of the same main run. A terminal race retains follow_up input without starting or restarting a run. Optional generation fences stale state; optional promotedFrom links an explicitly edited instruction to a succeeded side question in the same agent/session/generation. See docs/live-run-steering.md.",
         "parameters": [
           {
             "$ref": "#/components/parameters/PathRunId"
@@ -6381,12 +6565,14 @@
               "schema": {
                 "type": "object",
                 "required": [
-                  "message",
+                  "agentId",
                   "idempotencyKey"
                 ],
                 "properties": {
                   "agentId": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Explicit agent ID for steering; unlike busy-chat inputs this route requires it."
                   },
                   "sessionId": {
                     "type": "string",
@@ -6402,12 +6588,23 @@
                   "attachments": {
                     "type": "array",
                     "items": {
-                      "type": "object",
-                      "additionalProperties": true
+                      "$ref": "#/components/schemas/ChatAttachment"
                     }
+                  },
+                  "generation": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "Session reset generation. Optional for compatibility; clients should send the generation returned by GET to fence stale actions."
+                  },
+                  "promotedFrom": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Optional source side-question input ID; send the edited instruction explicitly in message/attachments."
                   }
                 },
-                "additionalProperties": false
+                "additionalProperties": false,
+                "description": "Supply a nonblank message or at least one normalized attachment. Steering is explicit and never falls back to a new or queued run."
               }
             }
           }
@@ -6427,7 +6624,14 @@
             "$ref": "#/components/parameters/PathRunId"
           },
           {
-            "$ref": "#/components/parameters/AgentId"
+            "name": "agentId",
+            "in": "query",
+            "required": true,
+            "description": "Explicit agent ID for the selected run.",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
           },
           {
             "$ref": "#/components/parameters/SessionId"
@@ -7665,6 +7869,260 @@
           }
         }
       }
+    },
+    "/api/events/github": {
+      "post": {
+        "tags": [
+          "Completion events"
+        ],
+        "summary": "Receive signed GitHub workflow completion webhook",
+        "operationId": "receiveGithubCompletionWebhook",
+        "description": "Independent of normal UI auth. Requires an effective secret configured in Settings or through the optional higher-priority BURROW_GITHUB_WEBHOOK_SECRET environment override and HMAC-SHA256 of the exact raw body in X-Hub-Signature-256; 256 KiB maximum raw body. X-GitHub-Event: ping returns 200 after signature and JSON validation; non-workflow_run or non-completed actions return 202 with zero events. Completed workflow_run requires the fields in GithubWorkflowCompletedPayload, including consistent repository/workflow identities, exact GitHub URL and valid timestamp. Matching is by enabled watch repository + exact workflow name; each run ID + attempt + watch is stored once. A 202 returns only per-watch {id, accepted} receipts plus accepted/duplicates counts: durable acceptance, not execution success. Full retained event rows are available only from normally UI-authorized GET /api/events. See docs/event-triggered-work.md.",
+        "security": [
+          {
+            "GithubWebhookSignature": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-GitHub-Event",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "GitHub event kind (workflow_run or ping); other kinds receive 202 with no events after signature verification."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Raw GitHub webhook JSON; for completed workflow_run deliveries the GithubWorkflowCompletedPayload schema describes required fields. Signature covers raw bytes before parsing.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/GithubWorkflowCompletedPayload"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "Signed ping and ignored GitHub event/action deliveries may have other JSON object shapes."
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CompletionOkResponse"
+          },
+          "202": {
+            "$ref": "#/components/responses/GithubWebhookAcceptResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "413": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "503": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/events/watches": {
+      "get": {
+        "tags": [
+          "Completion events"
+        ],
+        "summary": "List operator-owned completion watches",
+        "operationId": "listCompletionWatches",
+        "description": "Uses normal UI authorization (unlike webhook ingestion).",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CompletionWatchListResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Completion events"
+        ],
+        "summary": "Create or update an agent workflow watch",
+        "operationId": "saveCompletionWatch",
+        "description": "Uses normal UI authorization. Supply a watch UUID to update; omit for a new watch. The agent must exist and be enabled. Exact repository/workflow names must match the webhook. A dedicated per-agent ci-releases session is the default; instruction is the operator-authored authority, not GitHub content.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompletionWatchInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CompletionWatchResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/events/watches/{id}": {
+      "delete": {
+        "tags": [
+          "Completion events"
+        ],
+        "summary": "Delete a completion watch",
+        "operationId": "deleteCompletionWatch",
+        "description": "Uses normal UI authorization; previous event snapshots remain retained after deletion.",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CompletionOkResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/events": {
+      "get": {
+        "tags": [
+          "Completion events"
+        ],
+        "summary": "List retained completion events",
+        "operationId": "listCompletionEvents",
+        "description": "Uses normal UI authorization. Lists newest events first with status and retained run/trace fields. No automatic replay of interrupted events.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "agentId",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+            },
+            "description": "Optional exact agent ID filter."
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 50
+            },
+            "description": "Maximum recent events."
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CompletionEventListResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/events/settings": {
+      "get": {
+        "tags": [
+          "Completion events"
+        ],
+        "summary": "Read webhook receiver settings",
+        "operationId": "getCompletionEventSettings",
+        "description": "Normally UI-authorized. Settings apply to signature verification on each request without a restart. The optional environment secret overrides the stored secret; changing the service environment still requires a process restart. Readiness is local signature-verification readiness, not proof of public connectivity or agent handling. No plaintext secret is returned.",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CompletionEventSettingsResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Completion events"
+        ],
+        "summary": "Patch webhook receiver settings",
+        "operationId": "saveCompletionEventSettings",
+        "description": "Normally UI-authorized. Settings apply to signature verification on each request without a restart. The optional environment secret overrides the stored secret; changing the service environment still requires a process restart. Readiness is local signature-verification readiness, not proof of public connectivity or agent handling. No plaintext secret is returned. Omitted fields are preserved. Invalid patches return completion_event_invalid_settings.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompletionEventSettingsPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CompletionEventSettingsResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -7873,6 +8331,16 @@
         "required": true,
         "schema": {
           "type": "string"
+        }
+      },
+      "PathInputId": {
+        "name": "inputId",
+        "in": "path",
+        "required": true,
+        "description": "Durable chat input UUID in the selected agent/session generation.",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
         }
       }
     },
@@ -8875,6 +9343,96 @@
             }
           }
         }
+      },
+      "CompletionWatchListResponse": {
+        "description": "Configured completion watches.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CompletionWatchListResponse"
+            }
+          }
+        }
+      },
+      "CompletionWatchResponse": {
+        "description": "Created or updated completion watch.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CompletionWatchResponse"
+            }
+          }
+        }
+      },
+      "CompletionEventListResponse": {
+        "description": "Recent completion events, newest first.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CompletionEventListResponse"
+            }
+          }
+        }
+      },
+      "GithubWebhookAcceptResponse": {
+        "description": "Valid signed completion delivery durably accepted or deduplicated. events contains only {id, accepted} receipts, never full event rows. Processing continues asynchronously; no model turn is awaited. Unhandled event types/actions return empty events.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/GithubWebhookAcceptResponse"
+            }
+          }
+        }
+      },
+      "CompletionOkResponse": {
+        "description": "Operation completed.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CompletionOkResponse"
+            }
+          }
+        }
+      },
+      "CompletionEventSettingsResponse": {
+        "description": "Receiver settings without secret plaintext.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CompletionEventSettingsResponse"
+            }
+          }
+        }
+      },
+      "ChatInputResponse": {
+        "description": "Durable input accepted or cancellation observed. Acceptance is not completion.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ChatInputResponse"
+            }
+          }
+        }
+      },
+      "ChatInputListResponse": {
+        "description": "Current-generation public input projections; raw snapshot and profile contents are excluded.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ChatInputListResponse"
+            }
+          }
+        }
+      },
+      "ChatInputResumeResponse": {
+        "description": "Session queue hold released and held inputs resumed.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ChatInputResumeResponse"
+            }
+          }
+        }
       }
     },
     "schemas": {
@@ -9764,7 +10322,64 @@
             "type": "array",
             "items": {
               "type": "object",
-              "additionalProperties": true
+              "additionalProperties": true,
+              "properties": {
+                "runId": {
+                  "type": "string"
+                },
+                "agentId": {
+                  "type": "string"
+                },
+                "sessionId": {
+                  "type": "string"
+                },
+                "lane": {
+                  "type": "string",
+                  "enum": [
+                    "main",
+                    "side_question"
+                  ],
+                  "description": "Execution lane, independent of the source field."
+                },
+                "inputId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "description": "Present for a run originating from a durable chat input."
+                },
+                "source": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Origin of the run, such as queue_next, side_question, or another registered run source."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "running",
+                    "cancelling"
+                  ]
+                },
+                "phase": {
+                  "type": "string"
+                },
+                "startedAt": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "steeringReady": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "runId",
+                "agentId",
+                "sessionId",
+                "lane"
+              ]
             }
           }
         },
@@ -13854,6 +14469,1003 @@
           }
         },
         "additionalProperties": false
+      },
+      "CompletionWatchInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "repository",
+          "workflow",
+          "agentId",
+          "instruction"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional existing watch UUID to update; omitted creates a new watch."
+          },
+          "repository": {
+            "type": "string",
+            "maxLength": 255,
+            "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+            "example": "NightShaman/Burrow"
+          },
+          "workflow": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
+            "description": "GitHub workflow_run.name; exact case-sensitive match against the configured workflow name, not file path."
+          },
+          "agentId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+          },
+          "sessionId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
+            "default": "ci-releases",
+            "description": "Dedicated session for this agent and release watch; customize for independent work lanes."
+          },
+          "instruction": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 20000,
+            "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
+            "description": "Operator-authored standing instruction. Webhook payload fields are untrusted context, not new instructions."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "CompletionWatch": {
+        "type": "object",
+        "required": [
+          "id",
+          "repository",
+          "workflow",
+          "agentId",
+          "sessionId",
+          "instruction",
+          "enabled",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "workflow": {
+            "type": "string"
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "instruction": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CompletionWatchListResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "watches"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "watches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CompletionWatch"
+            }
+          }
+        }
+      },
+      "CompletionWatchResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "watch"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "watch": {
+            "$ref": "#/components/schemas/CompletionWatch"
+          }
+        }
+      },
+      "CompletionEvent": {
+        "type": "object",
+        "description": "Full retained event snapshot with agent/session authority captured when accepted. Returned by normally UI-authorized GET /api/events, never by the signed webhook acknowledgment.",
+        "required": [
+          "id",
+          "watchId",
+          "repository",
+          "workflow",
+          "runId",
+          "runAttempt",
+          "headSha",
+          "conclusion",
+          "url",
+          "completedAt",
+          "agentId",
+          "sessionId",
+          "instruction",
+          "status",
+          "ownerId",
+          "chatRunId",
+          "result",
+          "error",
+          "traceDir",
+          "createdAt",
+          "startedAt",
+          "finishedAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "watchId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "workflow": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*$",
+            "maxLength": 128
+          },
+          "runAttempt": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "headSha": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{40,64}$"
+          },
+          "conclusion": {
+            "type": "string",
+            "enum": [
+              "success",
+              "failure",
+              "neutral",
+              "cancelled",
+              "skipped",
+              "timed_out",
+              "action_required",
+              "startup_failure",
+              "stale"
+            ]
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "GitHub Actions run URL validated against repository and run ID."
+          },
+          "completedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "instruction": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "succeeded",
+              "failed",
+              "interrupted"
+            ],
+            "description": "pending/running are outstanding; succeeded/failed are terminal; interrupted is retained for reconciliation, not blindly replayed. Webhook receipt accepted=true means only durable acceptance, not handled."
+          },
+          "ownerId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "chatRunId": {
+            "type": "string"
+          },
+          "result": {
+            "description": "Runtime result JSON (including null) captured when handled."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "traceDir": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "finishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      },
+      "CompletionEventReceipt": {
+        "type": "object",
+        "description": "Minimal per-watch webhook acknowledgment; no retained event snapshot, watch instruction, agent/session identifiers or run/trace fields are exposed by the webhook.",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "accepted"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Retained event ID."
+          },
+          "accepted": {
+            "type": "boolean",
+            "description": "True for newly accepted events; false for a previously accepted duplicate. Neither value proves execution."
+          }
+        }
+      },
+      "CompletionEventListResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "events"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CompletionEvent"
+            }
+          }
+        }
+      },
+      "GithubWorkflowCompletedPayload": {
+        "type": "object",
+        "description": "Relevant fields in GitHub workflow_run delivery. Other GitHub fields are accepted. A signed ping may instead contain a different JSON object.",
+        "required": [
+          "action",
+          "repository",
+          "workflow_run"
+        ],
+        "properties": {
+          "action": {
+            "const": "completed"
+          },
+          "repository": {
+            "type": "object",
+            "required": [
+              "full_name"
+            ],
+            "properties": {
+              "full_name": {
+                "type": "string",
+                "maxLength": 255,
+                "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+              }
+            },
+            "additionalProperties": true
+          },
+          "workflow": {
+            "type": "object",
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          },
+          "workflow_run": {
+            "type": "object",
+            "required": [
+              "id",
+              "status",
+              "name",
+              "run_attempt",
+              "head_sha",
+              "conclusion",
+              "html_url",
+              "updated_at"
+            ],
+            "properties": {
+              "id": {
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^[1-9][0-9]*$",
+                    "maxLength": 128
+                  }
+                ]
+              },
+              "status": {
+                "const": "completed"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255,
+                "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+              },
+              "run_attempt": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2147483647
+              },
+              "head_sha": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{40,64}$"
+              },
+              "conclusion": {
+                "type": "string",
+                "enum": [
+                  "success",
+                  "failure",
+                  "neutral",
+                  "cancelled",
+                  "skipped",
+                  "timed_out",
+                  "action_required",
+                  "startup_failure",
+                  "stale"
+                ]
+              },
+              "html_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Must exactly equal https://github.com/{repository.full_name}/actions/runs/{workflow_run.id}."
+              },
+              "updated_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "repository": {
+                "type": "object",
+                "properties": {
+                  "full_name": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": true
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "GithubWebhookAcceptResponse": {
+        "type": "object",
+        "description": "The webhook acknowledgment projects only id and accepted for each matching watch; full event rows require the normally UI-authorized GET /api/events route.",
+        "required": [
+          "ok",
+          "events",
+          "accepted",
+          "duplicates"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "events": {
+            "type": "array",
+            "description": "Minimal per-watch receipts only; never event snapshots.",
+            "items": {
+              "$ref": "#/components/schemas/CompletionEventReceipt"
+            }
+          },
+          "accepted": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Count newly accepted for enabled matching watches."
+          },
+          "duplicates": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Count of matching previously accepted watch/run/attempt snapshots."
+          }
+        }
+      },
+      "CompletionOkResponse": {
+        "type": "object",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        }
+      },
+      "CompletionEventSettingsPatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Partial update. No plaintext secret readback. Nonblank secret with clearSecret=true is invalid.",
+        "properties": {
+          "deliveryUrl": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Optional delivery URL metadata, trimmed on save; empty clears it. If nonempty, absolute http(s) URL with path exactly /api/events/github, without username, password, query or fragment. Does not change routing or prove reachability."
+          },
+          "secret": {
+            "type": "string",
+            "writeOnly": true,
+            "description": "At most 8192 UTF-8 bytes; no CR, LF or NUL. Blank or whitespace-only preserves the existing stored secret exactly; nonblank stores the exact provided bytes encrypted using the managed credentials key. Nonblank and clearSecret=true are rejected."
+          },
+          "clearSecret": {
+            "type": "boolean",
+            "description": "True explicitly clears only the stored secret, not any environment override."
+          }
+        }
+      },
+      "CompletionEventSettings": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "deliveryUrl",
+          "webhookPath",
+          "secretConfigured",
+          "storedSecretConfigured",
+          "secretSource",
+          "environmentOverride",
+          "ready",
+          "readiness"
+        ],
+        "properties": {
+          "deliveryUrl": {
+            "type": "string",
+            "description": "Optional configured delivery URL metadata; empty when unset."
+          },
+          "webhookPath": {
+            "type": "string",
+            "const": "/api/events/github"
+          },
+          "secretConfigured": {
+            "type": "boolean",
+            "description": "Whether an effective secret is configured, including an unavailable stored secret."
+          },
+          "storedSecretConfigured": {
+            "type": "boolean",
+            "description": "Whether a stored secret is configured, even if unavailable."
+          },
+          "secretSource": {
+            "type": "string",
+            "enum": [
+              "settings",
+              "environment",
+              "none"
+            ]
+          },
+          "environmentOverride": {
+            "type": "boolean",
+            "description": "True when the optional nonempty environment secret takes precedence."
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "Local signature verification readiness only; not public reachability or agent-handling proof."
+          },
+          "readiness": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "secret_missing",
+              "secret_unavailable"
+            ],
+            "description": "secret_unavailable means the stored secret cannot be decrypted (for example corrupt data or wrong key), unless an environment override is active. The webhook returns 503 when the effective secret is missing or unavailable."
+          }
+        }
+      },
+      "CompletionEventSettingsResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ok",
+          "settings"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "settings": {
+            "$ref": "#/components/schemas/CompletionEventSettings"
+          }
+        }
+      },
+      "ChatInputRequest": {
+        "type": "object",
+        "required": [
+          "intent",
+          "idempotencyKey"
+        ],
+        "description": "Supply a nonblank message or an inline attachment. A side question needs message text for its answer and an exact active main targetRunId. The client should send the current generation.",
+        "properties": {
+          "agentId": {
+            "type": "string",
+            "description": "Selected agent; omit to use the server-selected agent."
+          },
+          "sessionId": {
+            "type": "string",
+            "default": "default"
+          },
+          "intent": {
+            "type": "string",
+            "enum": [
+              "queue_next",
+              "side_question"
+            ],
+            "description": "Explicit intent. No inference or fallback to steering or a different intent."
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable client-generated key for retries, scoped to agent, session, and generation."
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Session reset generation. Optional for compatibility; clients should send the generation returned by GET to fence stale actions."
+          },
+          "targetRunId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Required for a new side_question; exact currently active main run in this agent and session. An idempotent retry can replay after that run ends."
+          },
+          "message": {
+            "type": "string",
+            "description": "User text. A side question with no message text can be accepted if it has an attachment, but its side execution fails."
+          },
+          "attachments": {
+            "type": "array",
+            "description": "Inline attachments normalized as for chat. Current side-question attachments use normal text/native-image handling; historical attachments in a snapshot are only represented by manifest counts.",
+            "items": {
+              "$ref": "#/components/schemas/ChatAttachment"
+            }
+          },
+          "promotedFrom": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional succeeded side_question input ID in the same agent/session/generation; the operator supplies edited text/attachments explicitly."
+          }
+        },
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "intent": {
+                  "const": "side_question"
+                }
+              },
+              "required": [
+                "intent"
+              ]
+            },
+            "then": {
+              "required": [
+                "targetRunId"
+              ],
+              "properties": {
+                "targetRunId": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ChatInputActionRequest": {
+        "type": "object",
+        "description": "Select the same agent and session as the input. Clients should send the generation returned by GET to fence reset races.",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "sessionId": {
+            "type": "string",
+            "default": "default"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Session reset generation. Optional for compatibility; clients should send the generation returned by GET to fence stale actions."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChatInputAttachment": {
+        "type": "object",
+        "description": "Normalized inline attachment included in the public input record, including content.",
+        "required": [
+          "name",
+          "type",
+          "size",
+          "encoding",
+          "content"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "size": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "encoding": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChatInputSnapshotMetadata": {
+        "type": "object",
+        "description": "Immutable header of the original side-question snapshot. The raw captured conversation and profile are not returned.",
+        "required": [
+          "id",
+          "capturedAt",
+          "originRunId",
+          "phase",
+          "entryCount"
+        ],
+        "properties": {
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "capturedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "originRunId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phase": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entryCount": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChatInputResult": {
+        "type": "object",
+        "description": "Terminal runner projection; acceptance is not success.",
+        "required": [
+          "ok",
+          "answerText",
+          "decision",
+          "blockers"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "answerText": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "blockers": {
+            "type": "array",
+            "items": {}
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChatInput": {
+        "type": "object",
+        "description": "Public durable chat input; snapshot is metadata only, while submitted message and normalized attachments are returned.",
+        "required": [
+          "id",
+          "intent",
+          "status",
+          "agentId",
+          "sessionId",
+          "generation",
+          "targetRunId",
+          "runId",
+          "createdAt",
+          "startedAt",
+          "completedAt",
+          "message",
+          "attachments",
+          "result",
+          "error",
+          "snapshot",
+          "cancelRequested",
+          "promotedFrom",
+          "position"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "intent": {
+            "type": "string",
+            "enum": [
+              "queue_next",
+              "side_question"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "held",
+              "running",
+              "succeeded",
+              "failed",
+              "cancelled",
+              "interrupted"
+            ]
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "targetRunId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runId": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "message": {
+            "type": "string"
+          },
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatInputAttachment"
+            }
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChatInputResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "snapshot": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChatInputSnapshotMetadata"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cancelRequested": {
+            "type": "boolean",
+            "description": "For running work, cancellation is requested before terminal status is recorded."
+          },
+          "promotedFrom": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "position": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "description": "1-based FIFO position among queued/held main inputs, otherwise null."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChatInputResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "input"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "input": {
+            "$ref": "#/components/schemas/ChatInput"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChatInputListResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "generation",
+          "inputs"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatInput"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChatInputResumeResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "input",
+          "inputs"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "input": {
+            "$ref": "#/components/schemas/ChatInput"
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChatInput"
+            },
+            "description": "All held inputs transitioned by this resume, in accepted order."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "securitySchemes": {
+      "GithubWebhookSignature": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Hub-Signature-256",
+        "description": "sha256=<64 hexadecimal digits>: HMAC-SHA256 over the exact raw request bytes using the effective Settings secret or optional BURROW_GITHUB_WEBHOOK_SECRET environment override. Not a UI session, bearer token, or literal API key. Recompute for each delivery; do not paste the secret here."
       }
     }
   },

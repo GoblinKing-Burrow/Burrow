@@ -35,6 +35,7 @@ type UseChatRunOptions = {
   savedProviders: SavedProvider[];
   session: ChatRunSession;
   setAgentActivity: (agentId: string, status: string) => void;
+  onCompactionFinished?: () => void;
   onRunStopped?: (run: { agentId: string; sessionId: string; runId: string }) => void;
 };
 
@@ -57,7 +58,7 @@ export function trimStreamedAnswer(streamedAnswer: string, finalAnswer: string) 
 }
 
 /** Owns one-to-one chat run state, stream lifecycle, and cancellation. */
-export function useChatRun({ selectedAgentId, selected, savedProviders, session, setAgentActivity, onRunStopped }: UseChatRunOptions) {
+export function useChatRun({ selectedAgentId, selected, savedProviders, session, setAgentActivity, onRunStopped, onCompactionFinished }: UseChatRunOptions) {
   const [activeRuns, setActiveRuns] = useState<Record<string, ActiveRun>>({});
   const [liveProgressByRun, setLiveProgressByRun] = useState<Record<string, ProgressEntry[]>>({});
   const [liveAnswerByRun, setLiveAnswerByRun] = useState<Record<string, string>>({});
@@ -72,7 +73,7 @@ export function useChatRun({ selectedAgentId, selected, savedProviders, session,
     performance.measure(`chat:${runId}:first-useful-to-react-commit-observed`, `chat:${runId}:first-useful`, `chat:${runId}:react-commit-observed`);
   }, [activeRunForSelection, liveAnswerByRun, liveProgressByRun, selectedAgentId, session.sessionId]);
 
-  // Acceptance is synchronous; the returned promise still tracks run completion.
+  // Composer acceptance follows HTTP success; the returned promise tracks run completion.
   const sendMessage = async (draftOverride?: string, onAccepted?: () => void) => {
     const message = (draftOverride ?? session.draft).trim();
     if ((!message && !session.attached.length) || !selectedAgentId || !session.sessionId || activeRunForSelection || streamAbortRef.current[runKey(selectedAgentId, session.sessionId)]) return;
@@ -90,9 +91,15 @@ export function useChatRun({ selectedAgentId, selected, savedProviders, session,
     setActiveRuns((current) => ({ ...current, [targetKey]: { runId, ...target, stage: 'accepted' } }));
     setLiveProgressByRun((current) => ({ ...current, [targetKey]: [] }));
     setLiveAnswerByRun((current) => ({ ...current, [targetKey]: '' }));
-    setAgentActivity(target.agentId, 'thinking'); session.clearError(); session.setDraft(''); onAccepted?.(); session.clearAttachment(); session.leaveNewSessionForMessage();
+    setAgentActivity(target.agentId, 'thinking'); session.clearError();
     const appendVisibleTurn = transientContextCommand ? session.appendTransientTurn : session.appendTurn;
-    appendVisibleTurn(target.agentId, target.sessionId, { type: 'message', role: 'user', content: message, ts: new Date().toISOString(), runId, ...(attachments.length ? { metadata: { attachments: attachments.map(({ name, type, size }, index) => ({ index, name, type, size, encoding: 'data-url', ...(type.startsWith('image/') ? { preview: attachments[index].content } : {}) })) } } : {}) });
+    const acceptSubmission = () => {
+      if (abortController.signal.aborted || streamAbortRef.current[targetKey] !== abortController) return;
+      if (onAccepted) onAccepted();
+      else { session.setDraft(''); session.clearAttachment(); }
+      session.leaveNewSessionForMessage();
+      appendVisibleTurn(target.agentId, target.sessionId, { type: 'message', role: 'user', content: message, ts: new Date().toISOString(), runId, ...(attachments.length ? { metadata: { attachments: attachments.map(({ name, type, size }, index) => ({ index, name, type, size, encoding: 'data-url', ...(type.startsWith('image/') ? { preview: attachments[index].content } : {}) })) } } : {}) });
+    };
     performance.mark(`chat:${runId}:send`, { startTime: sentAt });
     let firstUseful = false;
     let streamedAnswer = ''; let progressEntries: ProgressEntry[] = []; let toolSequence = 0; let frame = 0;
@@ -101,8 +108,9 @@ export function useChatRun({ selectedAgentId, selected, savedProviders, session,
     try {
       const handleEvent = (event: unknown) => {
         if (streamAbortRef.current[targetKey] !== abortController || abortController.signal.aborted || !event || typeof event !== 'object') return;
-        const envelope = event as { type?: string; runId?: unknown; sessionId?: unknown; ts?: unknown; data?: { delta?: unknown; response?: unknown; message?: unknown; status?: unknown; modelCall?: unknown } & StreamToolEvent };
+        const envelope = event as { type?: string; runId?: unknown; sessionId?: unknown; ts?: unknown; data?: { delta?: unknown; response?: unknown; message?: unknown; status?: unknown; modelCall?: unknown; compressed?: unknown; reason?: unknown } & StreamToolEvent };
         if ((envelope.runId !== undefined && envelope.runId !== runId) || (envelope.sessionId !== undefined && envelope.sessionId !== target.sessionId)) return;
+        if (envelope.type === 'context.compaction.completed') onCompactionFinished?.();
         const useful = ((envelope.type === 'assistant.delta' || envelope.type === 'assistant.thought') && typeof envelope.data?.delta === 'string' && envelope.data.delta.length > 0) || ((envelope.type === 'tool.started' || envelope.type === 'tool.completed') && typeof envelope.data?.tool === 'string' && Boolean(envelope.data.tool.trim()));
         if (useful && !firstUseful) { firstUseful = true; performance.mark(`chat:${runId}:first-useful`); performance.measure(`chat:${runId}:send-to-first-useful`, `chat:${runId}:send`, `chat:${runId}:first-useful`); }
         setActiveRuns((current) => {
@@ -133,7 +141,7 @@ export function useChatRun({ selectedAgentId, selected, savedProviders, session,
           session.storeToolActivity({ runId, items, status: hasError ? 'warn' : hasPending ? 'running' : 'ok' });
         }
       };
-      const { terminalType, finalResult } = await streamChat({ requestBody, signal: abortController.signal, onEvent: handleEvent });
+      const { terminalType, finalResult } = await streamChat({ requestBody, signal: abortController.signal, onEvent: handleEvent, onAccepted: acceptSubmission });
       if (streamAbortRef.current[targetKey] !== abortController || abortController.signal.aborted) return;
       if (frame) { cancelAnimationFrame(frame); flushLiveText(); }
       const runStatus: NonNullable<RunProgress['status']> = terminalType === 'run.failed' ? 'failed' : terminalType === 'run.cancelled' ? 'cancelled' : terminalType === 'run.superseded' ? 'superseded' : 'complete';

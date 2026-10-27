@@ -64,3 +64,32 @@ it('preserves exact MCP and skill identity across start/completion without copyi
   ]);
   expect(JSON.stringify(activity)).not.toContain('secret');
 });
+
+it('projects workflow-event provenance intact for live input without attributing ordinary runs to GitHub', () => {
+  const completionEvent = { id: 'event-1', repository: 'owner/repo', workflow: 'CI', runId: 123, runAttempt: 2, headSha: 'abc', conclusion: 'success', url: 'https://github.com/owner/repo/actions/runs/123' };
+  const run = { agentId: 'a', sessionId: 'parent', runId: 'workflow-run', status: 'running', latestUserMessage: 'Workflow completed', source: 'workflow-event', completionEvent };
+  const response = { ok: true, runs: [run] };
+  const before = JSON.stringify(response);
+  expect(projectChatActivity(response, selection).runtimeRun).toMatchObject({ latestUserMessage: 'Workflow completed', userMessageMetadata: { source: 'workflow-event', completionEvent } });
+  expect(JSON.stringify(response)).toBe(before);
+  expect(projectChatActivity({ ok: true, runs: [{ ...run, source: 'operator' }] }, selection).runtimeRun?.userMessageMetadata).toBeUndefined();
+  expect(projectChatActivity({ ok: true, runs: [{ ...run, completionEvent: undefined }] }, selection).runtimeRun?.userMessageMetadata?.source).toBe('workflow-event');
+});
+
+it('side-question runs never own the main composer, readiness or Stop target', () => {
+ const side = { runId:'side', lane:'side_question' as const, agentId:'agent', sessionId:'default', status:'running', steeringReady:true };
+ const options = { agentId:'agent', sessionId:'default', isChildSession:false, hadRuns:false, now:0 };
+ expect(projectChatActivity({ ok:true, runs:[side] }, options).runtimeRun).toBeNull();
+ const main = { ...side, runId:'main', lane:'main' as const };
+ expect(projectChatActivity({ ok:true, runs:[side,main] }, options).runtimeRun?.runId).toBe('main');
+});
+
+it('recovers compaction status from the owning run progress', () => {
+  const run = { status: 'running', runId: 'r', agentId: 'a', sessionId: 'parent', progress: [
+    { type: 'context.compaction.started', runId: 'r', sessionId: 'parent' },
+    { type: 'context.compaction.failed', runId: 'other' },
+  ] };
+  expect(projectChatActivity({ ok: true, runs: [run] }, selection).runtimeRun?.stage).toBe('compacting');
+  run.progress.push({ type: 'context.compaction.completed', runId: 'r', sessionId: 'parent' });
+  expect(projectChatActivity({ ok: true, runs: [run] }, selection).runtimeRun?.stage).toBe('compaction-completed');
+});
