@@ -1,4 +1,6 @@
-import { invokeProviderFetch, providerTiming, flushProviderDiagnostics } from './provider-fetch.mjs';
+import { providerIdentity, providerUsageValues } from './provider-responsiveness.mjs';
+import { invokeProviderFetch, providerTiming, settleProviderDiagnostics, providerDiagnostic, providerCallback } from './provider-fetch.mjs';
+import { classifyModelFailure, markProviderEnvelopeFailure, providerFailureResult } from '../model-failure.mjs';
 import { apiMode, isChatGptBackendBaseUrl, isCodexBackendConfig, responsesUrl, completionUrl } from './openai-transport.mjs';
 import { toolNames, responseApiTool, messagesToResponsesInput, readResponseSseBounded, normalizeResponseChoice, normalizeChoice, compactResponseCompletion, mergeStreamToolCall, openAIEnvelopeError } from './openai-transport.mjs';
 import { redactStructuredJsonText } from '../redaction.mjs';
@@ -127,10 +129,11 @@ export function createOpenAICompatibleModelAdapter({ config = {}, fetchImpl = gl
     return contextUsageFromRequest({ promptChars: request.providerPromptChars, bodyChars: request.serializedBody.length, imageCount: imageCountFor(request.providerMessages), model, api: mode, continuation: request.continuation, modelCall: options.modelCall, clock });
   };
 
-  const complete = async ({ prompt, messages, temperature = config.temperature ?? 0.2, maxTokens = config.maxTokens, tools = null, toolChoice = 'auto', traceLogger, signal = null, toolContinuation = null, onTextDelta = null, onThoughtDelta = null, onContextUsage = null, modelCall = null } = {}) => {
-      const requestId = idFactory();
-    const timing = providerTiming({ traceLogger, requestId, provider: 'openai-compatible', api: mode, model, modelCall, clock });
-    try {
+  const complete = async ({ prompt, messages, temperature = config.temperature ?? 0.2, maxTokens = config.maxTokens, tools = null, toolChoice = 'auto', traceLogger, signal = null, toolContinuation = null, onTextDelta = null, onThoughtDelta = null, onContextUsage = null, modelCall = null, recoveryContext = null } = {}) => {
+    if (recoveryContext?.nextModelCall) modelCall = await recoveryContext.nextModelCall();
+    const requestId = idFactory();
+    const timing = providerTiming({ identity: providerIdentity(config), traceLogger, requestId, provider: 'openai-compatible', api: mode, model, modelCall, contextBudgetTokens: config.contextTokens ?? config.contextWindow, clock });
+    return settleProviderDiagnostics(traceLogger, async (recordResult) => {
       const headers = {
         'content-type': 'application/json',
         ...(config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {}),
@@ -151,7 +154,7 @@ export function createOpenAICompatibleModelAdapter({ config = {}, fetchImpl = gl
       // Provider bodies contain the complete prompt, including the current operator
       // turn. Persist only a redacted debugger projection; the raw body is sent to
       // the provider but must not become a durable trace artifact.
-      const providerRequestArtifact = await traceLogger?.artifact?.(`provider-request-${requestId}.json`, redactStructuredJsonText(serializedBody)) || null;
+      const providerRequestArtifact = await providerDiagnostic(() => traceLogger?.artifact?.(`provider-request-${requestId}.json`, redactStructuredJsonText(serializedBody))) || null;
       const requestContextUsage = contextUsageFromRequest({
         promptChars: providerPromptChars,
         bodyChars: serializedBody.length,
@@ -162,10 +165,10 @@ export function createOpenAICompatibleModelAdapter({ config = {}, fetchImpl = gl
         modelCall,
         clock,
       });
-      await onContextUsage?.(requestContextUsage);
+      await providerCallback(() => onContextUsage?.(requestContextUsage));
 
-      await traceLogger?.model?.({
-        stage: 'model-request',
+      await providerDiagnostic(() => traceLogger?.model?.({
+        stage: 'model-request', providerTiming: timing.projected, ...timing.ownership,
         requestId,
         modelCall,
         provider: 'openai-compatible',
@@ -184,9 +187,9 @@ export function createOpenAICompatibleModelAdapter({ config = {}, fetchImpl = gl
         providerMessageManifest,
         providerRequestArtifact,
         ts: clock(),
-      });
+      }));
 
-      const response = await invokeProviderFetch(fetchImpl, url, { method: 'POST', headers, body: serializedBody, ...(signal ? { signal } : {}) }, { traceLogger, requestId, provider: 'openai-compatible', api: mode, model, modelCall, clock, timing });
+      const response = await invokeProviderFetch(fetchImpl, url, { method: 'POST', headers, body: serializedBody, ...(signal ? { signal } : {}) }, { traceLogger, requestId, provider: 'openai-compatible', api: mode, model, modelCall, recoveryContext, clock, timing });
       if (codexBackend) {
         const returnedTurnState = response?.headers?.get?.('x-codex-turn-state') || response?.headers?.get?.('x-codex-turn-state-token');
         if (returnedTurnState) codexTurnState = String(returnedTurnState);
@@ -196,7 +199,7 @@ export function createOpenAICompatibleModelAdapter({ config = {}, fetchImpl = gl
       // answer into an empty streamed one.
       const providerReturnedJson = streaming && /application\/json/i.test(String(response?.headers?.get?.('content-type') || ''));
       const responseBody = streaming && !providerReturnedJson
-        ? await readResponseSseBounded(response, { mode, maxBytes: config.maxResponseBytes, onTextDelta: timing.wrap(onTextDelta, 'text'), onThoughtDelta: timing.wrap(onThoughtDelta, 'thought') })
+        ? await readResponseSseBounded(response, { mode, maxBytes: config.maxResponseBytes, onTextDelta: timing.wrap(onTextDelta, 'text'), onThoughtDelta: timing.wrap(onThoughtDelta, 'thought'), onToolDelta: () => { try { timing.stream('tool'); } catch {} } })
         : await readResponseTextBounded(response, config.maxResponseBytes);
       const text = responseBody.text || '';
       let data = streaming && !providerReturnedJson ? responseBody.data : null;
@@ -210,6 +213,7 @@ export function createOpenAICompatibleModelAdapter({ config = {}, fetchImpl = gl
 
       // HTTP success alone is not a completed provider generation. Apply the
       // nonstream schema gate also when a proxy ignores the streaming request.
+      const providerErrorEnvelope = data?.error;
       const envelopeError = (!streaming || providerReturnedJson) ? openAIEnvelopeError(data, mode) : null;
       if (envelopeError) data = { ...data, error: { message: envelopeError } };
       const ok = Boolean(response.ok) && responseBody.ok && !envelopeError;
@@ -224,6 +228,7 @@ export function createOpenAICompatibleModelAdapter({ config = {}, fetchImpl = gl
         choice: ok ? (mode === 'openai-responses' ? normalizeResponseChoice(data) : normalizeChoice(data)) : null,
         responseId: ok && typeof data?.id === 'string' ? boundedText(data.id, 256) : null,
         usage: data?.usage || null,
+        normalizedUsage: providerUsageValues(data?.usage, { provider:'openai-compatible', api:mode }),
         contextUsage: contextUsageFromResponse(requestContextUsage, data?.usage || null, clock),
         error: ok ? null : (responseBody.error || data?.error?.message || data?.message || text.slice(0, 500) || `HTTP ${response.status}`),
         // Provider envelopes can include unbounded vendor-specific fields
@@ -240,9 +245,14 @@ export function createOpenAICompatibleModelAdapter({ config = {}, fetchImpl = gl
         nativeTranscript,
       };
 
+      // Capture parser/HTTP provenance before response diagnostics can throw.
+      if (!ok && !responseBody.ok) result.modelFailure = classifyModelFailure(responseBody, { signal });
+      if (!ok && providerErrorEnvelope && response.ok && (!streaming || providerReturnedJson)) result.modelFailure = classifyModelFailure(markProviderEnvelopeFailure({}, providerErrorEnvelope));
+      if (!ok && signal?.aborted) result.cancelled = true;
+      const settledResult = recordResult(providerFailureResult(result));
       if (result.choice?.text || result.choice?.toolCalls?.length) timing.useful(result.choice?.toolCalls?.length ? 'tool' : 'final-text');
-      await onContextUsage?.(result.contextUsage);
-      await traceLogger?.model?.({
+      await providerCallback(() => onContextUsage?.(result.contextUsage));
+      await providerDiagnostic(() => traceLogger?.model?.({
         stage: 'model-response',
         requestId,
         modelCall,
@@ -252,6 +262,8 @@ export function createOpenAICompatibleModelAdapter({ config = {}, fetchImpl = gl
         status: response.status,
         ok,
         usage: result.usage,
+        normalizedUsage: result.normalizedUsage,
+        contextUsage: result.contextUsage, contextBudgetTokens: config.contextTokens ?? config.contextWindow ?? null,
         cachedTokens: result.usage?.prompt_tokens_details?.cached_tokens ?? result.usage?.input_tokens_details?.cached_tokens ?? null,
         stablePrefixHash,
         finishReason: result.choice?.finishReason || null,
@@ -263,11 +275,11 @@ export function createOpenAICompatibleModelAdapter({ config = {}, fetchImpl = gl
         error: result.error,
         ...(responseBody.errorDetails ? { errorDetails: responseBody.errorDetails } : {}),
         ts: clock(),
-      });
+      }));
 
-      return result;
-      } finally { await flushProviderDiagnostics(traceLogger); }
-    };
+      return settledResult;
+    }, { timing, signal });
+  };
 
   return {
     provider: 'openai-compatible',

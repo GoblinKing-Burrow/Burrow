@@ -5,7 +5,7 @@ import { readAttachment } from './app/readAttachment';
 import { isWithinAttachmentBudget } from './features/chat/attachmentValidation';
 import { useModelSelectionWriter } from './app/useModelSelectionWriter';
 import { useConfirm } from './app/ConfirmDialog';
-import { lazy, Suspense, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { PointerEvent } from 'react';
 import type { Agent, Page, PanelId, SettingsTab } from './app/types';
 import { api, attachmentDisplayName, type RuntimeHealth, type SetupStatus } from './app/api';
@@ -85,6 +85,7 @@ function AppContent() {
   const { agents, setAgents, refreshAgents, registryState, registryError, registryStale } = useRuntimeAgents({
     selectedAgentId,
     setSelectedAgentId,
+    selectedStreamId,
     parentSessionIdForAgent,
     runtimeProviders,
     setSelectedStreamId,
@@ -94,6 +95,10 @@ function AppContent() {
     reportError,
   });
   const [theme, setTheme] = usePersistedTheme();
+  useLayoutEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    return () => { delete document.documentElement.dataset.theme; };
+  }, [theme]);
   const [agentRailPreferences, setAgentRailPreferences] = useAgentRailPreferences();
   const availableAgents = enabledAgents(agents);
   const loadedSelected = availableAgents.find((agent) => agent.id === selectedAgentId) ?? availableAgents[0];
@@ -124,14 +129,12 @@ function AppContent() {
     const subagent = agents.find((agent) => agent.id === agentId)?.subagents.find((item) => item.id === subagentId);
     if (!subagent) return;
 
-    selectChildStream(agentId, subagentId);
-    // Keep the displayed child session separate from the parent session used by
-    // /api/agent-status polling.
-    // Rail IDs are target-qualified so separate remote nodes can expose the
-    // same child session ID. The remote backend, however, owns the unqualified
-    // child session ID; sending `node::session` makes its conversation lookup
-    // fail and leaves the chat oscillating between loading and empty state.
-    selectChildSession(agentId, subagent.resourceId ?? subagent.id);
+    const childSessionId = subagent.resourceId ?? subagent.id;
+    selectChildStream(agentId, childSessionId);
+    // Preserve the child’s root as the agent-row return anchor when known. The
+    // rail identity is namespaced by agent, but runtime conversation APIs own
+    // the raw session resource ID.
+    selectChildSession(agentId, childSessionId, subagent.rootSessionId);
     setActiveTabId('chat');
   };
   const writeModelSelection = useModelSelectionWriter(savedProviders,

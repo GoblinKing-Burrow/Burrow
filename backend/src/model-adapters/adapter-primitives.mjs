@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { readProviderChunk, readProviderText } from './provider-fetch.mjs';
 import { normalizeProviderMessage, normalizeProviderMessages, providerMessageManifest as buildProviderMessageManifest, providerToolRound, pruneProviderToolResults } from '../provider-messages.mjs';
 
 // The model envelope is transient transport data. Keep it comfortably below
@@ -234,6 +235,7 @@ function nativeToolReceipt(result = {}) {
     brain_save: ['agentId', 'result'],
     brain_update: ['agentId', 'result'],
     brain_remove: ['agentId', 'result'],
+    agents_list: ['agents', 'resultCount', 'query', 'includeDisabled', 'totalCount', 'nextCursor'],
     scheduled_jobs_list: ['jobs'],
     scheduled_jobs_read: ['job'],
     scheduled_jobs_create: ['job'],
@@ -370,7 +372,7 @@ async function readResponseBytesBounded(response, maxBytes = DEFAULT_MAX_RESPONS
   if (!reader) {
     // Compatibility fallback for mock/custom fetch implementations. Native
     // fetch responses use the stream branch above, which is the hard limit.
-    const data = typeof response.arrayBuffer === 'function' ? Buffer.from(await response.arrayBuffer()) : Buffer.from(await response.text());
+    const data = typeof response.arrayBuffer === 'function' ? Buffer.from(await readProviderText(response, { method: 'arrayBuffer' })) : Buffer.from(await readProviderText(response));
     const bytes = data.length;
     return bytes > limit
       ? { ok: false, data: Buffer.alloc(0), bytes, error: `model_response_too_large:${bytes}>${limit}` }
@@ -380,7 +382,7 @@ async function readResponseBytesBounded(response, maxBytes = DEFAULT_MAX_RESPONS
   let bytes = 0;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readProviderChunk(reader);
       if (done) break;
       // Do not clone an oversized Uint8Array before enforcing the cap. A
       // single malicious/broken upstream chunk must not get a full-size copy

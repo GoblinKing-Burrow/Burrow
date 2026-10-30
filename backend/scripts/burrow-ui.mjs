@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createArchiveAgentContext } from './ui/archive-agent-context.mjs';
 import { createChatInputRunner } from '../src/chat-input-runner.mjs';
 import { createChatInputService } from '../src/chat-input-service.mjs';
 import { createCompletionEventSettings } from '../src/completion-event-settings.mjs';
@@ -10,6 +11,7 @@ import { isInternalContextSession } from '../src/model-context-boundary.mjs';
 import { createModGenerationDispatcher } from '../src/mod-generations.mjs';
 import { createModTextGenerator } from '../src/mod-capabilities.mjs';
 import { migrateLegacyExecutionProviderApproval } from '../src/execution-provider-approval.mjs';
+import { createCoreApiDispatcher, coreApiCaller } from '../src/core-api-dispatch.mjs';
 import { createModAuthority, createModAuthorityRoute } from '../src/mod-authority.mjs';
 import { createProviderUsageService } from '../src/provider-usage-service.mjs';
 import { createBackgroundLifecycle, createCoordinatedShutdown } from '../src/background-lifecycle.mjs';
@@ -17,6 +19,7 @@ import { SkillGitSync } from '../src/skill-git-sync.mjs';
 import { createSkillSourceRoutes } from './ui/skill-source-routes.mjs';
 import { performance } from 'node:perf_hooks';
 import { createChatStreamDelta } from '../src/chat-stream-delta.mjs';
+import { applyModelRecoveryProgress, modelRecoveryProgress } from '../src/model-recovery-projection.mjs';
 import { beginSessionAdmissionSupersession, finishSessionAdmissionSupersession, serializeSessionAdmission } from '../src/session-admission.mjs';
 import { createBrainRoutes } from './ui/brain-routes.mjs';
 import { createArchiveService } from './ui/archive-service.mjs';
@@ -50,6 +53,8 @@ import { fileURLToPath } from 'node:url';
 import { inspectSessionContext, inspectSessionContextStatus } from '../src/context-engine.mjs';
 import { runSessionCompression } from '../src/session-compression.mjs';
 import { conversationAuthority } from '../src/conversation-authority.mjs';
+import { buildSessionEntry } from '../src/session-entry.mjs';
+import { serializeSessionExecution } from '../src/app-runtime.mjs';
 import { createTraceLogger } from '../src/trace-logger.mjs';
 import { activeConversationLimits } from '../src/context-preparation.mjs';
 import { beginRuntimeSessionExecutionSupersession, chatTurnInputFromBody, createChatTurnRunId, finishRuntimeSessionExecutionSupersession, runChatTurnFromBody, runChatTurnFromWorkbenchContinuation, chatTurnResponse, chatTurnProgressResponse, chatTurnErrorResponse, loadRuntimeConfig } from '../src/chat-turn-controller.mjs';
@@ -58,6 +63,8 @@ import { API_TOKEN_SCOPES } from '../src/api-token-store.mjs';
 import { loadEffectiveSkillCatalog, skillManifest } from '../src/skill-catalog.mjs';
 import { collectTraceObservability } from '../src/trace-observability.mjs';
 import { listSubagentRecords, subagentVisibilitySummary } from '../src/subagent-store.mjs';
+import { readMinionSettings, saveMinionSettings } from '../src/minion-depth.mjs';
+import { projectSubagentTree, sessionMinionAncestry } from '../src/subagent-projection.mjs';
 import { buildContinuityHandoff } from '../src/continuity-handoff-store.mjs';
 import { createRecoveryContinuationScheduler } from '../src/recovery-continuation-runner.mjs';
 import { recordActiveRunInterruptions } from '../src/interrupted-run-recovery.mjs';
@@ -99,7 +106,10 @@ import { createModExternalTurnDispatcher } from '../src/mod-external-turns.mjs';
 import { backgroundSchedulersEnabled } from '../src/background-scheduler-policy.mjs';
 import { diagnoseMcpConnection as diagnoseMcpConnectionRuntime, discoverMcpTools, configureMcpProviderStateStore, hydrateMcpProviderStates, reconcilePersistentMcpConnection } from '../src/mcporter-adapter.mjs';
 import { createRuntimeMetricsCollector } from '../src/runtime-metrics.mjs';
-import { createRuntimeServerLogger } from '../src/runtime-server-log.mjs';
+import { createRuntimeServerLogger, safeOperationalError } from '../src/runtime-server-log.mjs';
+import { operationalEvent } from '../src/operational-log.mjs';
+import { instrumentHttpResponse, correlateHttpRun, recordHttpFailure, observeHttpResult, observeHttpRunEvent, observeModelRecovery, createCatalogRefreshDiagnostics } from '../src/http-operational-log.mjs';
+import { logAuthFailure, startAuthLoginTelemetry, observeAuthEnvironmentOverride } from '../src/ui-auth-diagnostics.mjs';
 import { latestProviderRequest } from '../src/provider-request-inspection.mjs';
 import { chatCommandHelpText, chatCommandResponse, parseChatCommand } from '../src/chat-commands.mjs';
 import { activeChatRunKey, activeChatRunSummaries, activeChatRunSummary, cancelActiveChatRun, registerActiveAgentRun } from '../src/active-chat-runs.mjs';
@@ -154,6 +164,21 @@ function summarizeSessionTurns(turns = [], { maxChars = 4000 } = {}) {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sourceRoot = path.resolve(__dirname, '..');
+const runtimeRoot = process.env.BURROW_RUNTIME_ROOT || process.env.BURROW_DATA_ROOT || '/mnt/local/burrow';
+// PostgreSQL owns server persistence; startup fails if composition is unavailable.
+const serverLogger = createRuntimeServerLogger({ runtimeRoot });
+// Install before awaited composition/startup, not only after a listener exists.
+// Early startup cannot safely call the resource drain before its consts exist.
+let runtimeShutdownHandler = null;
+function fatalRuntimeFailure(event, signal, error) {
+  void serverLogger.event(event, { error: safeOperationalError(error) }, { level: 'fatal' }).finally(async () => {
+    if (runtimeShutdownHandler) return runtimeShutdownHandler(signal, { exitCode: 1 });
+    await serverLogger.flush().catch(() => {});
+    process.exit(1);
+  });
+}
+process.once('uncaughtException', error => fatalRuntimeFailure('uncaught_exception', 'uncaughtException', error));
+process.once('unhandledRejection', error => fatalRuntimeFailure('unhandled_rejection', 'unhandledRejection', error));
 const healthBuildIdentity = await buildIdentity(sourceRoot);
 const healthReleaseProvenance = await releaseProvenance(sourceRoot);
 const projectRoot = path.resolve(process.env.BURROW_SOURCE_ROOT || sourceRoot);
@@ -165,7 +190,6 @@ const configuredRunCancellationGraceMs = Number(process.env.BURROW_RUN_CANCELLAT
 const RUN_CANCELLATION_GRACE_MS = Number.isFinite(configuredRunCancellationGraceMs) ? Math.max(1_000, configuredRunCancellationGraceMs) : 5_000;
 const authorityConfig = httpAuthorityConfig({ host, port });
 browserOriginConfig(); // Validate optional environment override at startup.
-const requestLifecycle = createBackgroundLifecycle({ name: 'runtime_request' });
 const activeChatRuns = new Map();
 const executionProviders = createExecutionProviderRegistry();
 const sessionContinuityHeads = new Map();
@@ -193,17 +217,16 @@ const traceStatusCache = new Map();
 const TRACE_STATUS_CACHE_MS = 30_000;
 const BASIC_SESSION_COOKIE = 'hc_basic_session';
 const OPENAI_OAUTH_USAGE_URL = process.env.BURROW_OPENAI_OAUTH_USAGE_URL || 'https://chatgpt.com/backend-api/wham/usage';
-const runtimeRoot = process.env.BURROW_RUNTIME_ROOT || process.env.BURROW_DATA_ROOT || '/mnt/local/burrow';
-// PostgreSQL owns server persistence; startup fails if composition is unavailable.
-const serverLogger = createRuntimeServerLogger({ runtimeRoot });
+const requestLifecycle = createBackgroundLifecycle({ name: 'runtime_request', logger: serverLogger });
 const runtimePostgresConfig = postgresConfig();
 // Acquire before composition starts any producers, and before orphan repair.
 // Keep the dedicated session through shutdown and store teardown until exit.
 let runtimeOwnership;
 try { runtimeOwnership = await acquirePostgresRuntimeOwnership({ config: runtimePostgresConfig }); }
-catch (error) { console.error(`Burrow UI startup refused: ${String(error?.message || error)}`); process.exit(1); }
+catch (error) { await serverLogger.event('startup_ownership_failed', { reason: String(error?.message || '').startsWith('runtime_database_already_owned:') ? 'runtime_database_already_owned' : 'runtime_database_ownership_failed', error }, { level: 'fatal', component: 'postgres' }); await serverLogger.flush(); process.exit(1); }
 const postgresApplication = await createPostgresApplication({
   poolConfig: runtimePostgresConfig,
+  logger: serverLogger,
   encryptionKey: settingsKeyFromEnvironment(),
   runtimeRoot,
   resolveAgent: async (agentId) => resolveAgentRuntime(agentId),
@@ -212,13 +235,15 @@ const postgresApplication = await createPostgresApplication({
   resolveConfig: (connectionId, modelId) => resolveModelConfig({ stores: postgresApplication.stores, modelConnectionId: connectionId, model: modelId }),
 });
 const { anthropicOauthUsage, openaiOauthUsage, openaiResetCredits, consumeOpenaiResetCredit } = createProviderUsageService({ modelLookup: modelsStore, authSecretToken, fetchImpl: globalThis.fetch, clock: Date.now, openaiUsageUrl: OPENAI_OAUTH_USAGE_URL });
-configureMcpProviderStateStore(postgresApplication.stores.mcpProviderStates);
-await hydrateMcpProviderStates({ runtimeRoot: process.env.BURROW_MCPORTER_ROOT || path.join(runtimeRoot, 'integrations', 'mcporter') }).catch((error) => serverLogger.event('mcp_provider_state_hydration_failed', { error: String(error?.message || error) }));
+await serverLogger.event('database_ready', {}, { component: 'postgres' });
+configureMcpProviderStateStore(postgresApplication.stores.mcpProviderStates, { logger: serverLogger });
+await hydrateMcpProviderStates({ runtimeRoot: process.env.BURROW_MCPORTER_ROOT || path.join(runtimeRoot, 'integrations', 'mcporter') }).catch(() => serverLogger.event('mcp_provider_state_hydration_failed', { errorCode: 'mcp_provider_state_hydration_failed' }, { level: 'warn', component: 'mcp' }));
 const runtimeMetrics = createRuntimeMetricsCollector({ runtimeRoot });
-const otelRuntime = createReconfigurableOtelRuntime({ serviceVersion: releaseVersion });
+const otelRuntime = createReconfigurableOtelRuntime({ serviceVersion: releaseVersion, logger: serverLogger });
 await otelRuntime.apply(await readOtelRuntimeConfig({ store: postgresApplication.stores.opentelemetry, metadata: postgresApplication.stores.metadata }));
+await runtimeConfig();
 await runtimeOwnership.reconcileModJobs(postgresApplication.stores);
-const generationDispatcher = createModGenerationDispatcher({ store: postgresApplication.stores.generations, generateText: createModTextGenerator({ models: postgresApplication.stores.models }) });
+const generationDispatcher = createModGenerationDispatcher({ logger: serverLogger, store: postgresApplication.stores.generations, generateText: createModTextGenerator({ models: postgresApplication.stores.models }) });
 const chatInputRunner = createChatInputRunner({ store: postgresApplication.stores.chatInputs, stores: postgresApplication.stores,
   resolveAgentRuntime, rootDir: projectRoot, registerActiveRun: registerRuntimeActiveRun, telemetry: otelRuntime,
   requestRecovery: () => recoveryContinuationScheduler?.wake() || Promise.resolve(),
@@ -226,12 +251,55 @@ const chatInputRunner = createChatInputRunner({ store: postgresApplication.store
 });
 const chatInputs = createChatInputService({ stores: postgresApplication.stores, activeRuns: activeChatRuns, runner: chatInputRunner, resolveAgentRuntime });
 const completionEventRunner = createCompletionEventRunner({ store: postgresApplication.stores.completionEvents, stores: postgresApplication.stores, resolveAgentRuntime, rootDir: projectRoot, registerActiveRun: registerRuntimeActiveRun, telemetry: otelRuntime });
-const externalTurnDispatcher = createModExternalTurnDispatcher({ store: postgresApplication.stores.externalTurns, stores: postgresApplication.stores, resolveAgentRuntime, rootDir: projectRoot, registerActiveRun: registerRuntimeActiveRun, telemetry: otelRuntime });
+const externalTurnDispatcher = createModExternalTurnDispatcher({ logger: serverLogger, store: postgresApplication.stores.externalTurns, stores: postgresApplication.stores, resolveAgentRuntime, rootDir: projectRoot, registerActiveRun: registerRuntimeActiveRun, telemetry: otelRuntime });
+const NODE_GOBLIN_OTEL_CONFIGURATION_REASONS = new Set([
+  'provider_configuration_unsupported', 'configuration_failed',
+  'remote_configuration_controller_unavailable', 'remote_configuration_invalid',
+  'remote_configuration_failed', 'remote_configuration_send_failed', 'remote_configuration_timeout',
+  'gateway_not_connected', 'gateway_not_ready', 'gateway_disconnected', 'gateway_configuration_failed',
+  'gateway_configuration_timeout', 'telemetry_configuration_invalid',
+  'telemetry_endpoint_invalid', 'telemetry_headers_invalid',
+]);
+let nodeGoblinOtelConfigurationUnavailable = false;
 async function applyOtelConfigurationToNodeGoblins() {
   const configuration = otelRuntime.remoteConfiguration();
-  try { return await executionProviders.configure('node-goblin', configuration); }
-  catch (error) {
-    serverLogger.event('node_goblin_otel_configuration_failed', { error: String(error?.code || error?.message || 'configuration_failed') });
+  const expected = configuration.enabled === true && Boolean(executionProviders.get('node-goblin'))
+    && loadedMods.some(mod => mod.id === 'node-goblin' && mod.status === 'loaded');
+  // Disabling/removing a provider is not a failure or a recovery. Still send the
+  // configuration below, including disabled configurations, as before.
+  if (!expected) nodeGoblinOtelConfigurationUnavailable = false;
+  const failed = fields => {
+    if (!expected || nodeGoblinOtelConfigurationUnavailable) return;
+    nodeGoblinOtelConfigurationUnavailable = true;
+    operationalEvent(serverLogger, 'node_goblin_otel_configuration_failed', { providerId: 'node-goblin', ...fields }, { level: 'warn', component: 'opentelemetry' });
+  };
+  try {
+    const result = await executionProviders.configure('node-goblin', configuration);
+    if (result?.configured === false || (Number.isInteger(result?.failed) && result.failed > 0)
+      || result?.controllerRunning === false) {
+      // The controller aggregates gateway failures; retain only its known
+      // classifications, never arbitrary reply text or gateway metadata.
+      const failureReasons = [...new Set((Array.isArray(result.failures) ? result.failures.slice(0, 20) : [])
+        .map(failure => failure?.reason).filter(reason => NODE_GOBLIN_OTEL_CONFIGURATION_REASONS.has(reason)))];
+      failed({ reason: NODE_GOBLIN_OTEL_CONFIGURATION_REASONS.has(result.reason) ? result.reason
+        : failureReasons.length === 1 ? failureReasons[0] : 'configuration_failed',
+        ...(failureReasons.length ? { failureReasons } : {}),
+        ...(Number.isSafeInteger(result?.failed) && result.failed > 0 ? { failedGateways: result.failed } : {}) });
+    } else {
+      // A count is the number attempted, not an acknowledgement. Zero
+      // connected gateways cannot prove recovery from a previous outage.
+      const configured = result?.configured === true || (Number.isSafeInteger(result?.configured)
+        && result.configured > 0 && result.succeeded === result.configured
+        && result.failed === 0 && result.controllerRunning !== false);
+      if (expected && configured && nodeGoblinOtelConfigurationUnavailable) {
+        nodeGoblinOtelConfigurationUnavailable = false;
+        operationalEvent(serverLogger, 'node_goblin_otel_configuration_restored', { providerId: 'node-goblin' }, { level: 'info', component: 'opentelemetry' });
+      }
+    }
+    return result;
+  } catch (error) {
+    const { errorCode, errorType, upstreamStatus } = safeOperationalError(error, 'remote_configuration_failed');
+    failed({ reason: 'configuration_failed', errorCode, errorType, ...(upstreamStatus === undefined ? {} : { upstreamStatus }) });
     return { configured: false, reason: 'configuration_failed' };
   }
 }
@@ -364,7 +432,7 @@ async function executeBoardTask(taskId) {
         // Preserve only diagnostic fields, not arbitrary error properties or
         // credentials. The request logger applies its normal bounds/redaction;
         // keep this separate from `details`, which is exposed over HTTP.
-        const diagnostic = (error) => ({ name: String(error?.name || 'Error'), message: String(error?.message || error), ...(error?.code != null ? { code: String(error.code) } : {}) });
+        const diagnostic = (error) => safeOperationalError(error);
         failure.taskExecutionDiagnostics = {
           taskId: updated.id, runId, agentId: agentRuntime.agentId, sessionId,
           projectReadError: diagnostic(error), recoveryWriteError: diagnostic(recoveryError),
@@ -383,6 +451,8 @@ async function executeBoardTask(taskId) {
   sessionContinuityHeads.set(headKey, record);
   activeChatRuns.set(activeChatRunKey(agentRuntime.agentId, runId), record);
   if (lifecycle?.stopped) controller.abort(lifecycle.signal.reason);
+  const emitTextDelta = createChatStreamDelta({ record, type: 'assistant.delta', runId, sessionId, write: () => {} });
+  const emitThoughtDelta = createChatStreamDelta({ record, type: 'assistant.thought', runId, sessionId, write: () => {} });
   const runTaskTurn = () => runChatTurnFromBody({
     body: { message: record.latestUserMessage, sessionId, runId, abortSignal: controller.signal },
     rootDir: projectRoot,
@@ -394,14 +464,18 @@ async function executeBoardTask(taskId) {
     cancellationGraceMs: RUN_CANCELLATION_GRACE_MS,
     onCancellationDeadline: () => retireCancelledRun(record),
     registerNestedAgentRun: ({ agentRuntime: nestedRuntime, sessionId: nestedSessionId, runId: nestedRunId, message, source, ...a2a }) => registerRuntimeActiveRun({ agentId: nestedRuntime.agentId, sessionId: nestedSessionId, runId: nestedRunId, message, source, a2a: source === 'a2a' ? a2a : null }),
-    onModelTextDelta: createChatStreamDelta({ record, type: 'assistant.delta', runId, sessionId, write: () => {} }),
-    onModelThoughtDelta: createChatStreamDelta({ record, type: 'assistant.thought', runId, sessionId, write: () => {} }),
-    onSteeringReady: () => { record.steeringReady = true; },
+    onModelTextDelta: (delta) => { if (controller.signal.aborted || record.phase === 'cancelling') { record.phase = 'cancelling'; return; } emitTextDelta(delta); },
+    onModelThoughtDelta: (delta) => { if (controller.signal.aborted || record.phase === 'cancelling') { record.phase = 'cancelling'; return; } emitThoughtDelta(delta); },
+    onSteeringReady: () => { record.steeringReady = !controller.signal.aborted && record.phase !== 'cancelling'; },
     onTraceRecord: (traceRecord) => {
       const progress = publicChatProgress(traceRecord);
       if (!progress) return;
+      if (progress.type === 'model.recovery') observeModelRecovery(serverLogger, traceRecord, record);
       record.progress = [...record.progress, { ...progress, runId, sessionId, ts: traceRecord.ts || new Date().toISOString() }].slice(-50);
-      if (progress.type === 'model.started') record.phase = 'thinking';
+      if (applyModelRecoveryProgress(record, progress)) return;
+      if (controller.signal.aborted || record.phase === 'cancelling') { record.phase = 'cancelling'; return; }
+      if (progress.type === 'context.compaction.started') record.phase = 'compacting';
+      if (['context.compaction.completed', 'context.compaction.failed', 'model.started'].includes(progress.type)) record.phase = 'thinking';
       if (progress.type === 'model.completed') record.phase = 'streaming';
     },
     onModelContextUsage: async (usage) => {
@@ -437,7 +511,7 @@ function updateContextUsageHighWater(previous, usage) {
 }
 
 function registerRuntimeActiveRun(options) {
-  const lifecycle = registerActiveAgentRun(activeChatRuns, options);
+  const lifecycle = registerActiveAgentRun(activeChatRuns, { ...options, logger: typeof serverLogger === 'undefined' ? null : serverLogger });
   lifecycle.cancellationGraceMs = RUN_CANCELLATION_GRACE_MS;
   lifecycle.onCancellationDeadline = options.lane === 'side_question' ? null : () => retireCancelledRun(lifecycle.record);
   return lifecycle;
@@ -482,13 +556,28 @@ function agentRuntimeArgs(agentRuntime, dataRoot) {
 
 
 let codexClientVersionRefreshInterval = null;
-const versionRefreshLifecycle = createBackgroundLifecycle({ name: 'codex_client_version_refresh' });
+const versionRefreshLifecycle = createBackgroundLifecycle({ name: 'codex_client_version_refresh', logger: serverLogger });
+const modelCatalogDiagnostics = createCatalogRefreshDiagnostics(serverLogger, 'models');
 function refreshCodexClientVersionNow() {
   if (versionRefreshLifecycle.stopped) return;
   void versionRefreshLifecycle.track(async () => {
-    versionRefreshLifecycle.signal.throwIfAborted();
-    await refreshCodexClientVersionCache({ store: modelsStore(), signal: AbortSignal.any([versionRefreshLifecycle.signal, AbortSignal.timeout(15_000)]) }).catch(() => {});
-    await modelsStore().refreshOAuthCatalogs({ useModelsDev: true, signal: versionRefreshLifecycle.signal });
+    if (versionRefreshLifecycle.stopped) return;
+    try {
+      const cache = await refreshCodexClientVersionCache({ store: modelsStore(), signal: AbortSignal.any([versionRefreshLifecycle.signal, AbortSignal.timeout(15_000)]) });
+      if (!versionRefreshLifecycle.stopped) modelCatalogDiagnostics('codex_client_version_refresh', !cache?.lastError, { error: cache?.lastError });
+    } catch (error) {
+      if (!versionRefreshLifecycle.stopped) modelCatalogDiagnostics('codex_client_version_refresh', false, { error });
+    }
+    if (versionRefreshLifecycle.stopped) return;
+    try {
+      const results = await modelsStore().refreshOAuthCatalogs({ useModelsDev: true, signal: versionRefreshLifecycle.signal });
+      if (!versionRefreshLifecycle.stopped) {
+        modelCatalogDiagnostics('model_catalog_refresh', true);
+        for (const result of results || []) modelCatalogDiagnostics('model_catalog_refresh', result.ok === true, { connectionId: result.id, error: result.error });
+      }
+    } catch (error) {
+      if (!versionRefreshLifecycle.stopped) modelCatalogDiagnostics('model_catalog_refresh', false, { error });
+    }
   }).catch(() => {});
 }
 function startCodexClientVersionRefresh() {
@@ -501,7 +590,7 @@ const versionRefreshProducer = {
   stop() { versionRefreshLifecycle.stop(); clearInterval(codexClientVersionRefreshInterval); codexClientVersionRefreshInterval = null; },
   close() { this.stop(); return versionRefreshLifecycle.close(); },
 };
-const startupLifecycle = createBackgroundLifecycle({ name: 'runtime_startup' });
+const startupLifecycle = createBackgroundLifecycle({ name: 'runtime_startup', logger: serverLogger });
 
 let metadataStoreFactory = () => postgresApplication.stores.metadata;
 let uiAuthSecretStoreFactory = () => postgresApplication.stores.uiAuthSecrets;
@@ -537,7 +626,7 @@ async function saveMcpConnection(body = {}) { try {
   try {
     await reconcilePersistentMcpConnection(existing, connection, { previousApiKey, nextApiKey, previousEnvironmentVariables, nextEnvironmentVariables, previousHeaders, nextHeaders: await store.secretHeaders(connection.id) });
   } catch (error) {
-    console.warn(`MCP connection ${connection.id} was saved but its prior keep-alive daemon could not be stopped: ${String(error?.message || error)}`);
+    void serverLogger.event('mcp_connection_reconcile_failed', { connectionId: connection.id, error }, { level: 'warn', component: 'mcp' });
   }
   return { ok: true, connection };
 } catch (error) { return { ok: false, status: 400, error: String(error?.message || error) }; } }
@@ -550,7 +639,20 @@ async function removeMcpConnection(id) {
     return await store.remove(id);
   } catch (error) { throw error; }
 }
-async function discoverMcpConnection(body = {}) { try { const connection = await mcpStore().get(body.connectionId); if (!connection) return { ok: false, status: 404, error: 'mcp_connection_not_found' }; const tools = await discoverMcpTools(connection, { apiKey: await mcpStore().apiKey(connection.id), headers: await mcpStore().secretHeaders(connection.id), environmentVariables: await mcpStore().secretEnvironment(connection.id) }); return { ok: true, connection: await mcpStore().refreshTools(connection.id, tools), tools }; } catch (error) { return { ok: false, status: 400, error: String(error?.message || error) }; } }
+const mcpCatalogDiagnostics = createCatalogRefreshDiagnostics(serverLogger, 'mcp');
+async function discoverMcpConnection(body = {}) {
+  try {
+    const connection = await mcpStore().get(body.connectionId);
+    if (!connection) return { ok: false, status: 404, error: 'mcp_connection_not_found' };
+    const tools = await discoverMcpTools(connection, { apiKey: await mcpStore().apiKey(connection.id), headers: await mcpStore().secretHeaders(connection.id), environmentVariables: await mcpStore().secretEnvironment(connection.id) });
+    const refreshed = await mcpStore().refreshTools(connection.id, tools);
+    mcpCatalogDiagnostics('mcp_catalog_refresh', true, { connectionId: connection.id });
+    return { ok: true, connection: refreshed, tools };
+  } catch (error) {
+    mcpCatalogDiagnostics('mcp_catalog_refresh', false, { connectionId: body.connectionId, error });
+    return { ok: false, status: 400, error: String(error?.message || error) };
+  }
+}
 async function diagnoseMcpConnection(body = {}) {
   const connection = await mcpStore().get(body.connectionId);
   if (!connection) return { ok: false, status: 404, error: 'mcp_connection_not_found' };
@@ -769,6 +871,16 @@ async function saveAgentMinionModelSelection(agentId, body = {}) {
   } catch (error) {
     return { ok: false, status: error?.statusCode || 400, error: String(error?.message || error) };
   }
+}
+
+async function agentMinionSettings(agentId) {
+  const runtime = await resolveAgentRuntime(agentId);
+  return { ok: true, ...await readMinionSettings(metadataStore(), runtime.agentId) };
+}
+
+async function saveAgentMinionSettings(agentId, body = {}) {
+  const runtime = await resolveAgentRuntime(agentId);
+  return { ok: true, ...await saveMinionSettings(metadataStore(), runtime.agentId, body) };
 }
 
 async function archiveSummarySelection(agentId) {
@@ -1047,7 +1159,9 @@ async function resolveModelConnectionChatBody(body = {}) {
 }
 
 async function runtimeConfig(agentId = 'hatchet') {
-  return loadRuntimeConfig({ rootDir: projectRoot, args: { agent_id: String(agentId || 'hatchet') }, stores: postgresApplication.stores, tolerateModelResolutionError: true });
+  const runtime = await loadRuntimeConfig({ rootDir: projectRoot, args: { agent_id: String(agentId || 'hatchet') }, stores: postgresApplication.stores, tolerateModelResolutionError: true });
+  observeAuthEnvironmentOverride(runtime);
+  return runtime;
 }
 
 // Settings and retention maintenance need identity/context, not permission to execute a turn.
@@ -1328,10 +1442,21 @@ async function authenticateApiToken(req, url) {
   finally { await store.close?.(); }
 }
 
+// Keep optional diagnostics guarded: focused auth fixtures extract this region
+// without importing server composition or requiring its logger dependencies.
+async function logAuthorizationFailure(req, reason, { level = 'warn', stage = 'authorization' } = {}) {
+  if (typeof serverLogger === 'undefined' || typeof serverLogger?.event !== 'function') return;
+  req.operationalFailureLogged = true;
+  try {
+    await serverLogger.event('auth.failure', { reason, stage, ...(typeof req.requestId === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(req.requestId) ? { requestId: req.requestId } : {}) }, { level, component: 'auth' });
+  } catch { /* Authentication behavior does not depend on diagnostic delivery. */ }
+}
+
 async function authorizeRequest(req, res, url) {
   const apiToken = await authenticateApiToken(req, url);
   if (apiToken) { req.burrowApiToken = apiToken; req.burrowVerifiedAuth = Object.freeze({ enabled: ((await runtimeConfig()).ui?.authMode || 'none') !== 'none', authenticated: false }); return true; }
   if (bearerToken(req)) {
+    await logAuthorizationFailure(req, 'api_token_rejected');
     sendJson(res, 403, { ok: false, error: 'api_token_forbidden' });
     return false;
   }
@@ -1343,11 +1468,13 @@ async function authorizeRequest(req, res, url) {
     const address = remoteAddress(req);
     const allowed = auth.trustedProxy?.allowedProxies || [];
     if (!allowed.includes(address)) {
+      await logAuthorizationFailure(req, 'trusted_proxy_not_allowed', { stage: 'configuration' });
       sendJson(res, 401, { ok: false, error: 'unauthorized', auth: { required: true, mode, reason: 'proxy_not_allowed' } });
       return false;
     }
     const user = String(headerValue(req, auth.trustedProxy?.userHeader || 'x-forwarded-user') || '').trim();
     if (!user) {
+      await logAuthorizationFailure(req, 'trusted_proxy_user_missing', { stage: 'configuration' });
       sendJson(res, 401, { ok: false, error: 'unauthorized', auth: { required: true, mode, reason: 'missing_proxy_user' } });
       return false;
     }
@@ -1356,6 +1483,7 @@ async function authorizeRequest(req, res, url) {
   }
   if (mode === 'basic') {
     if (!auth.basic?.username || !auth.basic?.passwordHash) {
+      await logAuthorizationFailure(req, 'auth_configuration_missing', { level: 'error', stage: 'configuration' });
       sendJson(res, 503, { ok: false, error: 'auth_not_configured', auth: { required: true, mode } });
       return false;
     }
@@ -1365,25 +1493,45 @@ async function authorizeRequest(req, res, url) {
       req.burrowVerifiedAuth = Object.freeze({ enabled: true, authenticated: true });
       return true;
     }
+    const loginObservation = /^basic(?:\s|$)/i.test(String(req.headers.authorization || '')) && typeof startAuthLoginTelemetry === 'function' ? startAuthLoginTelemetry('basic') : null;
     const credentials = basicCredentials(req);
     if (!credentials) {
+      loginObservation?.('failure', { diagnostics:{ reason:'basic_credentials_invalid', stage:'login' } });
+      if (/^basic(?:\s|$)/i.test(String(req.headers.authorization || ''))) await logAuthorizationFailure(req, 'basic_credentials_invalid');
       denyBasic(res, 'missing_basic_credentials');
       return false;
     }
     if (credentials.username !== auth.basic.username || !verifyScryptPassword(credentials.password, auth.basic.passwordHash)) {
+      loginObservation?.('failure', { diagnostics:{ reason:'basic_credentials_invalid', stage:'login' } });
+      await logAuthorizationFailure(req, 'basic_credentials_invalid');
       denyBasic(res, 'invalid_basic_credentials');
       return false;
     }
     setBasicSessionCookie(res, auth);
+    loginObservation?.('success');
     req.burrowVerifiedAuth = Object.freeze({ enabled: true, authenticated: true });
     return true;
   }
   if (mode === 'oidc') {
     if (!auth.oidc?.issuer || !auth.oidc?.clientId || !auth.oidc?.clientSecret) {
+      await logAuthorizationFailure(req, 'auth_configuration_missing', { level: 'error', stage: 'configuration' });
       sendJson(res, 503, { ok: false, error: 'auth_not_configured', auth: { required: true, mode } });
       return false;
     }
-    const session = oidcSessionFromRequest(req, runtime);
+    let diagnostics;
+    let session;
+    try { session = oidcSessionFromRequest(req, runtime, { onFailure: value => { diagnostics = value; } }); }
+    catch (error) {
+      if (typeof logAuthFailure === 'function' && typeof serverLogger !== 'undefined') {
+        req.operationalFailureLogged = true;
+        await logAuthFailure(serverLogger, { req, error, stage: 'session' });
+      }
+      throw error;
+    }
+    if (diagnostics && typeof logAuthFailure === 'function' && typeof serverLogger !== 'undefined') {
+      req.operationalFailureLogged = true;
+      await logAuthFailure(serverLogger, { req, diagnostics });
+    }
     if (session) { req.burrowVerifiedAuth = Object.freeze({ enabled: true, authenticated: true }); return true; }
     if (req.method === 'GET' && !url.pathname.startsWith('/api/')) {
       res.writeHead(302, { location: `/auth/oidc/login?returnTo=${encodeURIComponent(url.pathname + url.search)}` });
@@ -1393,11 +1541,13 @@ async function authorizeRequest(req, res, url) {
     sendJson(res, 401, { ok: false, error: 'unauthorized', auth: { required: true, mode, loginUrl: '/auth/oidc/login' } });
     return false;
   }
+  await logAuthorizationFailure(req, 'auth_mode_unsupported', { level: 'error', stage: 'configuration' });
   sendJson(res, 501, { ok: false, error: 'auth_mode_not_implemented', auth: { required: true, mode } });
   return false;
 }
 
 function sendJson(res, status, body) {
+  observeHttpResult(res, status, body);
   const data = JSON.stringify(body, null, 2);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(data) });
   res.end(data);
@@ -1755,7 +1905,8 @@ function beginNdjson(res) {
   });
 }
 
-function writeNdjson(res, event) {
+function writeNdjson(res, event, options) {
+  observeHttpRunEvent(res, event, options);
   if (res.writableEnded || res.destroyed) return;
   res.write(`${JSON.stringify(event)}\n`);
 }
@@ -1764,6 +1915,7 @@ function writeNdjson(res, event) {
 // Prompts, headers, tool arguments/results, and model/provider internals stay
 // in trace evidence; the progress stream exposes only operational state.
 function publicChatProgress(record = {}) {
+  if (record.type === 'model-recovery') return modelRecoveryProgress(record);
   const payload = record.payload || {};
   if (['context-compaction-started', 'context-compaction-completed', 'context-compaction-failed'].includes(record.type)) {
     return { type: record.type.replace('context-compaction-', 'context.compaction.'), data: {
@@ -1973,8 +2125,10 @@ function compactAttachmentMetadata(attachment = {}, index = 0) {
   return projected;
 }
 
+import { compactDelegationMetadata } from '../src/compact-delegation-metadata.mjs';
+
 function compactChatTurn(turn = {}) {
-  const metadata = {};
+  const metadata = compactDelegationMetadata(turn.metadata);
   if (turn.metadata?.toolActivity) metadata.toolActivity = turn.metadata.toolActivity;
   if (Array.isArray(turn.metadata?.attachments)) {
     const attachments = turn.metadata.attachments.map(compactAttachmentMetadata).filter(Boolean);
@@ -2425,18 +2579,20 @@ async function archiveWorkbenchItem(id, agentRuntime = null) {
   return { ok: true, item };
 }
 
-async function listSubagentSummaries(agentRuntime = null) {
-  const records = await listSubagentRecords({ dataRoot: await dataRootForAgent(agentRuntime), limit: 100 });
-  return records.map(subagentVisibilitySummary);
+async function listSubagentSummaries(agentRuntime) {
+  // Truncating before ancestry selection can strand a live grandchild behind
+  // its older/final parent. Bound context hydration, not the projected tree.
+  const records = await listSubagentRecords({ dataRoot: agentRuntime.agentDataRoot, includeFinal: true, limit: Number.MAX_SAFE_INTEGER });
+  return records
+    .filter(record => [record.agentId, record.owner?.agentId].every(id => !id || id === agentRuntime.agentId))
+    .map(record => ({ ...subagentVisibilitySummary(record), ...(record.minionDepth || {}) }));
 }
 
 const CHILD_LIVE_FINAL_WINDOW_MS = 60 * 60 * 1000;
-function visibleChildWorkRecords(records = [], now = Date.now()) {
-  return records.filter((item) => {
-    if (!item?.final) return true;
-    const updatedAt = Date.parse(item.updatedAt || '');
-    return Number.isFinite(updatedAt) && now - updatedAt <= CHILD_LIVE_FINAL_WINDOW_MS;
-  });
+function visibleChildWorkRecord(item, now = Date.now()) {
+  if (!item?.final) return true;
+  const updatedAt = Date.parse(item.updatedAt || '');
+  return Number.isFinite(updatedAt) && now - updatedAt <= CHILD_LIVE_FINAL_WINDOW_MS;
 }
 
 async function agentOverview(body = {}) {
@@ -2453,7 +2609,7 @@ async function agentOverview(body = {}) {
     try {
       const agentRuntime = await resolveAgentRuntime(agent.id);
       const [status, runtime] = await Promise.all([
-        agentStatusForSession(sessionId, agentRuntime),
+        agentStatusForSession(sessionId, agentRuntime, { minionScope: body.minionScope }),
         runtimeConfig(agent.id),
       ]);
       const matchingRuns = [...activeChatRuns.values()].filter((run) => run.agentId === agent.id && run.sessionId === sessionId);
@@ -2465,7 +2621,7 @@ async function agentOverview(body = {}) {
         .filter(Boolean);
       const { all: sessionIds, hydrated: hydratedSessionIds, truncated } = overviewSessionIds(sessionId, childSessionIds);
       const contextEntries = await Promise.all(hydratedSessionIds.map(async (currentSessionId) => {
-        const liveRun = currentSessionId === sessionId ? active : null;
+        const liveRun = currentSessionId === sessionId ? active : [...activeChatRuns.values()].find(run => run.agentId === agent.id && run.sessionId === currentSessionId && !run.controller.signal.aborted);
         const context = await inspectSessionContextStatus({ stores: postgresApplication.stores, agentId: agentRuntime.agentId, rootDir: projectRoot, dataRoot: agentRuntime.agentWorkspaceRoot, sessionId: currentSessionId, limits, contextConfig: runtime.contextConfig, contextWindow: runtime.modelConfig?.contextWindow, contextTokens: runtime.modelConfig?.contextTokens, liveContext: liveRun?.contextUsage || null });
         return [currentSessionId, context];
       }));
@@ -2487,46 +2643,57 @@ async function agentOverview(body = {}) {
   return { ok: true, agents: overview };
 }
 
-async function agentStatusForSession(sessionId = 'default', agentRuntime = null) {
-  const records = visibleChildWorkRecords(await listSubagentSummaries(agentRuntime));
-  const child = records.find((item) => item.trace?.childSessionId === sessionId);
+async function agentStatusForSession(sessionId = 'default', agentRuntime = null, { minionScope = 'session' } = {}) {
+  agentRuntime ||= await resolveAgentRuntime();
+  const [records, metadata, settings] = await Promise.all([
+    listSubagentSummaries(agentRuntime),
+    postgresApplication.stores.conversations.getMetadata({ agentId: agentRuntime.agentId, sessionId }),
+    readMinionSettings(metadataStore(), agentRuntime.agentId),
+  ]);
+  const requested = sessionMinionAncestry({ sessionId, metadata, maxDepth: settings.maxDepth });
+  const agentRuns = [...activeChatRuns.values()].filter(run => run.agentId === agentRuntime.agentId);
+  const activeForSession = id => {
+    const matches = agentRuns.filter(run => run.sessionId === id);
+    return matches.find(run => !run.controller.signal.aborted) || matches.at(-1) || null;
+  };
+  const liveSessions = new Set(agentRuns.map(run => run.sessionId));
+  const activeSessions = await Promise.all(agentRuns.map(async run => ({
+    ...activeChatRunSummary(run),
+    metadata: run.sessionId === sessionId ? metadata : await postgresApplication.stores.conversations.getMetadata({ agentId: agentRuntime.agentId, sessionId: run.sessionId }),
+  })));
+  // Only bulk rail hydration opts into agent-wide discovery. Chat recovery and
+  // cancellation stay scoped to the requested conversation's subtree.
+  const tree = projectSubagentTree(records, { agentId: agentRuntime.agentId, sessionId: minionScope === 'agent' ? null : sessionId, rootSessionId: minionScope === 'agent' ? null : requested.depth > 0 ? requested.rootSessionId : null, activeSessions, visible: item => visibleChildWorkRecord(item) || liveSessions.has(item.sessionId) });
   const statusFor = (item) => item.status === 'running'
     ? (item.phase === 'streaming' ? 'STREAMING' : item.phase === 'verifying' ? 'VERIFYING' : 'THINKING')
     : item.status === 'succeeded' ? 'DONE'
       : item.status === 'failed' || item.status === 'timed_out' ? 'ERROR'
         : 'IDLE';
-  if (child) {
+  const active = activeForSession(sessionId);
+  const child = tree.find(item => item.sessionId === sessionId);
+  const ancestry = sessionMinionAncestry({ sessionId, runId: active?.runId, metadata, maxDepth: settings.maxDepth, subagent: child });
+  const liveStatusFor = run => run ? (run.controller.signal.aborted ? 'CANCELLING' : run.phase === 'streaming' ? 'STREAMING' : 'THINKING') : null;
+  const rowFor = item => {
+    const live = activeForSession(item.sessionId);
     return {
-      sessionId,
-      agents: [{
-        sessionId,
-        parentSessionId: child.owner?.sessionId || null,
-        label: child.label || child.purpose || child.id,
-        status: statusFor(child),
-        since: child.updatedAt || null,
-        subagentId: child.id,
-        result: child.result || null,
-      }],
-    };
-  }
-  const children = records
-    .filter((item) => item.owner?.sessionId === sessionId && item.trace?.childSessionId)
-    .map((item) => ({
-      sessionId: item.trace.childSessionId,
-      parentSessionId: sessionId,
-      label: item.label || item.purpose || item.id,
-      status: statusFor(item),
-      since: item.updatedAt || null,
-      subagentId: item.id,
+      ...sessionMinionAncestry({ sessionId: item.sessionId, runId: live?.runId, subagent: item }),
+      label: item.label || item.purpose || item.id || item.sessionId,
+      status: liveStatusFor(live) || statusFor(item),
+      since: live?.startedAt || item.updatedAt || null,
       result: item.result || null,
-    }));
-  const matchingRuns = [...activeChatRuns.values()].filter((run) => run.agentId === agentRuntime?.agentId && run.sessionId === sessionId);
-  const active = matchingRuns.find((run) => !run.controller.signal.aborted) || matchingRuns.at(-1) || null;
+    };
+  };
   return {
     sessionId,
+    minionScope,
     agents: [
-      { sessionId, parentSessionId: null, label: agentRuntime?.agent?.name || agentRuntime?.agentId || 'Hatchet', status: active ? (active.controller.signal.aborted ? 'CANCELLING' : active.phase === 'streaming' ? 'STREAMING' : 'THINKING') : 'IDLE', since: active ? new Date().toISOString() : null },
-      ...children,
+      child ? { ...rowFor(child), ...ancestry } : {
+        ...ancestry,
+        label: agentRuntime.agent?.name || agentRuntime.agentId || 'Hatchet',
+        status: liveStatusFor(active) || 'IDLE',
+        since: active?.startedAt || null,
+      },
+      ...tree.filter(item => item.sessionId && item.sessionId !== sessionId).map(rowFor),
     ],
   };
 }
@@ -2641,7 +2808,7 @@ function renderContextInspection({ inspection = {}, status = {}, agentRuntime, m
   ].join('\n\n');
 }
 
-async function handleChatCommand({ parsed, sessionId, agentRuntime, runId = null, onProgress = null } = {}) {
+async function handleChatCommand({ parsed, sessionId, agentRuntime, runId = null, onProgress = null, signal = null } = {}) {
   if (parsed?.error) return { status: 400, response: chatCommandResponse({ command: null, sessionId, text: `Invalid command.\n\n${chatCommandHelpText()}`, receipt: { error: parsed.error }, ok: false }) };
   if (!parsed?.definition) return { status: 400, response: chatCommandResponse({ command: parsed?.command || null, sessionId, text: `Unknown command: /${parsed?.command || ''}\n\n${chatCommandHelpText()}`, receipt: { error: 'command_unknown' }, ok: false }) };
   if (parsed.args && !(parsed.command === 'context' && parsed.args === 'full')) return { status: 400, response: chatCommandResponse({ command: parsed.command, sessionId, text: `${parsed.definition.usage} does not accept arguments.`, receipt: { error: 'command_arguments_not_supported' }, ok: false }) };
@@ -2658,19 +2825,29 @@ async function handleChatCommand({ parsed, sessionId, agentRuntime, runId = null
     } finally { finishSessionAdmissionsReset(resetBarrier); }
   }
   if (parsed.command === 'stop') {
-    await postgresApplication.stores.chatInputs.holdSession({ agentId:agentRuntime.agentId, sessionId });
+    // Signal first. Compaction/feedback may own the very row lock (or last
+    // pool connection) needed by the durable queue hold below.
     chatInputRunner.cancelSession({ agentId:agentRuntime.agentId, sessionId, mainOnly:true });
     const matchingRuns = [...activeChatRuns.values()].filter((run) => run.agentId === agentRuntime.agentId && run.sessionId === sessionId && run.lane !== 'side_question');
     const active = matchingRuns.find((run) => !run.controller.signal.aborted) || matchingRuns.at(-1) || null;
+    if (active && !active.controller.signal.aborted) {
+      const cancelled = await cancelChatRun(active.runId, { reason: 'stopped by /stop' }, agentRuntime);
+      return { status: 200, response: chatCommandResponse({ command: 'stop', sessionId, text: `Stopped active run ${active.runId}.`, receipt: cancelled }) };
+    }
+    await postgresApplication.stores.chatInputs.holdSession({ agentId:agentRuntime.agentId, sessionId });
     if (!active) return { status: 200, response: chatCommandResponse({ command: 'stop', sessionId, text: 'No active run in this session.', receipt: { status: 'idle' } }) };
-    if (active.controller.signal.aborted) return { status: 200, response: chatCommandResponse({ command: 'stop', sessionId, text: `Run ${active.runId} is already cancelling.`, receipt: { status: 'cancelling', runId: active.runId, agentId: active.agentId, sessionId: active.sessionId, reason: active.reason || null } }) };
-    const cancelled = await cancelChatRun(active.runId, { reason: 'stopped by /stop' }, agentRuntime);
-    return { status: 200, response: chatCommandResponse({ command: 'stop', sessionId, text: `Stopped active run ${active.runId}.`, receipt: cancelled }) };
+    return { status: 200, response: chatCommandResponse({ command: 'stop', sessionId, text: `Run ${active.runId} is already cancelling.`, receipt: { status: 'cancelling', runId: active.runId, agentId: active.agentId, sessionId: active.sessionId, reason: active.reason || null } }) };
   }
   if (parsed.command === 'compact') {
     runId ||= createChatTurnRunId({ sessionId, prefix: 'compact' });
     const lifecycle = { reason: 'manual', compressed: false };
+    signal?.throwIfAborted();
     await onProgress?.({ type: 'context.compaction.started', data: lifecycle });
+    signal?.throwIfAborted();
+    const authority = conversationAuthority({ store: postgresApplication.stores.conversations, agentId: agentRuntime.agentId });
+    const metadata = await authority.metadata(sessionId, { signal });
+    signal?.throwIfAborted();
+    const expectedGeneration = Number(metadata?.generation || 0);
     let logger;
     let receipt;
     let text;
@@ -2679,10 +2856,12 @@ async function handleChatCommand({ parsed, sessionId, agentRuntime, runId = null
       const runtime = await runtimeConfig(agentRuntime.agentId);
       const traceRoot = resolveRuntimeTracePath({ ...runtime.runtimeState, agentId: agentRuntime.agentId, sessionId });
       logger = createTraceLogger({ rootDir: traceRoot, runId, sessionId });
-      const result = await runSessionCompression({ rootDir: agentRuntime.agentWorkspaceRoot, sessionId, config: runtime.contextConfig, force: true, stores: postgresApplication.stores, agentId: agentRuntime.agentId, logger });
+      const result = await runSessionCompression({ rootDir: agentRuntime.agentWorkspaceRoot, sessionId, config: runtime.contextConfig, force: true, stores: postgresApplication.stores, agentId: agentRuntime.agentId, logger, expectedGeneration, signal });
+      signal?.throwIfAborted();
       receipt = { reason: result.reason, compressed: Boolean(result.compressed) };
       text = result.compressed ? 'Conversation context compacted. Original history remains archived.' : `No compaction performed: ${result.reason}.`;
     } catch (error) {
+      signal?.throwIfAborted();
       receipt = { ...lifecycle, error: error?.message || String(error) };
       text = `Compaction failed: ${receipt.error}`;
       ok = false;
@@ -2693,12 +2872,19 @@ async function handleChatCommand({ parsed, sessionId, agentRuntime, runId = null
     // it may archive. Command feedback is visible history, never model input.
     // Keep persistence outside the compression catch: a storage failure must
     // not publish a terminal receipt claiming feedback was saved.
-    const authority = conversationAuthority({ store: postgresApplication.stores.conversations, agentId: agentRuntime.agentId });
-    for (const [role, content] of [['user', '/compact'], ['assistant', text]]) {
-      await authority.appendTurn({ sessionId, runId, role, content, visibility: 'chat', entersPrompt: false,
-        metadata: { command: 'compact', commandReceipt: receipt, ok } },
-      { idempotencyKey: `command:compact:${runId}:${role}` });
-    }
+    signal?.throwIfAborted();
+    // Both feedback turns share a single locked generation check and commit.
+    // Reading metadata after rotation would accidentally adopt a concurrent /new.
+    await postgresApplication.stores.conversations.appendBatchIfGeneration({
+      agentId: agentRuntime.agentId, sessionId,
+      expectedGeneration: expectedGeneration + (receipt.compressed ? 1 : 0), signal,
+      entries: [['user', '/compact'], ['assistant', text]].map(([role, content]) => ({
+        entry: buildSessionEntry({ sessionId, runId, role, content, type: 'message', visibility: 'chat', entersPrompt: false,
+          metadata: { command: 'compact', commandReceipt: receipt, ok } }),
+        idempotencyKey: `command:compact:${runId}:${role}`,
+      })),
+    });
+    signal?.throwIfAborted();
     const response = chatCommandResponse({ command: 'compact', sessionId, text, receipt, ok });
     response.result.runId = runId;
     await onProgress?.({ type: ok ? 'context.compaction.completed' : 'context.compaction.failed', data: receipt });
@@ -2775,17 +2961,45 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
   const command = parseChatCommand(body.message);
   if (command) {
     const runId = body.runId ? String(body.runId) : createChatTurnRunId({ sessionId, prefix: 'command' });
-    // Compaction can take time: open the command stream before doing any work.
-    if (streaming) beginNdjson(res);
-    const onProgress = streaming ? (event) => writeNdjson(res, { ...event, runId, sessionId, ts: new Date().toISOString() }) : null;
-    const result = await handleChatCommand({ parsed: command, sessionId, agentRuntime, runId, onProgress });
-    if (streaming) {
-      writeNdjson(res, { type: result.response.ok ? 'run.completed' : 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: { ...result.response, result: { ...result.response.result, runId } } } });
-      return res.end();
+    correlateHttpRun(res, { runId, sessionId, agentId: agentRuntime.agentId });
+    // Manual compaction is real session work, not an invisible command.
+    // Register before waiting for the shared runtime lane so Stop can cancel
+    // even a compact blocked behind another producer.
+    const manualCompact = command.command === 'compact' && command.definition && !command.args && !command.error;
+    const owner = manualCompact ? registerActiveAgentRun(activeChatRuns, {
+      agentId: agentRuntime.agentId, sessionId, runId, message: '/compact', source: coreApiCaller(req) ? 'backdoor-api' : 'operator-chat',
+    }) : null;
+    if (owner) { owner.record.phase = 'compacting'; owner.record.detached = false; }
+    const detached = () => { if (owner && !res.writableEnded) owner.record.detached = true; };
+    if (owner) req.on('close', detached);
+    try {
+      if (streaming) beginNdjson(res);
+      const onProgress = streaming ? (event) => writeNdjson(res, { ...event, runId, sessionId, ts: new Date().toISOString() }) : null;
+      const operation = () => handleChatCommand({ parsed: command, sessionId, agentRuntime, runId, onProgress, signal: owner?.signal });
+      const result = owner
+        ? await serializeSessionExecution({ rootDir: projectRoot, sessionId, agentRuntime, args: { abort_signal: owner.signal } }, operation)
+        : await operation();
+      owner?.signal.throwIfAborted();
+      if (streaming) {
+        writeNdjson(res, { type: result.response.ok ? 'run.completed' : 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: { ...result.response, result: { ...result.response.result, runId } } } }, { status: result.status });
+        return res.end();
+      }
+      return sendJson(res, result.status, result.response);
+    } catch (error) {
+      if (owner?.signal.aborted) {
+        const response = { ok: false, error: String(owner.record.reason || error?.message || 'agent_stopped'), runId };
+        if (streaming) { writeNdjson(res, { type: 'run.cancelled', runId, sessionId, ts: new Date().toISOString(), data: { response } }); return res.end(); }
+        return sendJson(res, 499, response);
+      }
+      const expected = chatTurnErrorResponse(error);
+      if (!expected) recordHttpFailure(res, { error, status: 500, event: 'run_failed', errorCode: 'chat_command_failed' });
+      throw error;
+    } finally {
+      if (owner) { req.removeListener('close', detached); owner.finish(); }
     }
-    return sendJson(res, result.status, result.response);
   }
   const runId = body.runId ? String(body.runId) : createChatTurnRunId({ sessionId, prefix: 'ui' });
+  correlateHttpRun(res, { runId, sessionId, agentId: agentRuntime.agentId });
   if (activeChatRuns.has(activeChatRunKey(agentRuntime.agentId, runId))) throw Object.assign(new Error('chat_run_id_already_used'), { statusCode: 409 });
   const controller = new AbortController();
   const record = { agentId: agentRuntime.agentId, runId, sessionId, controller, startedAt: new Date().toISOString(), phase: 'thinking', latestUserMessage: String(body.message || '').trim().slice(0, 16_000), objective: String(body.message || '').trim().slice(0, 16_000), progress: [], contextUsage: null, cancelled: false, reason: null, detached: false, steeringReady: false };
@@ -2799,6 +3013,8 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
   req.on('close', () => {
     if (!res.writableEnded && !controller.signal.aborted) record.detached = true;
   });
+  const emitTextDelta = streaming ? createChatStreamDelta({ record, type: 'assistant.delta', runId, sessionId, write: (event) => writeNdjson(res, event) }) : null;
+  const emitThoughtDelta = streaming ? createChatStreamDelta({ record, type: 'assistant.thought', runId, sessionId, write: (event) => writeNdjson(res, event) }) : null;
   try {
     const chatBody = await resolveModelConnectionChatBody(body);
     const result = await runChatTurnFromBody({
@@ -2809,21 +3025,31 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
       resolveAgentRuntime,
       latencyTiming,
       telemetry: otelRuntime,
-      runSource: 'operator-chat',
+      runSource: coreApiCaller(req) ? 'backdoor-api' : 'operator-chat',
       cancellationGraceMs: RUN_CANCELLATION_GRACE_MS,
       onCancellationDeadline: () => retireCancelledRun(record),
       registerNestedAgentRun: ({ agentRuntime: nestedRuntime, sessionId: nestedSessionId, runId: nestedRunId, message, source, ...a2a }) => registerRuntimeActiveRun({ agentId: nestedRuntime.agentId, sessionId: nestedSessionId, runId: nestedRunId, message, source, a2a: source === 'a2a' ? a2a : null }),
       onTraceRecord: (traceRecord) => {
+        // Capture runtime-owned span correlation while the run is still active.
+        correlateHttpRun(res, { traceContext: otelRuntime.traceContextForRun?.(runId) });
         const progress = publicChatProgress(traceRecord);
         if (progress) {
           const event = { ...progress, runId, sessionId, ts: traceRecord.ts || new Date().toISOString() };
           record.progress = [...record.progress, event].slice(-50);
+          if (progress.type === 'model.recovery') observeModelRecovery(serverLogger, traceRecord, record);
+          if (!applyModelRecoveryProgress(record, progress)) {
+            if (controller.signal.aborted || record.phase === 'cancelling') record.phase = 'cancelling';
+            else {
+              if (progress.type === 'context.compaction.started') record.phase = 'compacting';
+              if (['context.compaction.completed', 'context.compaction.failed', 'model.started'].includes(progress.type)) record.phase = 'thinking';
+            }
+          }
           if (streaming) writeNdjson(res, event);
         }
       },
-      onModelTextDelta: streaming ? createChatStreamDelta({ record, type: 'assistant.delta', runId, sessionId, write: (event) => writeNdjson(res, event) }) : null,
-      onModelThoughtDelta: streaming ? createChatStreamDelta({ record, type: 'assistant.thought', runId, sessionId, write: (event) => writeNdjson(res, event) }) : null,
-      onSteeringReady: () => { record.steeringReady = true; },
+      onModelTextDelta: streaming ? (delta) => { if (controller.signal.aborted || record.phase === 'cancelling') { record.phase = 'cancelling'; return; } emitTextDelta(delta); } : null,
+      onModelThoughtDelta: streaming ? (delta) => { if (controller.signal.aborted || record.phase === 'cancelling') { record.phase = 'cancelling'; return; } emitThoughtDelta(delta); } : null,
+      onSteeringReady: () => { record.steeringReady = !controller.signal.aborted && record.phase !== 'cancelling'; },
       onModelContextUsage: async (usage) => {
         if (!usage || typeof usage !== 'object') return;
         // Keep every raw measurement in telemetry, while the active card uses
@@ -2854,6 +3080,17 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
       if (streaming) { writeNdjson(res, { type: 'run.superseded', runId, sessionId, ts: new Date().toISOString(), data: { response } }); return res.end(); }
       return sendJson(res, 409, response);
     }
+    correlateHttpRun(res, { cancelled: controller.signal.aborted });
+    // An abort-ignoring attempt can still settle with a result. Stop owns the
+    // public terminal; do not turn that late settlement into a completed run.
+    if (controller.signal.aborted) {
+      const response = chatTurnProgressResponse({ ...result, decision: 'cancelled', answerText: null }, { ok: false });
+      if (streaming) { writeNdjson(res, { type: 'run.cancelled', runId, sessionId, ts: new Date().toISOString(), data: { response } }); return res.end(); }
+      return sendJson(res, 499, response);
+    }
+    // Observe the internal result before the stream's intentionally narrow
+    // response drops model status/codes. This never serializes model payloads.
+    observeHttpResult(res, 200, { ok: result.ok, result }, { event: 'run_failed' });
     const response = chatTurnResponse(result, { ok: result.ok });
     const streamResponse = chatTurnProgressResponse(result, { ok: result.ok });
     if (streaming) { writeNdjson(res, { type: 'run.completed', runId, sessionId, ts: new Date().toISOString(), data: { response: streamResponse } }); return res.end(); }
@@ -2866,9 +3103,10 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
     }
     const errorResponse = chatTurnErrorResponse(error);
     if (errorResponse) {
-      if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: errorResponse.body } }); return res.end(); }
+      if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: errorResponse.body } }, { status: errorResponse.status }); return res.end(); }
       return sendJson(res, errorResponse.status, errorResponse.body);
     }
+    recordHttpFailure(res, { error, status: 500, event: 'run_failed', errorCode: 'chat_run_failed' });
     if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: { ok: false, error: String(error?.message || error), runId } } }); return res.end(); }
     throw error;
   } finally {
@@ -2891,11 +3129,12 @@ async function cancelChatRun(runId, body = {}, agentRuntime = null) {
   const requestedAgentId = agentRuntime?.agentId || body.agentId;
   const matches = [...activeChatRuns.values()].filter(run => run.runId===runId);
   const record = requestedAgentId ? activeChatRuns.get(activeChatRunKey(requestedAgentId,runId)) : matches.length===1 ? matches[0] : null;
+  const cancelled = cancelActiveChatRun(activeChatRuns, runId, { body, agentId: agentRuntime?.agentId || null });
   if (record && record.lane !== 'side_question') {
-    await postgresApplication.stores.chatInputs.holdSession(record);
     chatInputRunner.cancelSession({ ...record, mainOnly: true });
+    await postgresApplication.stores.chatInputs.holdSession(record);
   }
-  return cancelActiveChatRun(activeChatRuns, runId, { body, agentId: agentRuntime?.agentId || null });
+  return cancelled;
 }
 
 async function supersedeSessionRuns({ agentId, sessionId, reason = 'superseded by session reset' } = {}) {
@@ -2904,7 +3143,7 @@ async function supersedeSessionRuns({ agentId, sessionId, reason = 'superseded b
   for (const run of matches) {
     sessionContinuityHeads.delete(sessionContinuityHeadKey(agentId, sessionId));
     const result = cancelActiveChatRun(activeChatRuns, run.runId, { body: { reason }, agentId });
-    if (result.ok) superseded.push(...result.cancelledRuns);
+    if (result.ok && result.cancelledRuns.length) superseded.push(...result.cancelledRuns);
     else if (run.controller.signal.aborted) superseded.push({ runId: run.runId, agentId: run.agentId, sessionId: run.sessionId });
     // Reset supersedes this display/dispatch identity. Durable reset fences its
     // old writes; an abort-ignoring provider must not block the fresh generation.
@@ -2919,8 +3158,15 @@ async function beginSessionAdmissionsReset({ agentId, sessionId } = {}) {
   try {
     const runtime = beginRuntimeSessionExecutionSupersession({ rootDir: projectRoot, sessionId, agentRuntime });
     try {
-      await postgresApplication.stores.chatInputs.cancelGeneration({ agentId, sessionId });
+      // The reset barriers already exclude successors. Signal current owners
+      // before waiting for durable queue/reset rows they may themselves hold.
+      for (const record of activeChatRuns.values()) {
+        if (record.agentId === agentId && record.sessionId === sessionId) {
+          cancelActiveChatRun(activeChatRuns, record.runId, { body: { reason: 'superseded by session reset' }, agentId });
+        }
+      }
       chatInputRunner.cancelSession({ agentId, sessionId });
+      await postgresApplication.stores.chatInputs.cancelGeneration({ agentId, sessionId });
       return { http, runtime };
     } catch(error) { finishRuntimeSessionExecutionSupersession(runtime); throw error; }
   } catch (error) {
@@ -2961,31 +3207,46 @@ async function listChatSteering(runId, body, agentRuntime) {
 }
 
 async function currentActiveChatRunSummaries({ agentId = null, sessionId = null } = {}) {
-  const runs = activeChatRunSummaries(activeChatRuns, { agentId, sessionId });
-  for (const run of runs) {
-    if (run.lane === 'side_question') { run.steering = []; continue; }
-    try { run.steering = await postgresApplication.stores.steering.list(run); }
-    catch (error) { if (error.statusCode !== 404) throw error; run.steering = []; }
-  }
+  const allRuns = activeChatRunSummaries(activeChatRuns, { agentId });
+  const runs = [];
   const childRecords = [];
   // Observability reads stored identity/data, not permission to execute a turn.
   const runtimes = agentId ? [await resolveAgentContext(agentId)] : await Promise.all((await agentsStore().list({ includeDisabled: true })).map((agent) => resolveAgentContext(agent.id)));
   for (const agentRuntime of runtimes) {
-    const records = await listSubagentRecords({ dataRoot: agentRuntime.agentDataRoot, includeFinal: false, limit: 100 });
-    for (const record of records) {
-      const summary = subagentVisibilitySummary(record);
-      if (sessionId && summary.owner?.sessionId !== sessionId && summary.trace?.childSessionId !== sessionId) continue;
-      childRecords.push({
-        ...summary,
-        agentId: agentRuntime.agentId,
-        runId: summary.trace?.runId || summary.id,
-        sessionId: summary.trace?.childSessionId || null,
-        parentSessionId: summary.owner?.sessionId || null,
-        parentRunId: summary.owner?.parentRunId || summary.owner?.turnId || null,
-        source: 'subagent',
-      });
+    const [records, settings, metadata] = await Promise.all([
+      listSubagentSummaries(agentRuntime),
+      readMinionSettings(metadataStore(), agentRuntime.agentId),
+      sessionId ? postgresApplication.stores.conversations.getMetadata({ agentId: agentRuntime.agentId, sessionId }) : null,
+    ]);
+    const requested = sessionId ? sessionMinionAncestry({ sessionId, metadata, maxDepth: settings.maxDepth }) : null;
+    const agentRuns = allRuns.filter(run => run.agentId === agentRuntime.agentId);
+    const activeSessions = await Promise.all(agentRuns.map(async run => ({
+      ...run,
+      metadata: run.sessionId === sessionId ? metadata : await postgresApplication.stores.conversations.getMetadata({ agentId: agentRuntime.agentId, sessionId: run.sessionId }),
+    })));
+    const tree = projectSubagentTree(records, { agentId: agentRuntime.agentId, sessionId, rootSessionId: requested?.depth > 0 ? requested.rootSessionId : null, activeSessions });
+    const expectedRoot = requested?.depth > 0 ? requested.rootSessionId : tree.find(item => item.sessionId === sessionId)?.rootSessionId || sessionId;
+    const liveSessions = new Set(agentRuns.map(run => run.sessionId));
+    const activeTree = projectSubagentTree(tree, { agentId: agentRuntime.agentId, sessionId, rootSessionId: requested?.depth > 0 ? requested.rootSessionId : null, visible: item => !item.final || liveSessions.has(item.sessionId) });
+    childRecords.push(...activeTree.map(item => ({ ...item, source: 'subagent' })));
+    for (const run of agentRuns) {
+      const subagent = tree.find(item => item.sessionId === run.sessionId && (!item.trace?.runId || item.trace.runId === run.runId));
+      const runMetadata = subagent ? null : activeSessions.find(item => item.runId === run.runId)?.metadata;
+      const ancestry = sessionMinionAncestry({ sessionId: run.sessionId, runId: run.runId, metadata: runMetadata, maxDepth: settings.maxDepth, subagent });
+      if (sessionId && run.sessionId !== sessionId && ancestry.rootSessionId && expectedRoot && ancestry.rootSessionId !== expectedRoot) continue;
+      if (sessionId && run.sessionId !== sessionId && !subagent && ancestry.rootSessionId !== sessionId && ancestry.parentSessionId !== sessionId) continue;
+      // A requested child must not pick up siblings sharing its root marker.
+      if (sessionId && requested?.depth > 0 && run.sessionId !== sessionId && !subagent && ancestry.parentSessionId !== sessionId) continue;
+      const observed = { ...run, ...ancestry };
+      if (run.lane === 'side_question') observed.steering = [];
+      else {
+        try { observed.steering = await postgresApplication.stores.steering.list(run); }
+        catch (error) { if (error.statusCode !== 404) throw error; observed.steering = []; }
+      }
+      runs.push(observed);
     }
   }
+  runs.sort((a, b) => a.agentId.localeCompare(b.agentId) || a.depth - b.depth);
   return { runs, subagents: childRecords };
 }
 
@@ -2998,7 +3259,7 @@ const forgeStoreFactory = () => postgresApplication.stores.forge;
 configureForgeStoreFactory(forgeStoreFactory);
 const forgeRoute = createForgeRoutes({ store: forgeStoreFactory, readJsonBody, sendJson, sendStaticFile });
 const dreamRoute = createDreamRoutes({ readJsonBody, sendJson, agentDreamSettings, agentDreamDiary, agentDreamMemoryConsolidate, agentDreamMemoryPreview, agentDreamCycle });
-const skillGitSync = new SkillGitSync({ pool: postgresApplication.pool, skills: postgresApplication.stores.skills, sources: postgresApplication.stores.skillSources, packageRoot: path.join(runtimeRoot,'skill-packages'), onError: error => { void serverLogger.event('skill_sync_error',{error: error.statusCode ? error.message : 'skill_sync_failed'}); } });
+const skillGitSync = new SkillGitSync({ pool: postgresApplication.pool, skills: postgresApplication.stores.skills, sources: postgresApplication.stores.skillSources, packageRoot: path.join(runtimeRoot,'skill-packages'), logger: serverLogger });
 const skillSourceRoute = createSkillSourceRoutes({ sources: postgresApplication.stores.skillSources, skills: postgresApplication.stores.skills, sync: skillGitSync, pool: postgresApplication.pool, readJsonBody, sendJson });
 const skillStoreCall = async (operation) => operation(postgresApplication.stores.skills);
 const skillApi = {
@@ -3010,19 +3271,20 @@ const skillApi = {
   agentSkills: async (id) => { const runtime = await resolveAgentContext(id); const assignments = await skillStoreCall(store => store.assignments(runtime.agentId)); const catalog = await loadEffectiveSkillCatalog({ workspaceRoot: runtime.workspaceRoot, agentRuntime: runtime, skillStore: postgresApplication.stores.skills }); return { ok: true, ...assignments, effectiveSkills: catalog.skills.map(skillManifest) }; },
   saveAgentSkills: async (id, body) => { const runtime = await resolveAgentContext(id); await skillStoreCall(store => store.replaceAssignments(runtime.agentId, body.skillIds)); return skillApi.agentSkills(runtime.agentId); },
 };
-const settingsRoute = createSettingsRoutes({ globalProfileDocuments, timezoneSettings: async () => ({ ok: true, timezone: await operatorTimezone(postgresApplication.stores.metadata) }), saveTimezoneSettings: (body) => saveOperatorTimezone(postgresApplication.stores.metadata, body), ...skillApi, readJsonBody, sendJson, modelConnections, claudeCliCredentialStatus, importClaudeCliCredential, startOpenAiOAuthLoginApi, openAiOAuthLoginStatus, submitOpenAiOAuthLoginApi, cancelOpenAiOAuthLoginApi, startClaudeCodeLoginApi, claudeCodeLoginStatus, submitClaudeCodeLoginApi, cancelClaudeCodeLoginApi, importClaudeCodeLoginApi, mcpConnections, discoverMcpConnection, diagnoseMcpConnection, saveMcpConnection, removeMcpConnection, agentMcpTools, saveAgentMcpTools, agentModelSelection, saveAgentModelSelection, agentMinionModelSelection, saveAgentMinionModelSelection, archiveSummaryModelSelection: async (agentId) => ({ ok: true, selection: await archiveSummarySelection((await resolveAgentRuntime(agentId)).agentId) }), saveArchiveSummaryModelSelection, discoverModelConnection, saveModelConnection, removeModelConnection: async (id) => await modelsStore().remove(id), completeSetupOperation: async body => { try { return await completeSetupOperation({ pool: postgresApplication.pool, encryptionKey: modelsStore().key, body }); } catch (error) { return { ok: false, status: error.message === 'setup_operation_conflict' || error.message === 'agent_id_exists' ? 409 : 400, error: error.message }; } }, setupStatus: async () => postgresApplication.stores.setupState.readStatus(), completeSetup: async () => postgresApplication.stores.setupState.completeSetup() });
+const settingsRoute = createSettingsRoutes({ globalProfileDocuments, timezoneSettings: async () => ({ ok: true, timezone: await operatorTimezone(postgresApplication.stores.metadata) }), saveTimezoneSettings: (body) => saveOperatorTimezone(postgresApplication.stores.metadata, body), ...skillApi, readJsonBody, sendJson, modelConnections, claudeCliCredentialStatus, importClaudeCliCredential, startOpenAiOAuthLoginApi, openAiOAuthLoginStatus, submitOpenAiOAuthLoginApi, cancelOpenAiOAuthLoginApi, startClaudeCodeLoginApi, claudeCodeLoginStatus, submitClaudeCodeLoginApi, cancelClaudeCodeLoginApi, importClaudeCodeLoginApi, mcpConnections, discoverMcpConnection, diagnoseMcpConnection, saveMcpConnection, removeMcpConnection, agentMcpTools, saveAgentMcpTools, agentModelSelection, saveAgentModelSelection, agentMinionModelSelection, saveAgentMinionModelSelection, agentMinionSettings, saveAgentMinionSettings, archiveSummaryModelSelection: async (agentId) => ({ ok: true, selection: await archiveSummarySelection((await resolveAgentRuntime(agentId)).agentId) }), saveArchiveSummaryModelSelection, discoverModelConnection, saveModelConnection, removeModelConnection: async (id) => await modelsStore().remove(id), completeSetupOperation: async body => { try { return await completeSetupOperation({ pool: postgresApplication.pool, encryptionKey: modelsStore().key, body }); } catch (error) { return { ok: false, status: error.message === 'setup_operation_conflict' || error.message === 'agent_id_exists' ? 409 : 400, error: error.message }; } }, setupStatus: async () => postgresApplication.stores.setupState.readStatus(), completeSetup: async () => postgresApplication.stores.setupState.completeSetup() });
 const agentRoute = createAgentRoutes({ readJsonBody, sendJson, validateBoundaryBody, agentsStore, createAgent, updateAgent, deleteAgent, agentProfileDocuments, selectedAgentRuntime, agentStatusForSession, agentOverview });
-const { archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveContinuityCards, archiveContinuityCardDetail } = createArchiveService({
-  stores: () => postgresApplication.stores, agentsStore, dreamDiaryStore,
-  resolveAgentRuntime, runtimeConfig, runtimeTraceRoot, settingsKeyFromEnvironment,
+const archiveAgentContext = createArchiveAgentContext({ agentsStore, rootDir: projectRoot });
+const { archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveDreamGroups, archiveDreamGroupDetail, archiveWorkflowEvents, archiveContinuityCards, archiveContinuityCardDetail } = createArchiveService({
+  stores: () => postgresApplication.stores, agentsStore: archiveAgentContext.agentsStore, dreamDiaryStore,
+  resolveAgentRuntime: archiveAgentContext.resolveAgentRuntime, runtimeConfig: archiveAgentContext.runtimeConfig, runtimeTraceRoot, settingsKeyFromEnvironment,
   isChatMessage, compactChatTurn, summarizeSessionTurns, boundedInteger,
 });
-const sessionRoute = createSessionRoutes({ rootDir: projectRoot, readJsonBody, sendJson, resolveAgentRuntime, runtimeAgentWorkspaceRoot, runtimeDataRoot, runtimeSessionRoot, runtimeConfig, activeConversationLimits, inspectSessionContext, inspectSessionContextStatus, activeChatRuns, searchSessionEvidence, searchBurrowSessionEvidence, agentsStore, agentRuntimeContext, archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveContinuityCards, archiveContinuityCardDetail, listSessions, sessionDetail, sessionWriteHandoff, sessionContinuityScope, setSessionContinuityScope, clearSessionContinuityScope, sessionReadHandoff, sessionWriteHandoffCandidate, archiveSummaryForReset, archiveSummaryForSession, supersedeSessionRuns, beginSessionAdmissionsReset, finishSessionAdmissionsReset, latestAuthorityExplanationForSession, listAuthorityExplanationsForSession, conversationStore: postgresApplication.stores.conversations });
+const sessionRoute = createSessionRoutes({ resolveArchiveAgentRuntime: archiveAgentContext.resolveAgentRuntime, rootDir: projectRoot, readJsonBody, sendJson, resolveAgentRuntime, runtimeAgentWorkspaceRoot, runtimeDataRoot, runtimeSessionRoot, runtimeConfig, activeConversationLimits, inspectSessionContext, inspectSessionContextStatus, activeChatRuns, searchSessionEvidence, searchBurrowSessionEvidence, agentsStore, agentRuntimeContext, archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveDreamGroups, archiveDreamGroupDetail, archiveWorkflowEvents, archiveContinuityCards, archiveContinuityCardDetail, listSessions, sessionDetail, sessionWriteHandoff, sessionContinuityScope, setSessionContinuityScope, clearSessionContinuityScope, sessionReadHandoff, sessionWriteHandoffCandidate, archiveSummaryForReset, archiveSummaryForSession, supersedeSessionRuns, beginSessionAdmissionsReset, finishSessionAdmissionsReset, latestAuthorityExplanationForSession, listAuthorityExplanationsForSession, conversationStore: postgresApplication.stores.conversations });
 const brainRoute = createBrainRoutes({ store: postgresApplication.stores.brains, metadata: metadataStore(), embeddings: postgresApplication.stores.brainEmbeddings, readJsonBody, sendJson });
-const generalSettingsRoute = createGeneralSettingsRoutes({ readJsonBody, sendJson, chatIdentities, saveChatIdentity, curatorSettings, saveCuratorSettings, tiddleSettings: async (agentId) => tiddleStatus({ agentId, stores: postgresApplication.stores, }), tiddleCards: async (query) => listTiddleCards({ ...query, stores: postgresApplication.stores, }), tiddleHistory: async (query) => tiddleHistory({ ...query, stores: postgresApplication.stores, }), uiAuthSettings, saveUiAuthSettings, browserOriginSettings: () => browserOriginSettings({ metadata: metadataStore() }), saveBrowserOriginSettings: body => saveBrowserOriginSettings(body, { metadata: metadataStore() }), browserTabSettings: () => browserTabSettings({ metadata: metadataStore() }), saveBrowserTabSettings: body => saveBrowserTabSettings(body, { metadata: metadataStore() }), otelSettings: () => otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }), saveOtelSettings: async body => { let result = await saveOtelSettings(body, { store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); if (result.ok) { try { await otelRuntime.apply(await readOtelRuntimeConfig({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore() })); await applyOtelConfigurationToNodeGoblins(); } catch (error) { serverLogger.event('otel_configuration_apply_failed', { error: String(error?.message || 'configuration_failed') }); return { ok: false, status: 500, error: 'opentelemetry_configuration_apply_failed' }; } result = await otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); } return result; }, executionBoundarySettings, saveExecutionBoundarySettings, retentionPolicySettings, saveRetentionPolicySettings, retentionCleanup });
+const generalSettingsRoute = createGeneralSettingsRoutes({ readJsonBody, sendJson, chatIdentities, saveChatIdentity, curatorSettings, saveCuratorSettings, tiddleSettings: async (agentId) => tiddleStatus({ agentId, stores: postgresApplication.stores, }), tiddleCards: async (query) => listTiddleCards({ ...query, stores: postgresApplication.stores, }), tiddleHistory: async (query) => tiddleHistory({ ...query, stores: postgresApplication.stores, }), uiAuthSettings, saveUiAuthSettings, browserOriginSettings: () => browserOriginSettings({ metadata: metadataStore() }), saveBrowserOriginSettings: body => saveBrowserOriginSettings(body, { metadata: metadataStore() }), browserTabSettings: () => browserTabSettings({ metadata: metadataStore() }), saveBrowserTabSettings: body => saveBrowserTabSettings(body, { metadata: metadataStore() }), otelSettings: () => otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }), saveOtelSettings: async body => { let result = await saveOtelSettings(body, { store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); if (result.ok) { try { await otelRuntime.apply(await readOtelRuntimeConfig({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore() })); await applyOtelConfigurationToNodeGoblins(); } catch (error) { serverLogger.event('otel_configuration_apply_failed', { error }); return { ok: false, status: 500, error: 'opentelemetry_configuration_apply_failed' }; } result = await otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); } return result; }, executionBoundarySettings, saveExecutionBoundarySettings, retentionPolicySettings, saveRetentionPolicySettings, retentionCleanup });
 const observabilityRoute = createObservabilityRoutes({ providerPoolMetrics: () => postgresApplication.stores.models.providerPoolMetrics.summary(), readJsonBody, sendJson, validateBoundaryBody, runtimeStatus, runtimeMetrics, anthropicOauthUsage, openaiOauthUsage, openaiResetCredits, consumeOpenaiResetCredit, currentActiveChatRunSummaries, selectedAgentRuntime, resolveAgentRuntime, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, listTraces, runtimeConfig, traceRootForRun, conversationStore: postgresApplication.stores.conversations, summarizeTrace, authorityExplanationFromTraceSummary, projectRoot });
 const scheduledChannelRoute = createScheduledChannelRoutes({ readJsonBody, sendJson, validateBoundaryBody, withScheduledJobs, scheduler, listGroupChannels, createGroupChannel, readGroupChannelTurns, groupChannelRuns, startGroupChannelMessage, cancelGroupChannelRun, runtimeDataRoot, conversationStore: postgresApplication.stores.conversations });
-const authRoute = createAuthRoutes({ runtimeConfig, oidcLoginUrl, setOidcStateCookie, completeOidcCallback, sendOidcSessionCookie, clearOidcCookies, oidcCookieClearHeader, oidcSessionFromRequest, sendJson });
+const authRoute = createAuthRoutes({ serverLogger, runtimeConfig, oidcLoginUrl, setOidcStateCookie, completeOidcCallback, sendOidcSessionCookie, clearOidcCookies, oidcCookieClearHeader, oidcSessionFromRequest, sendJson });
 const chatRoute = createChatRoutes({ handleChat, readJsonBody, sendJson, selectedAgentRuntime, cancelChatRun, steerChatRun, listChatSteering, chatInputs });
 const modsRuntimeRoot = process.env.BURROW_RUNTIME_ROOT || process.env.BURROW_DATA_ROOT || '/mnt/local/burrow';
 const modAuthority = createModAuthority({ repositoryFactory: postgresApplication.modDistributionRepositoryFactory });
@@ -3098,7 +3360,15 @@ const modManagementCapability = Object.freeze(Object.fromEntries(['inventory', '
   if (!coreModManagement) throw new Error('mod_management_unavailable');
   return coreModManagement[method](...args);
 }])));
-const modLoadOptions = { modAuthority, modManagement: modManagementCapability, onExecutionProviderActivated: async modId => { if (modId === 'node-goblin') await applyOtelConfigurationToNodeGoblins(); }, stores: postgresApplication.stores, modStoreFactory: postgresApplication.modStoreFactory, enabledModIds: postgresApplication.enabledModIds, modCatalogWriter: postgresApplication.modCatalogWriter, runtimeRoot: modsRuntimeRoot, executionProviders, resolveAgentRuntime, scheduledJobScheduler: scheduler(), externalTurnDispatcher, generationDispatcher, runtimeDiagnostics, resolveAgentWorkspaceRoot: async (id) => {
+const coreApi = createCoreApiDispatcher({
+  handleRequest,
+  trackRequest: (operation, phase) => requestLifecycle.track(operation, phase),
+  onComplete: ({ method, route, status, actor }) => serverLogger.event('core_api_request', {
+    method, route, status, modId: actor?.ownerModId, agentId: actor?.caller.agentId,
+    sessionId: actor?.caller.sessionId, runId: actor?.caller.runId,
+  }, { component: 'api' }),
+});
+const modLoadOptions = { coreApi, logger: serverLogger, modAuthority, modManagement: modManagementCapability, onExecutionProviderActivated: async modId => { if (modId === 'node-goblin') await applyOtelConfigurationToNodeGoblins(); }, stores: postgresApplication.stores, modStoreFactory: postgresApplication.modStoreFactory, enabledModIds: postgresApplication.enabledModIds, modCatalogWriter: postgresApplication.modCatalogWriter, runtimeRoot: modsRuntimeRoot, executionProviders, resolveAgentRuntime, scheduledJobScheduler: scheduler(), externalTurnDispatcher, generationDispatcher, runtimeDiagnostics, resolveAgentWorkspaceRoot: async (id) => {
   const agent = await agentsStore().get(id);
   if (!agent) throw new Error('agent_not_found');
   return agentRuntimeContext({ runtimeState: (await runtimeConfig()).runtimeState, agent }).agentWorkspaceRoot;
@@ -3109,6 +3379,7 @@ async function reconcileRuntimeManagedSkills(mods = loadedMods) {
   return reconcileManagedSkills({ root: path.join(workspaceRoot, 'global', 'managed-skills'), declarations: activeManagedSkillDeclarations(mods, coreManagedSkills) });
 }
 const managedSkillSynchronizer = createManagedSkillSynchronizer({
+  logger: serverLogger,
   reconcile: () => reconcileRuntimeManagedSkills(),
   intervalMs: Math.max(60_000, Number(process.env.BURROW_MANAGED_SKILL_SYNC_INTERVAL_MS || 6 * 60 * 60 * 1000)),
 });
@@ -3133,7 +3404,7 @@ async function transitionMod({ modId, enabled, installed, action, reactivate = f
     return;
   }
   if (!installed || !enabled) {
-    if (old) await cleanupMods([old]);
+    if (old) await cleanupMods([old], { logger: serverLogger });
     loadedMods = installed
       ? loadedMods.map((entry) => entry.id === modId ? { ...entry, host: null, routes: [], store: null, lifecycleCleanup: null, status: 'disabled' } : entry)
       : loadedMods.filter((entry) => entry.id !== modId);
@@ -3143,12 +3414,12 @@ async function transitionMod({ modId, enabled, installed, action, reactivate = f
   if (reactivate && old) {
     // Newly approved interfaces require a fresh host. Stop the old listener
     // before activation; overlapping Node Goblin listeners cannot share a port.
-    await cleanupMods([old]);
+    await cleanupMods([old], { logger: serverLogger });
     Object.assign(old, { host: null, routes: [], store: null, lifecycleCleanup: null, status: 'disabled' });
   }
   const [next] = await loadMods({ ...modLoadOptions, onlyModIds: [modId], replaceExecutionProviders: action === 'update' });
   if (!next || next.status !== 'loaded') {
-    if (next) await cleanupMods([next]);
+    if (next) await cleanupMods([next], { logger: serverLogger });
     throw Object.assign(new Error(next?.error || 'mod_activation_failed'), { statusCode: 409 });
   }
   // Activation awaits child IPC; acquire an idle admission barrier before
@@ -3162,15 +3433,16 @@ async function transitionMod({ modId, enabled, installed, action, reactivate = f
     next.commitProviderReplacement?.();
     loadedMods = old ? loadedMods.map((entry) => entry.id === modId ? next : entry) : [...loadedMods, next];
   } catch (error) {
-    await cleanupMods([next]);
+    await cleanupMods([next], { logger: serverLogger });
     resumeAdmissions?.();
     throw error;
   }
-  if (old) await cleanupMods([old]);
+  if (old) await cleanupMods([old], { logger: serverLogger });
   await reconcileRuntimeManagedSkills();
   await modLoadOptions.onExecutionProviderActivated?.(modId);
 }
 const modDistribution = createModDistribution({
+  logger: serverLogger,
   runtimeRoot: modsRuntimeRoot,
   repositoryFactory: postgresApplication.modDistributionRepositoryFactory,
   onLifecycleChange: transitionMod,
@@ -3182,15 +3454,14 @@ const modDistribution = createModDistribution({
 await modDistribution.ready;
 await migrateLegacyExecutionProviderApproval({
   repositoryFactory: postgresApplication.modDistributionRepositoryFactory,
-  mods: await discoverMods({ runtimeRoot: modsRuntimeRoot }),
+  mods: await discoverMods({ runtimeRoot: modsRuntimeRoot, logger: serverLogger }),
   agents: await agentsStore().list({ includeDisabled: true }),
 });
 loadedMods = await loadMods(modLoadOptions);
-const initialManagedSkillSync = await managedSkillSynchronizer.tick();
-if (!initialManagedSkillSync.ok) await serverLogger.event('managed_skill_sync_failed', { error: initialManagedSkillSync.error });
+await managedSkillSynchronizer.tick();
 await applyOtelConfigurationToNodeGoblins();
 modsStarting = false;
-coreModManagement = createModManagement({ modAuthority, distribution: modDistribution, repositoryFactory: postgresApplication.modDistributionRepositoryFactory });
+coreModManagement = createModManagement({ logger: serverLogger, modAuthority, distribution: modDistribution, repositoryFactory: postgresApplication.modDistributionRepositoryFactory });
 await coreModManagement.ready;
 const modAuthorityRoute = createModAuthorityRoute({ authority: modAuthority, getMods: () => loadedMods, readJsonBody, sendJson });
 const modManagementDistribution = {
@@ -3216,35 +3487,38 @@ const modManagementDistribution = {
 const modManagementRoute = createModManagementRoute({ distribution: modManagementDistribution, readJsonBody, sendJson });
 
 const server = createServer((req, res) => {
-  void requestLifecycle.track(() => handleRequest(req, res)).catch(error => {
-    console.error(`Burrow request failed: ${String(error?.message || error)}`);
-    res.destroy(error);
-  });
+  instrumentHttpResponse({ req, res, logger: serverLogger });
+  void requestLifecycle.track(async () => {
+    try { await handleRequest(req, res); }
+    catch (error) { recordHttpFailure(res, { error, status: 500 }); res.destroy(error); }
+  }).catch(() => {});
 });
 async function handleRequest(req, res) {
   if (shuttingDown) return sendJson(res, 503, { ok: false, error: 'runtime_shutting_down' });
-  const startedAt = Date.now();
-  let responseStatus = null;
-  res.once('finish', () => { void serverLogger.event('http_request', { method: req.method || null, path: String(req.url || '/').split('?')[0], status: responseStatus || res.statusCode, durationMs: Date.now() - startedAt }); });
-  req.once('aborted', () => { void serverLogger.event('client_disconnect', { method: req.method || null, path: req.url || null, phase: 'request_aborted', durationMs: Date.now() - startedAt }); });
   try {
-    const authority = hostAuthorityPolicy(req, authorityConfig, authorityConfig.enabled ? (await runtimeConfig()).ui.authMode : 'none');
+    const internal = coreApiCaller(req);
+    // Only Core-created request objects can take this path. No header/token/
+    // cookie or mod-owned HTTP route can mint this trusted caller identity.
+    const authority = internal ? { protocol: 'http:', authority: 'core-api.invalid' }
+      : hostAuthorityPolicy(req, authorityConfig, authorityConfig.enabled ? (await runtimeConfig()).ui.authMode : 'none');
     if (authority.error) return sendJson(res, authority.status, { ok: false, error: authority.error });
     const url = new URL(req.url || '/', `${authority.protocol}//${authority.authority || `${host}:${port}`}`);
     // Absolute-form request targets cannot override the checked authority.
     if (authorityConfig.enabled && url.host !== authority.authority) return sendJson(res, 403, { ok: false, error: 'host_authority_not_allowed' });
     const origin = `${url.protocol}//${url.host}`;
-    if (await applyApiCors(req, res, url)) return;
-    if (await authRoute({ req, res, url, origin })) return;
+    if (!internal && await applyApiCors(req, res, url)) return;
+    if (internal && req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+    try { if (await authRoute({ req, res, url, origin })) return; }
+    catch (error) { req.operationalFailureLogged = true; throw error; } // Auth routes already emit safe auth.failure.
     if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/api/health')) return sendJson(res, 200, { ok: true, runtime: 'burrow', version: releaseVersion, buildIdentity: healthBuildIdentity, ...(healthReleaseProvenance ? { releaseProvenance: healthReleaseProvenance } : {}), ...(process.env.BURROW_SMOKE_TOKEN && req.headers['x-burrow-smoke-token'] === process.env.BURROW_SMOKE_TOKEN ? { smokeToken: process.env.BURROW_SMOKE_TOKEN } : {}) });
     if (await completionEventRoute({ req, res, url, webhookOnly: true })) return;
-    if (!(await authorizeRequest(req, res, url))) return;
+    if (!internal && !(await authorizeRequest(req, res, url))) return;
     if (await completionEventRoute({ req, res, url })) return;
     if (req.method === 'GET' && url.pathname === '/api/auth/validate') {
       const runtime = await runtimeConfig();
       const mode = runtime?.ui?.authMode || 'none';
       if (mode === 'none') return sendJson(res, 401, { ok: false, error: 'authentication_not_enabled', auth: { mode, enabled: false, authenticated: false } });
-      return sendJson(res, 200, { ok: true, auth: { mode, enabled: true, authenticated: req.burrowVerifiedAuth?.authenticated === true } });
+      return sendJson(res, 200, { ok: true, auth: { mode, enabled: true, authenticated: req.burrowVerifiedAuth?.authenticated === true, ...(internal ? { authorized: true, actor: { type: 'agent', id: internal.caller.agentId } } : {}) } });
     }
     if (await forgeRoute({ req, res, url })) return;
     if (req.method === 'GET' && !url.pathname.startsWith('/api/')) {
@@ -3386,7 +3660,7 @@ async function handleRequest(req, res) {
     return sendJson(res, 404, { ok: false, error: 'not_found' });
   } catch (error) {
     const status = Number(error?.statusCode) >= 400 && Number(error.statusCode) < 500 ? Number(error.statusCode) : 500;
-    void serverLogger.event('request_error', { method: req.method || null, path: req.url || null, status, error: String(error?.message || error), ...(error?.message === 'task_execution_pre_dispatch_recovery_failed' && error.taskExecutionDiagnostics ? { taskExecution: error.taskExecutionDiagnostics } : {}), durationMs: Date.now() - startedAt });
+    recordHttpFailure(res, { error, status });
     return sendJson(res, status, { ok: false, error: String(error?.message || error), ...(error?.details ? { details: error.details } : {}), stack: process.env.NODE_ENV === 'development' ? error?.stack : undefined });
   }
 }
@@ -3426,7 +3700,7 @@ const closeRuntimeResources = createCoordinatedShutdown({
     }
   },
   drainAdmission: () => httpClosePromise,
-  closers: () => [() => cleanupMods(loadedMods), () => otelRuntime.shutdown(), () => postgresApplication.close()],
+  closers: () => [() => cleanupMods(loadedMods, { logger: serverLogger }), () => otelRuntime.shutdown(), () => postgresApplication.close()],
   onTimeout: () => server.closeAllConnections?.(),
 });
 let shutdownPromise = null;
@@ -3440,47 +3714,52 @@ function shutdownRuntime(signal, { exitCode = signal === 'SIGINT' ? 130 : signal
       const { forced, errors } = await drain;
       if (errors.length) {
         exitCode ||= 1;
-        await serverLogger.event('shutdown_error', { signal, errors: errors.map(error => String(error?.message || error)) });
+        await serverLogger.event('shutdown_error', { signal, errors });
       }
-      await serverLogger.event('shutdown_complete', { signal, forced, drainMs: SHUTDOWN_DRAIN_MS });
+      await serverLogger.event(forced ? 'shutdown_forced' : 'shutdown_complete', { signal, forced, drainMs: SHUTDOWN_DRAIN_MS }, { level: forced ? 'warn' : 'info' });
     } catch (error) {
-      console.error(`Burrow shutdown recovery failed: ${String(error?.message || error)}`); exitCode ||= 1;
+      await serverLogger.event('shutdown_recovery_failed', { signal, error }); exitCode ||= 1;
       await drain;
     } finally { await serverLogger.flush().catch(() => {}); process.exit(exitCode); }
   })();
   return shutdownPromise;
 }
-process.once('uncaughtException', (error) => { void serverLogger.event('uncaught_exception', { error: String(error?.stack || error) }).finally(() => shutdownRuntime('uncaughtException', { exitCode: 1 })); });
-process.once('unhandledRejection', (error) => { void serverLogger.event('unhandled_rejection', { error: String(error?.stack || error) }).finally(() => shutdownRuntime('unhandledRejection', { exitCode: 1 })); });
+runtimeShutdownHandler = shutdownRuntime;
 process.once('SIGTERM', () => { void shutdownRuntime('SIGTERM'); });
 process.once('SIGINT', () => { void shutdownRuntime('SIGINT'); });
 
 // A duplicate launcher/service must not become an unhandled EventEmitter
 // exception that buries the actual bind conflict in a Node stack trace.
 server.once('error', (error) => {
-  const code = String(error?.code || 'server_error');
+  const { errorCode: code } = safeOperationalError(error, 'listener_failed');
   const detail = code === 'EADDRINUSE'
     ? `Burrow UI could not bind ${host}:${port}: address already in use.`
-    : `Burrow UI failed to listen on ${host}:${port}: ${String(error?.message || error)}`;
-  void serverLogger.event('listener_error', { code, host, port, error: String(error?.message || error) }).finally(() => { console.error(detail); process.exit(1); });
+    : `Burrow UI failed to listen on ${host}:${port}: ${code}.`;
+  void serverLogger.event('listener_error', { host, port, error }).finally(() => { console.error(detail); process.exit(1); });
 });
 
-server.on('clientError', (error, socket) => { void serverLogger.event('client_error', { code: error?.code || null, error: String(error?.message || error), remoteAddress: socket?.remoteAddress || null }); socket?.destroy(); });
-server.on('connection', (socket) => { socket.once('error', (error) => { void serverLogger.event('socket_error', { code: error?.code || null, error: String(error?.message || error), remoteAddress: socket.remoteAddress || null }); }); });
+server.on('clientError', (error, socket) => { void serverLogger.event('client_error', { error }); socket?.destroy(); });
+server.on('connection', (socket) => { socket.once('error', (error) => { void serverLogger.event('socket_error', { error }); }); });
 // Direct server/Docker startup must publish bundled skills just like the installer.
 const bundledSkillRuntime = await runtimeConfig();
 await ensureDefaultGlobalWorkspace({ installDir: projectRoot, workspaceRoot: bundledSkillRuntime.runtimeState.workspaceRoot, skillStore: postgresApplication.stores.skills });
 
 server.listen(port, host, () => {
   void startupLifecycle.track(async () => {
+  try {
+  await serverLogger.event('startup_summary', {
+    version: releaseVersion, authMode: bundledSkillRuntime.ui.authMode, authSource: bundledSkillRuntime.ui.authSource,
+    environmentOverride: Object.keys(process.env).some(key => key.startsWith('BURROW_UI_AUTH_') && Boolean(process.env[key])),
+    database: 'ready', schedulers: backgroundSchedulersEnabled() ? 'enabled' : 'disabled',
+    mods: { total: loadedMods.length, loaded: loadedMods.filter(mod => mod.status === 'loaded').length,
+      disabled: loadedMods.filter(mod => mod.status === 'disabled').length, failed: loadedMods.filter(mod => mod.status === 'failed').length },
+  });
   await serverLogger.event('listener_started', { host, port, pid: process.pid, version: releaseVersion });
   await postgresApplication.stores.dreamCycles.reconcileInterrupted();
   if (shuttingDown) return;
   if (backgroundSchedulersEnabled()) {
-    void managedSkillSynchronizer.start().then(result => {
-      if (!result.ok) return serverLogger.event('managed_skill_sync_failed', { error: result.error });
-    }).catch(error => serverLogger.event('managed_skill_sync_failed', { error: String(error?.message || error) }));
-    void skillGitSync.start().catch(error => serverLogger.event('skill_sync_startup_failed',{error:'skill_sync_failed'}));
+    void managedSkillSynchronizer.start().catch(() => {}); // Synchronizer owns failure/recovery diagnostics.
+    void skillGitSync.start().catch(error => serverLogger.event('skill_sync_startup_failed',{ error }, { level: 'warn', component: 'skills' }));
     const store = postgresApplication.stores.scheduledJobs;
     try { await store.markMissedRuns(); await store.markMissedSchedules({ activeOwnerModIds: loadedMods.filter((mod) => mod.status === 'loaded').map((mod) => mod.id) }); } finally { /* Shared application store remains open. */ }
     if (shuttingDown) return;
@@ -3531,7 +3810,8 @@ server.listen(port, host, () => {
       } finally { lifecycle.finish(); }
     },
   }) });
-  void recoveryContinuationScheduler.start().catch(() => {});
-  }).catch(error => { console.error(`Burrow startup failed: ${String(error?.message || error)}`); void shutdownRuntime('startup_failure', { exitCode: 1 }); });
+  void recoveryContinuationScheduler.start().catch(error => { if (!shuttingDown) void serverLogger.event('recovery_scheduler_start_failed', { error }); });
+  } catch (error) { void serverLogger.event('startup_failed', { error }); void shutdownRuntime('startup_failure', { exitCode: 1 }); }
+  }).catch(() => {});
 });
 

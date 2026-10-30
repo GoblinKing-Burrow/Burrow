@@ -1,3 +1,5 @@
+import { operatorPreferenceTurn } from './preference-learning.mjs';
+import { resolveTurnMinionDepth } from './minion-depth.mjs';
 import { conversationAuthority } from './conversation-authority.mjs';
 import { contextSessionId, withContextHistory } from './model-context-boundary.mjs';
 import { createHash } from 'node:crypto';
@@ -60,14 +62,16 @@ function sessionExecutionKey({ rootDir, sessionId, args = {}, agentRuntime = nul
     || rootDir;
   return `${path.resolve(String(sessionRoot))}:${String(sessionId || args?.session_id || args?.sessionId || args?.run_id || args?.runId || 'default')}`;
 }
-async function serializeSessionExecution(options, operation) {
+export async function serializeSessionExecution(options, operation) {
   const key = sessionExecutionKey(options);
   return serializeSessionAdmission(
     sessionExecutionQueues,
     key,
     operation,
     options.args?.abort_signal || options.args?.abortSignal,
-    { cancellationGraceMs: options.cancellationGraceMs, onCancellationDeadline: options.onCancellationDeadline },
+    // Continuity retirement fences terminal commits, not every preparation or
+    // command write. Retain the runtime lane until the operation actually drains.
+    // Reset remains an explicit generation supersession, not a timeout shortcut.
   );
 }
 
@@ -84,7 +88,18 @@ export async function runAskChat(options = {}) {
   // continuity guard directly. Production callers always serialize here.
   if (options.testHooks?.bypassSessionExecutionQueue) return runAskChatUnserialized(options);
   const latencyTiming = { ...(options.latencyTiming || {}), runtimeQueuedMs: performance.now() };
-  return serializeSessionExecution(options, () => runAskChatUnserialized({ ...options, latencyTiming: { ...latencyTiming, runtimeAdmittedMs: performance.now() } }));
+  return serializeSessionExecution(options, async () => {
+    try {
+      return await runAskChatUnserialized({ ...options, latencyTiming: { ...latencyTiming, runtimeAdmittedMs: performance.now() } });
+    } catch (error) {
+      // Preserve interrupted-run evidence after execution unwinds but before a
+      // successor can claim continuity. Retirement never detaches live work.
+      if ((options.args?.abort_signal || options.args?.abortSignal)?.aborted) {
+        await options.onCancellationDeadline?.();
+      }
+      throw error;
+    }
+  });
 }
 
 async function subagentDebugSnapshot({ dataRoot, legacyDataRoot = null, sessionId, compatibilityObserver = null, limit = 20 } = {}) {
@@ -224,7 +239,7 @@ async function runAskChatUnserialized({
     }
   }
   if (!contextBoundary) {
-    const isolation = (await stores.conversations.getMetadata({ agentId: runtimeState.agentId, sessionId: resolvedSessionId }))?.contextIsolation;
+    const isolation = (await stores.conversations.getMetadata({ agentId: runtimeState.agentId, sessionId: resolvedSessionId, signal: normalizedArgs.abort_signal }))?.contextIsolation;
     if (isolation?.historySessionId) stores = { ...stores, conversations: withContextHistory(stores.conversations, { agentId: runtimeState.agentId, sessionId: resolvedSessionId, historySessionId: isolation.historySessionId }) };
   }
   const steeringIdentity = { agentId: runtimeState.agentId, sessionId: resolvedSessionId, runId: resolvedRunId };
@@ -233,6 +248,19 @@ async function runAskChatUnserialized({
     onSteeringReady?.(steeringIdentity);
     normalizedArgs.live_steering = { boundary: options => stores.steering.boundary(steeringIdentity, options) };
   }
+  let telemetryRun = null;
+  let telemetryTerminalResult = null;
+  let telemetryEnded = false;
+  const rememberTelemetryTerminal = (result) => {
+    // The orchestrator retains cancellation evidence on the model without
+    // changing the persisted/product model_failed decision contract.
+    telemetryTerminalResult ||= result?.decision === 'model_failed' && result?.model?.cancelled === true ? { ...result, cancelled: true } : result;
+  };
+  const endTelemetryRun = () => {
+    if (!telemetryRun || telemetryEnded) return;
+    telemetryEnded = true;
+    try { telemetry.endRun?.(resolvedRunId, telemetryTerminalResult || { ok: false, status: 'failed' }); } catch {}
+  };
   try {
   const continuityAuthority = postgresContinuity({ store: stores.conversations, agentId: runtimeState.agentId });
   const continuity = await continuityAuthority.claim({
@@ -287,16 +315,21 @@ async function runAskChatUnserialized({
     agentId: runtimeState.agentId,
     sessionId: resolvedSessionId,
   });
-  const telemetryRun = runtimeConfig.opentelemetry?.effective?.enabled
-    ? telemetry?.startRun?.({ runId: resolvedRunId, sessionId: resolvedSessionId, agentId: runtimeState.agentId, source: runSource || turnSource || command, parentTraceContext })
+  // A still-owned A2A delegation belongs to its sender's generation, even if
+  // settings were disabled after the sender started. Neither an arbitrary W3C
+  // carrier nor serialized args may enroll an unrelated run while disabled.
+  const telemetryParentRunId = incomingAgentMessage?.sourceRunId || null;
+  const ownedTelemetryParent = telemetryParentRunId && telemetry?.traceContextForRun?.(telemetryParentRunId);
+  telemetryRun = runtimeConfig.opentelemetry?.effective?.enabled || ownedTelemetryParent
+    ? telemetry?.startRun?.({ runId: resolvedRunId, sessionId: resolvedSessionId, agentId: runtimeState.agentId, source: runSource || turnSource || command, parentRunId: telemetryParentRunId, parentTraceContext })
     : null;
   const observeTrace = telemetryRun
     ? (record) => { telemetry.observe?.(record); return onTraceRecord?.(record); }
     : onTraceRecord;
   const logger = createTraceLogger({ rootDir: traceRoot, runId: resolvedRunId, sessionId: resolvedSessionId, conversationId, onRecord: observeTrace });
   if (latencyTiming) await logger.event('chat-admission-timing', { ...latencyTiming, clockDomain: 'server-process' });
-  const commitTerminalResult = createTerminalCommitter({ stores, agentId:runtimeState.agentId, continuityAuthority, rootDir, sessionRoot, sessionId: resolvedSessionId, runId: resolvedRunId, generation: continuity.generation, command, json, initialWorkingContext, objective: message, traceRef: logger.traceDir, logger, onTerminal: telemetryRun ? (result) => telemetry.endRun?.(resolvedRunId, result) : null, testHooks });
-  const runAgentReply = async ({ recipientRuntime, recipientSessionId, content, senderAgentId, sourceSessionId, sourceRunId, messageMode = 'request_reply', inboundEntryId, contextBoundary = null, parentSignal = null }) => {
+  const commitTerminalResult = createTerminalCommitter({ stores, agentId:runtimeState.agentId, continuityAuthority, rootDir, sessionRoot, sessionId: resolvedSessionId, runId: resolvedRunId, generation: continuity.generation, command, json, initialWorkingContext, objective: message, traceRef: logger.traceDir, logger, onTerminal: rememberTelemetryTerminal, testHooks });
+  const runAgentReply = async ({ recipientRuntime, recipientSessionId, content, senderAgentId, sourceSessionId, sourceRunId, messageMode = 'request_reply', inboundEntryId, contextBoundary = null, parentTraceContext = null, parentSignal = null }) => {
     // Ingress is already durable/idempotent before this callback. Each distinct
     // exchange needs a distinct run, while replays retain the same identity.
     if (!inboundEntryId) throw new Error('agent_message_inbound_identity_required');
@@ -326,7 +359,8 @@ async function runAskChatUnserialized({
         stores: historyStores,
         onTraceRecord: lifecycle?.onTraceRecord || null,
         telemetry,
-        parentTraceContext: telemetryRun ? telemetry.traceContextForRun?.(resolvedRunId) : null,
+        // The sender tool, not its root run, is the immediate A2A parent.
+        parentTraceContext,
         runSource: 'a2a',
         onModelTextDelta: lifecycle?.onModelTextDelta || null,
         onModelThoughtDelta: lifecycle?.onModelThoughtDelta || null,
@@ -345,7 +379,8 @@ async function runAskChatUnserialized({
   const agentMessageReplyTo = incomingAgentMessage?.senderAgentId && incomingAgentMessage?.sourceSessionId
     ? { recipientAgentId: incomingAgentMessage.senderAgentId, sessionId: incomingAgentMessage.sourceSessionId }
     : null;
-  const executionContext = createRuntimeExecutionContext({ agentMessageReplyTo, stores, runtimeState, resolvedSessionId, conversationId, continuityScope, agentRuntime, resolveAgentRuntime, runAgentReply, resolvedWorkingRoot, resolvedTarget, dataRoot, executionBoundaries, mcpTools, mcpConnections, parentRunId: resolvedRunId, traceContext: telemetryRun ? telemetry.traceContextForRun?.(resolvedRunId) : null, telemetry: telemetryRun ? telemetry : null, abortSignal: normalizedArgs.abort_signal || null, skillOverrides: scopedSkillsConfig });
+  const minionDepth = await resolveTurnMinionDepth({ metadata: stores?.metadata, conversations: stores?.conversations, agentId: runtimeState.agentId, sessionId: resolvedSessionId, runId: resolvedRunId });
+  const executionContext = createRuntimeExecutionContext({ minionDepth, agentMessageReplyTo, stores, runtimeState, resolvedSessionId, conversationId, continuityScope, agentRuntime, resolveAgentRuntime, runAgentReply, resolvedWorkingRoot, resolvedTarget, dataRoot, executionBoundaries, mcpTools, mcpConnections, parentRunId: resolvedRunId, traceContext: telemetryRun ? telemetry.traceContextForRun?.(resolvedRunId) : null, telemetry: telemetryRun ? telemetry : null, abortSignal: normalizedArgs.abort_signal || null, skillOverrides: scopedSkillsConfig });
   const effectiveSkillCatalog = await loadEffectiveSkillCatalog({
     workspaceRoot: runtimeState.workspaceRoot,
     agentId: runtimeState.agentId,
@@ -425,6 +460,7 @@ async function runAskChatUnserialized({
     agentId: runtimeState.agentId,
     transcript: sessionSnapshot?.entries || [],
     transcriptSnapshotSupplied: true,
+    signal: normalizedArgs.abort_signal,
   });
   const { compressionResult, preCompressionInspection } = preparedContext;
   const executionPolicy = createExecutionPolicy({
@@ -464,6 +500,7 @@ async function runAskChatUnserialized({
       traceDir: logger.traceDir,
       metadata: {
         ...userTurnMetadata({ command, session, intent, attachments: turnAttachments, turnPlan, subjectScope: verifiedSubjectScope }),
+        operatorInputAt: turnStartedAt,
         ...(turnSource ? { source: turnSource } : {}),
         ...(completionEvent ? { completionEvent } : {}),
         ...(chatInput ? { chatInput } : {}),
@@ -489,7 +526,7 @@ async function runAskChatUnserialized({
     : message;
   let promptContext;
   try {
-    promptContext = await prepareRuntimePromptContext({ rootDir, sessionRoot, resolvedSessionId, preparedContext, runtimeState, runtimeConfig, agentRuntime, stores, route, ambientWorkingContext, structuredSubagents, extraEyesReview, dreamPreload, childEvidence, sessionRecall, runEvidence, albdruckRecall, groupChannelContext, promptAttachments, attachmentManifest, modelTask, logger, modelConfig, executionContext, temporalContext: { turnStartedAt, lastOperatorMessageAt, timezone: await operatorTimezone(stores.metadata) } });
+    promptContext = await prepareRuntimePromptContext({ rootDir, sessionRoot, resolvedSessionId, preparedContext, runtimeState, runtimeConfig, agentRuntime, stores, route, ambientWorkingContext, structuredSubagents, extraEyesReview, dreamPreload, childEvidence, sessionRecall, runEvidence, albdruckRecall, groupChannelContext, promptAttachments, attachmentManifest, modelTask, logger, modelConfig, executionContext, signal: normalizedArgs.abort_signal, temporalContext: { turnStartedAt, lastOperatorMessageAt, timezone: await operatorTimezone(stores.metadata) } });
   } catch (error) {
     // Context preparation can reject before returning its final inspection.
     // Route that exact budget failure through the same durable blocked owner,
@@ -503,7 +540,7 @@ async function runAskChatUnserialized({
   const { turnContext, conversationContext, prompt, finalPromptInspection, contextCompression } = promptContext;
   if (finalPromptInspection.pressure === 'blocked') {
     const content = 'I could not safely fit the final prompt inside the configured model context window after compression. I should not call the model with an over-budget prompt.';
-    return commitTerminalResult({
+    return await commitTerminalResult({
       branch: 'prompt_context_over_budget',
       finalize: () => finalizeBlockedRuntimeResult({
         sessionRoot, stores, agentId: runtimeState.agentId,
@@ -531,12 +568,14 @@ async function runAskChatUnserialized({
 
   const modelExecution = await runRuntimeModelExecution({ continuityAuthority, runtimeTurn, prompt, message, shouldCallModel, modelConfig, logger, resolvedWorkingRoot, rootDir, dataRoot, resolvedSessionId, conversationId, runtimeConfig, executionPolicy, executionContext, normalizedArgs, attachments: turnAttachments, sessionRoot, resolvedRunId, continuity, initialWorkingContext, onTextDelta: onModelTextDelta, onThoughtDelta: onModelThoughtDelta, onContextUsage: onModelContextUsage, command, json });
   if (modelExecution.superseded) {
+    rememberTelemetryTerminal(modelExecution.result);
     await continuityAuthority.interrupt({
       rootDir: sessionRoot, sessionId: resolvedSessionId, runId: resolvedRunId, generation: continuity.generation,
       reason: 'superseded_by_newer_session_run', objective: message, traceRef: logger.traceDir,
       lastCompletedStep: 'Model execution completed after session ownership changed; terminal result was not persisted.',
       pendingVerification: ['Reconcile durable workspace and tool state before continuing.'], workingContext: initialWorkingContext,
     });
+    await logger.terminal();
     return modelExecution.result;
   }
   const { modelTurn, finalWorkingContext } = modelExecution;
@@ -548,7 +587,7 @@ async function runAskChatUnserialized({
       // into a failure. Record it before terminal.json so the marker remains the
       // final trace write and completed traces stay retention-eligible.
       try {
-        const residue = await appendTiddleResidueAsync({ metadataStore: stores.metadata, agentId: runtimeState.agentId, scope: continuityScope, sessionId: resolvedSessionId, conversationId: conversationId || resolvedSessionId, runId: logger.runId, message, answerText: committedResult.answerText, toolResults: committedResult?.proposalExecution?.tools || [] });
+        const residue = await appendTiddleResidueAsync({ metadataStore: stores.metadata, agentId: runtimeState.agentId, scope: continuityScope, sessionId: resolvedSessionId, conversationId: conversationId || resolvedSessionId, runId: logger.runId, message, userAt: turnStartedAt, operatorInput: !incomingAgentMessage && operatorPreferenceTurn({ source: turnSource, externalTurn: externalTurnMetadata, completionEvent }), answerText: committedResult.answerText, toolResults: committedResult?.proposalExecution?.tools || [] });
         await logger.event('tiddle-residue-recorded', { rollingContinuity: true, residue: residue ? { ref: residue.ref, scope: residue.scope } : null });
       } catch (error) {
         await logger.event('tiddle-residue-recorded', { rollingContinuity: true, error: String(error?.message || error) });
@@ -556,8 +595,17 @@ async function runAskChatUnserialized({
     },
   });
   return result;
+  } catch (error) {
+    rememberTelemetryTerminal({ ok: false, status: normalizedArgs.abort_signal?.aborted || error?.name === 'AbortError' ? 'cancelled' : 'failed' });
+    throw error;
   } finally {
-    if (stores.steering) await stores.steering.boundary(steeringIdentity, { finish: true });
+    try {
+      if (stores.steering) await stores.steering.boundary(steeringIdentity, { finish: true });
+    } finally {
+      // Finish only after the terminal owner (including its trace writes) has
+      // settled. Exceptions and supersession cannot strand a started OTel run.
+      endTelemetryRun();
+    }
   }
 }
 

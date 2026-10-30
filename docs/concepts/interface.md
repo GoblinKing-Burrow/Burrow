@@ -4,7 +4,6 @@
 !!! warning "Earlier technical reference"
     This page is retained from earlier documentation and has not been fully revalidated for the public 2026.10.19 release. Its revision-specific links and examples may describe older or development behavior. Start with the [current operator guide](../guide/installation.md); do not use this page alone to select installation commands, image tags, or security settings.
 
-
 The BURROW interface brings conversations, agent configuration, project tasks, retained evidence, and media generation into one operator console. This retained guide includes targeted source corrections against public **2026.10.19**; its older screenshots are not a complete inventory of current controls. Start by checking the agent and session: these determine which conversation and records you are viewing.
 
 The runtime owns durable state. The browser presents API responses and live activity, and keeps some local preferences and conversation caches. A visible answer, an accepted job, and a verified result are different states; inspect the relevant run or evidence before treating work as complete.
@@ -13,14 +12,13 @@ The runtime owns durable state. The browser presents API responses and live acti
 !!! note "Development screenshots"
     The screenshots below show synthetic development fixtures captured on October 16, 2026. They illustrate interface layout, not verified task execution, provider generation, or saved configuration. Empty outer canvas has been cropped; application content is unchanged. Select an image to inspect it at full resolution. The source-backed behavior described in this guide remains pinned to the documented release.
 
-
 ## Find the right page
 
 | Page | Use it for |
 | --- | --- |
 | **Chat** | Agent conversations, named sessions, Minion activity, group rooms, and workspace file tabs |
 | **Tasks** | Projects, named project paths, task status, assignment, and task execution |
-| **Archive** | Retained Chat, Dreams, Tiddle continuity, and run Proof |
+| **Archive** | Retained Chat, Dreams, Tiddle continuity, Tasks, Forge, Workflow Events, and run Proof |
 | **Brains** | Explicit agent-owned saved memories, search, editing, and deletion |
 | **Forge** | Generation catalogs, jobs, artifacts, and recent creations |
 | **Settings** | General preferences, agents, skills, connections, and mods |
@@ -54,7 +52,7 @@ flowchart TD
     Mods --> Browser
 ```
 
-The built-in `api` and `apiLocal` helpers both request same-origin paths. Agent selection changes the conversation owner; it does not change the server. Mod installation remains a trust decision. See [Trust boundaries](../security/trust-boundaries.md). Sources: , .
+The built-in `api` and `apiLocal` helpers both request same-origin paths. Agent selection changes the conversation owner; it does not change the server. Mod installation remains a trust decision. See [Trust boundaries](../security/trust-boundaries.md).
 
 The registry distinguishes loading, empty, and unavailable states. A failed refresh can leave the last known agents visible with an **Agents stale** status. Treat that label as a failed refresh, not confirmation of current availability.
 
@@ -80,7 +78,7 @@ The composer suggests `/help`, `/context [full]`, `/status`, `/new`, and `/stop`
 
 Chat submits `POST /api/chat` and requests newline-delimited JSON events. Progress, tool activity, and streamed answer text are displayed separately. The terminal result supplies the authoritative final answer; materially different streamed text can remain in a separate disclosure. A connection error does not prove that the runtime stopped.
 **Stop response** (square icon) aborts the browser's stream read and requests cancellation through `POST /api/chat/{runId}/cancel`. The interface also reconciles activity with `GET /api/chat/runs/active` and reloads session records. It does not resume a disconnected stream from an event offset. If work seems stuck, inspect current runtime activity and [Troubleshooting](../operations/troubleshooting.md) before resubmitting a potentially consequential instruction.
-Expand an agent to inspect its Minion streams. Selecting a Minion changes the displayed child conversation while preserving its parent agent's identity for workspace ownership. See [Agents and Minions](agents-minions.md). MCP activity cards show provider and tool identity without exposing MCP argument and output payloads in the transcript. Use the relevant evidence views when investigating execution.
+Expand an agent to inspect its Minion tree, then select a child or nested child to view its stream. Work whose parent is no longer retained remains visible at the top of the displayed subtree rather than disappearing. Selecting a Minion changes the displayed child conversation while preserving its parent agent's identity for workspace ownership. See [Agents and Minions](agents-minions.md). MCP activity cards show provider and tool identity without exposing MCP argument and output payloads in the transcript. Use the relevant evidence views when investigating execution.
 <figure markdown="span">
 [![Synthetic Chat conversation with an expanded runtime activity card beneath an assistant message.](../assets/screenshots/04-chat-runtime-actions.webp){ loading=lazy }](../assets/screenshots/04-chat-runtime-actions.webp)
 <figcaption>Expanded runtime activity in a synthetic conversation. Visible fixture entries do not verify that an operation ran.</figcaption>
@@ -90,11 +88,11 @@ Expand an agent to inspect its Minion streams. Selecting a Minion changes the di
 
 The waiting label distinguishes **Waiting for runtime**, **Preparing response**, **Model request prepared**, **Model request dispatched**, and **Model response received; continuing**. A prepared request is not proof that the provider received it. Expand tool cards for individual pending, successful, or failed tool entries; a collapsed card's checkmark is not proof that every operation succeeded. **Progress recorded** retains available run progress after completion.
 
-While a run is active, send a follow-up in the composer to steer it. Check the message status: **Pending — next model boundary**, **Delivered to run**, or **Not delivered — retained as follow-up**. Delivery does not mean the requested correction has already been carried out. If a run fails or is interrupted, inspect recorded activity and the final answer before repeating work. Sources: , , .
+While a main run is active, choose the composer action explicitly: **Queue next** (the busy default) accepts a durable later turn, **Steer** targets the selected active run at a model boundary, and **Side question** makes a separate tool-free call against a frozen snapshot. A failed steer is not silently retried as Send; a side answer does not automatically become main-session context. Acceptance or delivery does not mean the instruction has been carried out. Inspect each input’s status and the run’s recorded result before repeating work. See [delivery choices and queue holds](../guide/everyday-use.md#send-queue-next-steer-or-side-question).
 
 ### Attachments and groups
 
-Single-agent chat accepts supported image and text formats. Default browser budgets are **8 MiB per file**, **16 MiB per batch**, and **8 files**; deployments can override these budgets. Check the attachment list and any validation error before sending. PDF extraction is not supported; convert the relevant content to a supported text format before attaching. Persisted attachments and generated artifacts have separate download routes under `/api/attachments/` and `/api/generated-artifacts/`; images can be enlarged. Sources: , , .
+Single-agent chat accepts supported image and text formats. Default browser budgets are **8 MiB per file**, **16 MiB per batch**, and **8 files**; deployments can override these budgets. Check the attachment list and any validation error before sending. PDF extraction is not supported; convert the relevant content to a supported text format before attaching. Persisted attachments and generated artifacts have separate download routes under `/api/attachments/` and `/api/generated-artifacts/`; images can be enlarged.
 
 Choose **Group Chat** to create or reopen a room. A new room needs a name and at least two agents from the local registry. Participant-scoped `@` suggestions help address messages; the runtime parses the submitted text. Each participant's active run can be cancelled separately. Rooms use `/api/group-channels`; browser tabs can be restored, while room content is fetched from the server. Unsupported or oversized group attachments are skipped, so verify the attachment list.
 ## Workspace and layout
@@ -102,28 +100,32 @@ Choose **Group Chat** to create or reopen a room. A new room needs a name and at
 The **Workspace** panel shows the selected parent agent's files, including while a Minion conversation is displayed. Open a file to create a document tab, choose **Edit**, then **Save**. The tab retains its owning agent for the save request. The editor provides text editing, not a terminal or a file creation, rename, deletion, or upload workflow.
 The file tree uses `GET /api/workspace/files?agentId=…&scope=agent`; reads and saves use `/api/workspace/file`. Automatic tree refresh runs while Workspace is visible in the left rail and keeps the last tree on a transient failure. The backend remains responsible for file access checks.
 
-Use **Settings → General → Rail panels** to choose **None**, **Agents**, **Workspace**, **Accounts**, or **System** for each rail. A rail can show a single panel or divided panels. Defaults put Agents above Workspace on the left and no panels on the right. **Appearance** offers Smatchet Dark, Nexus, Hatchet, Chaos, Paper, Terminal, and High Contrast. These layout preferences are stored in the browser.
+Use **Settings → General → Rail panels** to choose **None**, **Agents**, **Workspace**, **Accounts**, or **System** for each rail. A rail can show a single panel or divided panels. Defaults put Agents above Workspace on the left and no panels on the right. **Appearance** offers Smatchet Dark, Midnight, Blue Hour, Nexus, Hatchet, Chaos, and Terminal. These layout preferences are stored in the browser.
 On viewports at or below 600 pixels wide, controls reflow into a stacked layout, rails remain available, and page tabs can scroll horizontally. Scroll the page or expand a collapsed rail to reach its controls.
 
 ## Settings map
 
-Settings separates category navigation, subsection navigation, the main editor, and supporting inventory or details. The agent selected inside Settings can differ from the agent selected in Chat; check the agent selector before saving.
+This settings map reflects the development UI reviewed **29 October 2026**, rather than the older screenshots below. Settings separates category navigation, subsection navigation, the main editor, and supporting inventory or details. The agent selected inside Settings can differ from the agent selected in Chat; check the agent selector before saving.
 
 | Category | Built-in sections |
 | --- | --- |
-| **General** | Operator profile (including Operator timezone), Execution boundaries, Trace retention, OpenTelemetry, Brain memory, Export, Rail panels, Tiddle Signal, Appearance |
-| **Agents** | Agent details, Profile documents, MCP tools, Cron jobs, Dreams, Skills |
+| **General** | Operator profile (including Operator timezone and Browser tab), Trace retention, Continuity, Export, Rail panels, Appearance |
+| **Agents** | Select **Global** for Global documents and Execution boundaries; select an agent for Agent details, Profile documents, MCP tools, Cron jobs, Workflow events, Dreams, Skills |
 | **Skills** | Text skills, managed Git sources, lifecycle, global use, and assignments |
-| **Connections** | Authentication, Model providers, Load Balancing, MCP servers, API tokens |
+| **Connections** | Authentication, OpenTelemetry, Browser origin, Models, Load balancing, MCP servers, API tokens |
 | **Mods** | Installed mods, Mod sources, Automatic source checks |
 
-- **Model providers:** configure connections, discover or enter models, and select the models exposed to agents. See [Models and providers](models.md).
+- **OpenTelemetry:** add, select, enable or remove destinations, then save the complete draft list. The master **Send telemetry** switch and individual destination switches are separate. Saved and effective environment-controlled destinations are distinguished; see [Observability](../operations/observability.md#opentelemetry).
+- **Models:** configure connections, discover or enter models, and select the models exposed to agents. See [Models and providers](models.md).
 - **MCP servers and MCP tools:** configure a connection under Connections, then review the selected agent's grants under Agents. Mod-managed connections and mod-authorized tools have different editing rules. See [MCP](mcp.md).
 - **Profile documents:** edit `SOUL.md`, `RULES.md`, `ORIENTATION.md`, `PREFERENCES.md`, `TOOLS.md`, and `DreamMemory.md`. See [Agents and Minions](agents-minions.md).
 - **Cron jobs and Dreams:** manage their separate schedules and model selections. An accepted manual job trigger is not a completed run. See [Workers and tasks](workers-tasks.md) and [Dreams](dreams.md).
-- **Tiddle Signal:** configure continuity curation separately from task execution. See [Memory](memory.md).
+- **Continuity:** configure embeddings and global Dream promotion in the main column; configure Tiddle Signal curation in the additional-settings column, separately from task execution. See [Memory](memory.md).
 - **Authentication, API tokens, and Execution boundaries:** review the relevant [authentication](../security/authentication.md) and [trust-boundary](../security/trust-boundaries.md) guidance before changing access or execution policy.
-- **Export and Trace retention:** use [Backup and recovery](../operations/backup-recovery.md) and [Operator procedures](../operations/procedures.md). Trace retention requires **Save policy**, then **Preview cleanup**, then **Run now** for the unchanged policy. Any edit requires saving and previewing again.
+- **Export and Trace retention:** use [Backup and recovery](../operations/backup-recovery.md) and [Operator procedures](../operations/procedures.md). Trace retention uses **Apply policy**. Applying an enabled policy can start scheduled deletion without Preview or Run now. For a manual cleanup, apply the intended policy, inspect **Preview cleanup**, then choose **Run now** with unchanged inputs. Any policy edit requires applying and previewing again.
+
+**Export** keeps export controls in the main editor and **Import** in the additional-settings column. **Agent details** places **Minion settings** in that additional column, with the default Minion model and **Maximum minion depth** (0: none; 1: direct children, the default; 2: one further nested level). Depth saves when slider adjustment ends; existing Minion trees cannot gain extra depth. **OpenTelemetry** keeps the selected destination editor in the main column and the **Destinations** inventory in the additional column; **Dreams** uses it for **Dream memory**, with retained history in **Archive → Dreams**. Settings boolean controls are styled as switches; save the relevant section where it offers a Save action.
+
 Under **Mods**, source checks discover available versions; they do not automatically install updates. Newly installed mods begin disabled, while updates preserve enabled state. Honor any restart-required or busy response shown by the runtime. A mod UI is dynamically imported into the application page, so installing a mod is a trust decision rather than an isolated visual customization.
 
 ### General
@@ -228,13 +230,13 @@ To run a task:
 3. Follow the dispatched run in the assigned agent's chat. The current board does not poll task execution continuously; reopen the task or use **Refresh history** to inspect newer persisted activity.
 4. Inspect the assigned agent's **default** conversation and **Archive → Proof** for the final answer, blockers, and verification evidence.
 
-Dispatch awaits the stored task and project; the previous unawaited-lookup limitation no longer applies. A successful dispatch records a running execution with a run ID, then records its terminal result asynchronously. Execution receipt status is separate from the board column: dispatch and completion do not automatically move the card to In Progress or Done. Check the result and update task status deliberately. If progress remains visible after a connection failure, check the active run before clicking Execute again. Deleting a project also deletes its tasks. See [Workers and tasks](workers-tasks.md). Sources: , , .
+Dispatch awaits the stored task and project; the previous unawaited-lookup limitation no longer applies. A successful dispatch records a running execution with a run ID, then records its terminal result asynchronously. Execution receipt status is separate from the board column: dispatch and completion do not automatically move the card to In Progress or Done. Check the result and update task status deliberately. If progress remains visible after a connection failure, check the active run before clicking Execute again. Deleting a project also deletes its tasks. See [Workers and tasks](workers-tasks.md).
 
 Current UI adds **Archive → Tasks** for Done tasks aged 48 hours, and **Archive → Forge** for retained creation evidence. See [tasks](../guide/tasks.md#completed-tasks-move-to-archive) and [Forge deletion](../guide/everyday-use.md#delete-a-forge-creation-retain-its-execution-record). The retired external Codex-LB rail/polling is removed; native OpenAI LB statistics live in the footer and account usage/reset controls live in **Accounts**.
 
 ### Archive
 
-Use **Chat** for retained sessions, **Dreams** for recorded Dream entries, **Tiddle** for continuity cards and history, and **Proof** for run evidence. The calendar uses the browser's timezone. Chat and Dream lists support server-side date filtering; Tiddle and Proof do not use that same date filter.
+Use **Chat** for retained sessions, **Dreams** for agent/day groups with narratives and phase outcomes, **Tiddle** for continuity cards/history, **Tasks** and **Forge** for retained work, **Workflow Events** for retained GitHub deliveries/handling, and **Proof** for run evidence. The calendar uses the browser timezone. Chat, Dreams and Workflow Events have server-side date filtering; Tiddle and Proof do not use that same date filter.
 
 Chat opens recent messages first and can load earlier pages. **Copy loaded chat** copies only the messages already loaded. A history-unavailable response is different from reaching the beginning of retained history. In Proof, expand the evidence to distinguish execution from verification: an answer without a terminal receipt is shown as **unverified**, and a linked child's execution state is separate from its verification result. The control labeled **Full redacted tool evidence** loads retained traces when expanded. That label is not a blanket guarantee that every free-text value is secret-free; review evidence before sharing it.
 <figure markdown="span">
@@ -252,12 +254,11 @@ Brains replaces the former Albdruck knowledge workspace. Memories belong to an *
 4. Open an existing entry, make changes, and choose **Save memory**. Check the returned revision and owner.
 5. If a conflict appears, preserve any unsaved wording you need, choose **Reload memory**, review the current version, then reapply the intended edit.
 
-Migrated records show **Migrated from legacy Albdruck** and expandable **Legacy migration details**. These are retained historical records, not fresh verification. Saved memories are not automatically preloaded into every conversation. The agent explicitly invokes memory tools when needed. For provider-backed semantic search, see **Settings → General → Brain memory** and [Memory](memory.md). Embeddings are optional and off by default; hosted providers can receive memory contents and queries when enabled.
+Migrated records show **Migrated from legacy Albdruck** and expandable **Legacy migration details**. These are retained historical records, not fresh verification. Saved memories are not automatically preloaded into every conversation. The agent explicitly invokes memory tools when needed. For provider-backed semantic search, see **Settings → General → Continuity** and [Memory](memory.md). Embeddings are optional and off by default; hosted providers can receive memory contents and queries when enabled.
 
 
 !!! warning "Review before deleting memories"
     **Delete memory** and **Delete selected memories** issue deletion immediately; the workspace does not present the old conversation-purge confirmation. **Select page** selects only the displayed page. Bulk deletion is independent per record, not atomic: inspect every reported result, then **Reload list** before retrying conflicts. Deleting a saved memory does not erase its source conversation.
-
 
 <figure markdown="span">
 [![Brains with an Agent owner selector, saved-memory list, and an editor for a synthetic memory and source references.](../assets/screenshots/06-brains-memory.webp){ loading=lazy }](../assets/screenshots/06-brains-memory.webp)
@@ -271,7 +272,7 @@ Migrated records show **Migrated from legacy Albdruck** and expandable **Legacy 
 3. For a previous decision or an exact quotation, ask that agent to search its historical conversations with `session_search`, including reset history, and expand the original source with surrounding dialogue.
 4. Check the source session, date, and reset/archive provenance before relying on the result. A memory summary or an empty search is not proof that an original exists or never existed.
 
-Brains search searches saved memories, not conversation transcripts. The old Albdruck Recall, retention, and purge workflows are no longer available in the built-in UI; their compatibility route adapter is not mounted by the server. Do not use an old purge recipe for this release. See [Operator procedures](../operations/procedures.md) for supported maintenance. Sources: , , .
+Brains search searches saved memories, not conversation transcripts. The old Albdruck Recall, retention, and purge workflows are no longer available in the built-in UI; their compatibility route adapter is not mounted by the server. Do not use an old purge recipe for this release. See [Operator procedures](../operations/procedures.md) for supported maintenance.
 
 ## Forge
 
@@ -317,7 +318,7 @@ The interface uses `localStorage` for more than appearance. Closing the tab or r
 | Archive Chat lists | Up to 12 scoped query entries by default |
 | Group tabs | Room-tab descriptors survive reloads; file tabs do not |
 | UI preferences | Agent selection, themes, rail layout, and ordering persist |
-Archive cache keys include target identity, agent, query, date, timezone, and content kind. Cached rows can appear before refresh; check stale or unavailable warnings rather than treating a cached list as a successful current read. Default transcript cache limits also bound turns per conversation, text size per turn, and aggregate serialized content. Sources: , .
+Archive cache keys include target identity, agent, query, date, timezone, and content kind. Cached rows can appear before refresh; check stale or unavailable warnings rather than treating a cached list as a successful current read. Default transcript cache limits also bound turns per conversation, text size per turn, and aggregate serialized content.
 
 These bounds are cache policies, not secure-erasure guarantees. Protect the browser profile, especially on shared machines, and include site data in any browser cleanup procedure. Clearing browser site data does not delete server records; server retention or purge does not promise to erase every browser copy. Basic credentials are held separately in memory and are not written to these caches.
 For endpoint schemas and error behavior, use the [API reference](../reference/api.md). For deployment checks, failure diagnosis, and consequential maintenance actions, use [Troubleshooting](../operations/troubleshooting.md) and [Operator procedures](../operations/procedures.md).
@@ -333,4 +334,18 @@ Corrections on this page were checked against public **2026.10.19**; any newer d
 
 ## Current chat and appearance additions
 
-The chat composer distinguishes Send, Queue next, Steer and Side question; [everyday use](../guide/everyday-use.md#send-queue-next-steer-or-side-question) explains their different effects and held queues. Compaction has visible started/completed/failed feedback and retained completion receipts. **Settings → General → Appearance** also offers **Midnight**, a black theme with blue outlines and magenta accents. Theme changes do not alter model or runtime policy.
+The chat composer distinguishes Send, Queue next, Steer and Side question; [everyday use](../guide/everyday-use.md#send-queue-next-steer-or-side-question) explains their different effects and held queues. Compaction has visible started/completed/failed feedback and retained completion receipts. The current **Settings → General → Appearance** choices include **Midnight** (black with blue outlines and magenta accents) and **Blue Hour** (black and blue with purple accents); Paper and High Contrast are no longer listed. Theme changes do not alter model or runtime policy.
+
+## 29 October development delta
+
+The Minion depth controls, nested Minion tree and multi-destination telemetry settings above were checked statically against UI `daa914ae80ed154ce39a76d0b8ca5f84aa278b21` on **2026-10-29**. This did not recapture the historical screenshots or verify a live deployment. See [source coverage](../project/source-map.md).
+
+## Current save behavior and history locations
+
+Independent controls autosave with saving/saved/error feedback: operator and agent names on validated blur; avatar changes and agent enabled state immediately; timezone/tab-suffix text on validated blur; MCP grants, complete Minion model choices and Dream toggles immediately; Minion depth, Dream emphasis and temperature at adjustment completion. Failed edits remain retryable and protected by the shared unsaved-change guard. Independent writes use accepted counterpart values rather than silently saving unrelated drafts.
+
+Coupled editors retain an explicit save: profile documents, model providers/pools, authentication, MCP connections, skills/sources, cron jobs, workflow watches/receiver, embeddings, execution boundaries and OpenTelemetry. Tiddle model source/provider/path settings remain under **Save Tiddle Settings**; temperature autosaves only against an already accepted model. Built-in Mods automatic-check settings autosave a valid complete enabled/interval/stale scope. Do not assume contributed mod forms have the same shared guard.
+
+Dream history is in **Archive → Dreams**; workflow delivery history is in **Archive → Workflow Events**. Their Settings pages retain configuration. The agent rail discovers visible Minions across that agent's originating sessions and retains their parent/root context; opening one does not change the parent agent's ordinary session selection. Delegated child task turns are labeled from retained source attribution rather than presented as a new operator message.
+
+Source-reviewed on 30 October 2026 against UI `bb78b136e7ceb21858b134c1f8376726d8e18f5d`; historical screenshots were not recaptured.

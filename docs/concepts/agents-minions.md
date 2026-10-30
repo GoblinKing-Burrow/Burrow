@@ -4,7 +4,6 @@
 !!! warning "Earlier technical reference"
     This page is retained from earlier documentation and has not been fully revalidated for the public 2026.10.19 release. Its revision-specific links and examples may describe older or development behavior. Start with the [current operator guide](../guide/installation.md); do not use this page alone to select installation commands, image tags, or security settings.
 
-
 Use a registered agent for a persistent identity and configuration. Use a minion for an explicit child task. Use peer messaging when one registered agent needs another agent's response in that recipient's own context.
 
 ## Registered agents
@@ -50,16 +49,29 @@ Optional fields include a short `label` and an exact configured `model` ID. When
 
 The target is validated before dispatch. Local wrapper directories may be refined to a nested `repo` directory when only that directory has repository signals. The receipt records the resolved target; use it when interpreting results.
 
+### Minion Depth
+
+Current development has an independent per-agent **Minion Depth** setting, default **1**:
+
+| Depth limit | Work permitted from the root (depth 0) |
+|---|---|
+| `0` | No child spawning |
+| `1` | Direct children only; children are leaves |
+| `2` | Children may spawn grandchildren; grandchildren are leaves |
+
+At a leaf, `spawn_subagent` is absent from the tool surface and the executor independently rejects a manually requested spawn. This is a nesting ceiling, not a fan-out control or a per-spawn argument. Saving or clearing the separate Minion model selection does not change depth. Use the [Minion settings API](../reference/api/settings.md#minion-depth) for the request contract.
+
+Child ancestry and its spawn-time budget persist. Reopening a child does not turn it into a root; historical direct children without a marker remain depth 1 with budget 1. The current agent setting can tighten the effective spawning budget, but raising it does not enlarge a child's saved lineage budget.
+
 ### What a minion receives
 
-A child starts with a purpose-built prompt containing its task and working directory. It runs its own model/tool loop and does not receive the full parent conversation as a cloned transcript. Its standard tool surface includes filesystem, shell, Git, and nested child tools; it excludes the server-owned Forge dispatcher.
+A child starts with a purpose-built prompt containing its task and working directory. It runs its own model/tool loop and does not receive the full parent conversation as a cloned transcript. Its standard tool surface includes filesystem, shell and Git tools; nested spawning is available only while the depth budget permits it. It excludes the server-owned Forge dispatcher.
 
 Local minions use a separate Node process. A remote-assigned minion uses the child runner in-process so it can preserve the trusted remote execution controller. Both have separate child-session lineage and receipts.
 
 
 !!! warning "Isolation is about session/process context"
     A minion target is not a filesystem cage. An instruction such as “do not modify files” communicates task scope, but the target directory does not remove mutation tools. Configured execution boundaries are forwarded into child review and execution; they retain the limited enforcement scope described in [Permissions](../security/permissions.md#minion-boundary-propagation).
-
 
 ### Completion and evidence
 
@@ -88,7 +100,11 @@ Identical structural spawn requests within the same parent lineage can reuse an 
 
 ## Peer agent messages
 
-`agent_send_message` addresses another registered agent, optionally choosing its recipient session. Messages are stored as attributed `agent` turns in both conversations; they are not impersonated operator messages.
+`agent_send_message` addresses another registered agent by canonical ID (preferred) or unique full display name, optionally choosing its recipient session. Exact IDs take precedence; otherwise existing ASCII case-insensitive ID/name matching applies. There is no fuzzy recipient selection, and unknown or ambiguous names fail without sending. Messages are stored as attributed `agent` turns in both conversations; they are not impersonated operator messages.
+
+For an unknown or ambiguous peer, use Core-native `agents_list`. No Backdoor skill, MCP catalog lookup, health probe or peer-session inspection is needed for ordinary A2A. A known unambiguous peer can be messaged directly.
+
+The directory returns only exact `{id, name, enabled}` cards, with enabled agents by default. Optional `query` matches case-insensitive ID/name substrings; `includeDisabled: true` includes disabled identities. `limit` is 1–20 (default 20); follow `nextCursor` with unchanged filters until null. `totalCount` describes the filtered directory. If the registry changes, restart the listing. If provider-context projection reports omitted cards, narrow the query or page before advancing. Directory membership is not a health check or permission to inspect peer data.
 
 | Mode | Behavior |
 |---|---|
@@ -121,7 +137,7 @@ Use [Interface groups](interface.md#attachments-and-groups) for room controls an
 
 ## Watching and stopping work
 
-Active peer runs expose bounded progress. Stopping an A2A parent cancels its active nested reply tree. Local minion process cancellation sends `SIGTERM` to the process group, then forces `SIGKILL` after a configurable grace (default one second); cleanup also handles remaining descendants and removes the temporary payload. This cancellation grace is not a wall-clock task timeout. Completed child visibility is a UI projection: the helper retains recent completed children for one hour and caps the displayed list; durable receipts are separate from that visible list.
+Active peer runs expose bounded progress. Stopping an A2A parent cancels its active nested reply tree. Local minion process cancellation sends `SIGTERM` to the process group, then forces `SIGKILL` after a configurable grace (default one second); cleanup also handles remaining descendants and removes the temporary payload. This cancellation grace is not a wall-clock task timeout. Session-scoped status projects the requested session and its descendants, not an arbitrary capped child list. The agent rail additionally requests agent-wide Minion discovery through overview, covering visible children from all originating sessions for the selected agent without adding unrelated normal conversations. Recent completed children normally remain visible for one hour; an ended ancestor can remain to connect a visible descendant. Immediate parent, root and depth are separate fields. A child-scoped query excludes siblings; overview context hydration is separately bounded to the requested session plus 12 descendants. Durable receipts remain separate from visibility.
 
 See [Interface](interface.md), [Observability](../operations/observability.md), and [Execution flow](../architecture/execution-flow.md).
 
@@ -133,3 +149,13 @@ Corrections on this page were checked against public **2026.10.19**; any newer d
 
 - [backend/src/config.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/config.mjs)
 - [backend/src/subagent-spawn-execution.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/subagent-spawn-execution.mjs)
+
+## 29 October development delta
+
+Changed contracts above were checked statically against Backend `4057b50a5d5a9b14d36bb3b70f35781c4b29a9b9` on **2026-10-29**. This is not a runtime, provider or collector test, nor a revalidation of unchanged historical sections. See [source coverage](../project/source-map.md).
+
+## Cross-session discovery and delegated authorship
+
+`POST /api/agents/overview` accepts `minionScope: "agent"` to return the requested anchor and visible Minions across that agent's sessions; omitted scope remains `session`. A successful `status.minionScope: "agent"` confirms that broader coverage. An older response without that marker proves only session-scoped coverage. Context hydration is separately bounded to the anchor plus 12 distinct child sessions; omitted contexts do not hide status rows. This does not broaden cancellation, recovery, or `/api/agent-status`.
+
+Live and Archive child turns retain compact source-authored delegation metadata. A `role: user` child task with `kind: subagent-delegated-task` is delegated work, not a fresh operator instruction. Missing legacy markers do not prove operator authorship; arbitrary raw metadata is not passed through. The UI uses retained source information for truthful sender labels.

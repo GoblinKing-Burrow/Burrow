@@ -1,6 +1,8 @@
 import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { redactProtectedText } from './redaction.mjs';
+import { remoteTelemetryConfiguration } from './remote-telemetry-configuration.mjs';
 
 const CHILD_PATH = fileURLToPath(new URL('./mod-host-child.mjs', import.meta.url));
 // A hung extension handler must not hold Burrow core's HTTP request open forever.
@@ -64,13 +66,47 @@ function validateResponseHeaders(value) {
 }
 // Mod HTTP responses remain JSON-only. Streaming, buffers and arbitrary structured
 // clone values are deliberately outside the generic mod-host contract.
+// Providers may inadvertently echo their private request, including inside result
+// metadata. Strip the reserved transport field recursively without inspecting or
+// rewriting ordinary command, filesystem, or metadata content.
+function stripPrivateTelemetryResult(value, code) {
+  let result;
+  try { result = JSON.parse(JSON.stringify(value)); } catch { throw hostError(code); }
+  // The parsed JSON tree has no cycles. Iteration avoids imposing a new depth or
+  // metadata limit on valid process and filesystem results.
+  const pending = [result];
+  while (pending.length) {
+    const current = pending.pop();
+    if (current && typeof current === 'object') {
+      for (const key of Object.keys(current)) {
+        if (key === 'telemetryConfiguration') { delete current[key]; continue; }
+        pending.push(current[key]);
+      }
+    }
+  }
+  return result;
+}
+
+// Preserve known operational categories without trusting arbitrary exception text.
+const SYSTEM_CONTROLLER_ERROR_CODES = new Set([
+  'remote_process_failed', 'remote_filesystem_failed', 'remote_configuration_failed',
+  'gateway_not_connected', 'gateway_not_ready', 'gateway_disconnected', 'gateway_dispatch_failed',
+  'gateway_configuration_failed', 'gateway_configuration_timeout', 'gateway_operation_id_mismatch',
+  'gateway_terminal_evidence_missing', 'operation_id_conflict', 'operation_in_progress',
+  'protected_redelivery_forbidden', 'operation_correlation_conflict', 'operation_correlation_missing',
+  'telemetry_configuration_invalid', 'telemetry_endpoint_invalid', 'telemetry_headers_invalid',
+]);
+function safeSystemControllerError(value, fallback) {
+  return SYSTEM_CONTROLLER_ERROR_CODES.has(value) ? value : fallback;
+}
+
 function validateSystemProcessResult(value, operationId, targetId) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.tool !== 'shell_exec'
     || value.operationId !== operationId || value.targetId !== targetId || typeof value.ok !== 'boolean') throw hostError('remote_process_result_invalid');
-  let encoded;
-  try { encoded = JSON.stringify(value); } catch { throw hostError('remote_process_result_invalid'); }
-  if (encoded === undefined) throw hostError('remote_process_result_invalid');
-  try { return JSON.parse(encoded); } catch { throw hostError('remote_process_result_invalid'); }
+  const result = stripPrivateTelemetryResult(value, 'remote_process_result_invalid');
+  if (!result || typeof result !== 'object' || Array.isArray(result) || result.tool !== 'shell_exec'
+    || result.operationId !== operationId || result.targetId !== targetId || typeof result.ok !== 'boolean') throw hostError('remote_process_result_invalid');
+  return result;
 }
 
 function jsonObject(value, code) {
@@ -85,7 +121,8 @@ function jsonObject(value, code) {
 }
 
 function validateSystemFilesystemResult(value, operationId, targetId, tool) {
-  const result = jsonObject(value, 'remote_filesystem_result_invalid');
+  const result = stripPrivateTelemetryResult(value, 'remote_filesystem_result_invalid');
+  if (!result || typeof result !== 'object' || Array.isArray(result)) throw hostError('remote_filesystem_result_invalid');
   if (result.tool !== tool || typeof result.ok !== 'boolean' || result.operationId !== operationId || result.targetId !== targetId) {
     throw hostError('remote_filesystem_result_invalid');
   }
@@ -102,17 +139,123 @@ function validateRouteResult(value) {
   return { status, ...(headers === undefined ? {} : { headers }), body };
 }
 
+// Core owns lifecycle records; mod-supplied prose is never an error detail.
+// Keep logging best-effort and instance-local, including for console-only callers.
+export function emitModEvent(logger, type, fields = {}, level = 'info') {
+  const fallback = () => {
+    try {
+      const sink = typeof logger?.[level] === 'function' ? logger : console;
+      sink[level]?.(JSON.stringify({ event: type, component: 'mods', level, ...fields }));
+    } catch { /* A broken log sink cannot take down Core. */ }
+  };
+  try {
+    if (typeof logger?.event !== 'function') { fallback(); return; }
+    const result = logger.event(type, fields, { level, component: 'mods' });
+    if (result && typeof result.catch === 'function') result.catch(fallback);
+  } catch { fallback(); }
+}
+
+export function modLogIdentity(mod) {
+  const id = String(mod?.id || '');
+  return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id) && id.length <= 120 ? id : '[invalid-mod-id]';
+}
+
+const MAX_CHILD_OUTPUT_BYTES = 1_048_576;
+const CHILD_OUTPUT_DRAIN_MS = 100;
+const MAX_MOD_LOG_INPUT_CHARS = 16_384;
+const MAX_MOD_LOG_CHARS = 2_000;
+const MOD_LOG_LEVELS = new Set(['debug', 'info', 'warn', 'error']);
+
+// This is an operational mod-logger boundary, not a conversation/prose policy.
+// Known credential fields/headers and URL credentials are projected locally;
+// exact secrets obtained from this host's store supplement those schemas.
+const MOD_LOG_SENSITIVE_KEY = /^(?:token|accesstoken|refreshtoken|idtoken|apikey|xapikey|secret|clientsecret|password|passwd|credential|credentials|privatekey|auth|authorization|proxyauthorization|cookie|cookies|setcookie|state|oauthstate|oidcstate|code|authorizationcode|authcode|nonce|codeverifier|codechallenge)$/i;
+function modLogLocation(value) {
+  try {
+    const url = new URL(value);
+    url.username = ''; url.password = ''; url.search = ''; url.hash = '';
+    return url.toString();
+  } catch {
+    return value.split(/[?#]/, 1)[0].replace(/^((?:[A-Za-z][A-Za-z0-9+.-]*:)?\/\/)[^/]*@/, '$1');
+  }
+}
+function projectModLog(args, protectedValues) {
+  let remaining = MAX_MOD_LOG_INPUT_CHARS;
+  let nodes = 512;
+  const seen = new WeakSet();
+  const consume = size => { remaining -= size; if (remaining < 0 || --nodes < 0) throw new Error('mod_log_too_large'); };
+  // Include brackets in URL matches: an exact-value replacement in userinfo
+  // must not interrupt parsing and leave a query/auth suffix intact.
+  const text = value => redactProtectedText(value, protectedValues)
+    .replace(/\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>"'(){}]+/g, modLogLocation)
+    .replace(/\b((?:proxy-authorization|authorization)\s*[:=]?\s*(?:Bearer|Basic)\s+)[^\s"',;\]}]+/gi, '$1[redacted]')
+    .replace(/\b((?:proxy-authorization|authorization|cookie|set-cookie|x-api-key)\s*:\s*)[^\r\n"'}]+/gi, '$1[redacted]');
+  const visit = (value, depth = 0, key = '') => {
+    consume(typeof value === 'string' ? value.length : 8);
+    if (MOD_LOG_SENSITIVE_KEY.test(key.replace(/[-_]/g, ''))) return '[redacted]';
+    // Exception prose/stacks can contain unmarked credentials. Preserve only the
+    // fact that an exception was logged, never its message or enumerable fields.
+    if (value instanceof Error) return { errorType: 'Error', contentOmitted: true };
+    if (typeof value === 'string') {
+      // Also support a single JSON string without weakening mixed-argument logs.
+      if (/^\s*[\[{]/.test(value)) {
+        let parsed;
+        try { parsed = JSON.parse(value); } catch { /* Ordinary prose. */ }
+        if (parsed && typeof parsed === 'object') return JSON.stringify(visit(parsed, depth + 1));
+      }
+      return /(?:url|uri|href|endpoint|issuer)$/i.test(key) ? modLogLocation(text(value)) : text(value);
+    }
+    if (value == null || typeof value === 'boolean' || typeof value === 'number') return value;
+    if (typeof value !== 'object') return '[unserializable]';
+    if (depth >= 12 || seen.has(value)) return '[log traversal truncated]';
+    seen.add(value);
+    if (Array.isArray(value)) return value.map(entry => visit(entry, depth + 1));
+    const result = Object.create(null);
+    for (const name in value) {
+      if (!Object.hasOwn(value, name)) continue;
+      consume(name.length);
+      result[text(name)] = visit(value[name], depth + 1, name);
+    }
+    return result;
+  };
+  try {
+    const projected = visit(args);
+    return { message: projected.map(entry => typeof entry === 'string' ? entry : JSON.stringify(entry)).join(' ').slice(0, MAX_MOD_LOG_CHARS) };
+  } catch { return { messageOmitted: true, reason: 'message_too_large' }; }
+}
+
 const STORE_METHODS = Object.freeze({
   settings: Object.freeze({ get: 'get', set: 'set', delete: 'delete' }),
   secrets: Object.freeze({ get: 'getSecret', set: 'setSecret', clear: 'clearSecret', has: 'hasSecret' }),
 });
 
-export function startModHost({ mod, store, logger = console, systemCapability = null, modAuthority = null, capabilities = null, capabilityTimeoutMs = null, modelCapabilityTimeoutMs = null, activationTimeoutMs = 10_000, routeTimeoutMs = DEFAULT_MOD_ROUTE_TIMEOUT_MS, cleanupTimeoutMs = 5_000, systemProcessWatchdogGraceMs = SYSTEM_PROCESS_WATCHDOG_GRACE_MS, onUnavailable = null, onSystemControllerReady = null, onSystemControllerUnavailable = null } = {}) {
+export function startModHost({ mod, store, logger = console, systemCapability = null, modAuthority = null, capabilities = null, capabilityTimeoutMs = null, modelCapabilityTimeoutMs = null, activationTimeoutMs = 10_000, routeTimeoutMs = DEFAULT_MOD_ROUTE_TIMEOUT_MS, cleanupTimeoutMs = 5_000, systemProcessWatchdogGraceMs = SYSTEM_PROCESS_WATCHDOG_GRACE_MS, onUnavailable = null, onSystemControllerReady = null, onSystemControllerUnavailable = null, deferRuntimeLogging = false } = {}) {
   if (!store) throw hostError('mod_store_required', mod?.id);
-  const child = fork(CHILD_PATH, [], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'], serialization: 'advanced' });
+  const child = fork(CHILD_PATH, [], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'], serialization: 'advanced' });
   const pending = new Map();
   let sequence = 0;
   let activationSettled = false;
+  let activationSucceeded = false;
+  let activationCommitted = !deferRuntimeLogging;
+  let exitDetails = null;
+  let disconnectTimer = null;
+  let outputDrainTimer = null;
+  let unavailableCode = null;
+  const modId = modLogIdentity(mod);
+  const logProtectedValues = new Set();
+  const output = { stdout: { bytes: 0, capped: false }, stderr: { bytes: 0, capped: false } };
+  // Drain continuously without buffering, decoding, or forwarding raw content. A
+  // child can print credentials or megabytes without creating a log flood.
+  for (const stream of ['stdout', 'stderr']) {
+    child[stream].on('data', chunk => {
+      const entry = output[stream];
+      const first = entry.bytes === 0;
+      entry.capped ||= entry.bytes + chunk.length > MAX_CHILD_OUTPUT_BYTES;
+      entry.bytes = Math.min(MAX_CHILD_OUTPUT_BYTES, entry.bytes + chunk.length);
+      if (first) emitModEvent(logger, 'mod_child_output', { modId, stream, contentOmitted: true, classification: 'unstructured_output' });
+    });
+  }
+  const outputDiagnostics = () => ({ stdout: { ...output.stdout }, stderr: { ...output.stderr } });
   let stopped = false;
   let closing = false;
   let admissionsPaused = false;
@@ -137,19 +280,19 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
     const controller = new AbortController();
     const parentInvocationId = String(message.parentInvocationId || "");
     const invocation = pending.get(parentInvocationId);
-    const parentRequired = message.method === 'readRuntimeDiagnostics' || message.method.startsWith('management');
+    const parentRequired = message.method === 'readRuntimeDiagnostics' || message.method === 'requestCoreApi' || message.method.startsWith('management');
     if (parentRequired && parentInvocationId && !invocation) {
-      child.send({ type: "capability-result", requestId, error: message.method.startsWith('management') ? 'mod_management_caller_required' : 'mod_diagnostic_caller_required' }, () => {}); return;
+      child.send({ type: "capability-result", requestId, error: message.method === 'requestCoreApi' ? 'core_api_caller_required' : message.method.startsWith('management') ? 'mod_management_caller_required' : 'mod_diagnostic_caller_required' }, () => {}); return;
     }
     if (!parentRequired && parentInvocationId && !invocation) { child.send({ type: "capability-result", requestId, error: "mod_capability_cancelled" }, () => {}); return; }
-    if (activeCapabilities.size >= 4 || !capabilities || !["managementInventory", "managementSubmit", "managementOperation", "readRuntimeDiagnostics", "listAgents", "getOperatorIdentity", "getOperatorTimezone", "listConversations", "readConversation", "listModels", "generateText", "submitGeneration", "readGeneration", "submitExternalTurn", "readExternalTurn", "cancelExternalTurn", "createExternalSession", "readExternalSessionModel", "setExternalSessionModel", "getForgeImageStatus", "createForgeImage", "readForgeImageJob", "listScheduledJobs", "readScheduledJob", "createScheduledJob", "updateScheduledJob", "deleteScheduledJob", "listScheduledJobRuns", "triggerScheduledJob"].includes(message.method)) {
+    if (activeCapabilities.size >= 4 || !capabilities || !["requestCoreApi", "managementInventory", "managementSubmit", "managementOperation", "readRuntimeDiagnostics", "listAgents", "getOperatorIdentity", "getOperatorTimezone", "listConversations", "readConversation", "listModels", "generateText", "submitGeneration", "readGeneration", "submitExternalTurn", "readExternalTurn", "cancelExternalTurn", "createExternalSession", "readExternalSessionModel", "setExternalSessionModel", "getForgeImageStatus", "createForgeImage", "readForgeImageJob", "listScheduledJobs", "readScheduledJob", "createScheduledJob", "updateScheduledJob", "deleteScheduledJob", "listScheduledJobRuns", "triggerScheduledJob"].includes(message.method)) {
       child.send({ type: "capability-result", requestId, error: "mod_capability_unavailable" }, () => {}); return;
     }
     // Capability methods validate their own inputs; transport does not impose a
     // smaller arbitrary envelope than the model/provider or archive reader.
     activeCapabilities.set(requestId, { controller, parentInvocationId, method: message.method, startedAt: Date.now() });
     const configuredTimeout = message.method === "generateText" ? modelCapabilityTimeoutMs : capabilityTimeoutMs;
-    const deadline = Number(configuredTimeout);
+    const deadline = message.method === 'requestCoreApi' ? 0 : Number(configuredTimeout);
     const timer = Number.isFinite(deadline) && deadline > 0
       ? setTimeout(() => controller.abort(hostError("mod_capability_timeout")), deadline)
       : null;
@@ -166,15 +309,17 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
         if (controller.signal.aborted) throw controller.signal.reason;
         let caller = null;
         const management = message.method.startsWith('management');
+        const coreApi = message.method === 'requestCoreApi';
         let parent = null;
-        if (message.method === 'readRuntimeDiagnostics' || management) {
+        if (message.method === 'readRuntimeDiagnostics' || management || coreApi) {
+          if (coreApi && !(mod.systemCapabilities || []).includes('core-api-v1')) throw hostError('mod_capability_unavailable');
           if (management && !(mod.systemCapabilities || []).includes('mod-management-v1')) throw hostError('mod_capability_unavailable');
           parent = pending.get(String(message.parentInvocationId || ''));
-          if (!parent?.trustedCaller || !parent.routeId?.startsWith('tool:')) throw hostError(management ? 'mod_management_caller_required' : 'mod_diagnostic_caller_required');
+          if (!parent?.trustedCaller || !parent.routeId?.startsWith('tool:')) throw hostError(coreApi ? 'core_api_caller_required' : management ? 'mod_management_caller_required' : 'mod_diagnostic_caller_required');
           caller = parent.trustedCaller;
         }
         const assertCallerActive = () => {
-          if (controller.signal.aborted || !parent || pending.get(String(message.parentInvocationId || '')) !== parent) throw hostError('mod_management_caller_required');
+          if (controller.signal.aborted || !parent || pending.get(String(message.parentInvocationId || '')) !== parent) throw hostError(coreApi ? 'core_api_caller_required' : 'mod_management_caller_required');
         };
         return capabilities[message.method](message.input, { signal: controller.signal, caller, assertCallerActive, waitForCaller: parent?.completed });
       })]);
@@ -220,9 +365,12 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
   const markUnavailable = (code) => {
     if (unavailable || closing) return;
     unavailable = true;
+    unavailableCode = code;
     revokeSystemController(code);
     onUnavailable?.(code);
   };
+  let resolveClosed;
+  const closed = new Promise(resolve => { resolveClosed = resolve; });
   let resolveExit;
   const exited = new Promise((resolve) => { resolveExit = resolve; });
 
@@ -249,6 +397,9 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
       // The store was constructed from the manifest ID. Any child-supplied modId
       // is deliberately ignored and can never select another namespace.
       const result = await store[method](...args);
+      // Record before replying: a child may immediately log the retrieved value.
+      // Keep older values after rotation/clear while this process can retain them.
+      if (method === 'getSecret' && typeof result === 'string' && result && child.connected && !stopped && !closing) logProtectedValues.add(result);
       replyStore(requestId, { result });
     } catch {
       // Store failures are intentionally opaque: values, keys, SQL and secrets
@@ -279,7 +430,12 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
       serviceStoreRequest(message);
       return;
     }
-    if (message?.type === 'log') logger[message.level]?.(`[mod:${mod.id}] ${message.message}`);
+    if (message?.type === 'log') {
+      if (!MOD_LOG_LEVELS.has(message.level) || !Array.isArray(message.args)) return;
+      const fields = { modId, ...projectModLog(message.args, [...logProtectedValues]) };
+      emitModEvent(logger, 'mod_log', fields, message.level);
+      return;
+    }
     if (message?.type === 'system-controller-ready') {
       if (systemCapability !== 'execution-provider-v1' || message.protocol !== systemCapability || systemControllerReady) {
         markUnavailable('system_controller_registration_invalid');
@@ -313,7 +469,7 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
       if (!entry || message.operationId !== entry.operationId || message.targetId !== entry.targetId) return;
       pendingSystemFilesystem.delete(requestId);
       entry.abortSignal?.removeEventListener?.('abort', entry.cancel);
-      if (message.ok !== true) entry.reject(hostError(typeof message.error === 'string' && /^[a-z0-9_]+$/.test(message.error) ? message.error : 'remote_filesystem_failed'));
+      if (message.ok !== true) entry.reject(hostError(safeSystemControllerError(message.error, 'remote_filesystem_failed')));
       else {
         try { entry.resolve(validateSystemFilesystemResult(message.result, entry.operationId, entry.targetId, entry.tool)); }
         catch { entry.reject(hostError('remote_filesystem_result_invalid')); }
@@ -327,8 +483,11 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
       if (!entry) return;
       pendingSystemConfiguration.delete(requestId);
       clearTimeout(entry.timer);
-      if (message.ok !== true) entry.reject(hostError(typeof message.error === 'string' && /^[a-z0-9_]+$/.test(message.error) ? message.error : 'remote_configuration_failed'));
-      else entry.resolve(validateJsonBody(message.result));
+      if (message.ok !== true) entry.reject(hostError(safeSystemControllerError(message.error, 'remote_configuration_failed')));
+      else {
+        try { entry.resolve(stripPrivateTelemetryResult(message.result, 'remote_configuration_result_invalid')); }
+        catch { entry.reject(hostError('remote_configuration_result_invalid')); }
+      }
       return;
     }
     if (message?.type === 'system-controller-host-description-result') {
@@ -356,7 +515,7 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
       pendingSystemProcess.delete(requestId);
       clearTimeout(entry.watchdogTimer);
       entry.abortSignal?.removeEventListener?.('abort', entry.cancel);
-      if (message.ok !== true) entry.reject(hostError(typeof message.error === 'string' && /^[a-z0-9_]+$/.test(message.error) ? message.error : 'remote_process_failed'));
+      if (message.ok !== true) entry.reject(hostError(safeSystemControllerError(message.error, 'remote_process_failed')));
       else {
         try { entry.resolve(validateSystemProcessResult(message.result, entry.operationId, entry.targetId)); }
         catch { entry.reject(hostError('remote_process_result_invalid')); }
@@ -374,6 +533,7 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
       routes.diagnosticsSupported = message.diagnostics === true;
       routes.secretReferenceSchemes = Array.isArray(message.secretReferenceSchemes) && message.secretReferenceSchemes.every(scheme => typeof scheme === 'string' && /^[a-z][a-z0-9-]{0,31}$/.test(scheme)) ? [...new Set(message.secretReferenceSchemes)] : [];
       routes.tools = message.tools;
+      activationSucceeded = true;
       resolveActivation(routes);
       return;
     }
@@ -411,10 +571,15 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
     rejectPending(error);
     cancelCapabilities();
     markUnavailable('mod_host_disconnected');
-    if (!stopped) child.kill('SIGKILL');
+    // An exiting process usually disconnects before its exit event. Give that
+    // event time to preserve the real exit code/signal instead of overwriting it
+    // with Core's SIGKILL. A child that only drops IPC is still bounded.
+    if (!stopped && !closing) disconnectTimer = setTimeout(() => { if (!stopped) child.kill('SIGKILL'); }, 100);
   });
   child.once('exit', (code, signal) => {
     stopped = true;
+    exitDetails = { exitCode: code, signal: signal || null };
+    clearTimeout(disconnectTimer);
     clearTimeout(activationTimer);
     const error = hostError('mod_host_exited', `${code ?? 'null'}:${signal || 'none'}`);
     if (!activationSettled) {
@@ -425,6 +590,27 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
     cancelCapabilities();
     markUnavailable('mod_host_exited');
     resolveExit({ code, signal });
+    // A mod may spawn descendants inheriting these pipes. They cannot delay
+    // Core cleanup indefinitely after the owned child has already exited.
+    outputDrainTimer = setTimeout(() => {
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }, CHILD_OUTPUT_DRAIN_MS);
+  });
+  // close follows exit AND drained stdio; one terminal record covers the
+  // disconnect/error/exit cascade and contains actionable process status.
+  child.once('close', (code, signal) => {
+    clearTimeout(disconnectTimer);
+    clearTimeout(outputDrainTimer);
+    exitDetails ||= { exitCode: code, signal: signal || null };
+    logProtectedValues.clear();
+    resolveClosed({ code, signal });
+    if (!activationSucceeded || !activationCommitted) return; // loadMods owns activation failure.
+    if (unavailable) {
+      emitModEvent(logger, 'mod_runtime_unavailable', { modId, errorCode: unavailableCode, ...exitDetails, classification: signal ? 'signal' : 'process_exit', output: outputDiagnostics() }, 'error');
+    } else if (closing) {
+      emitModEvent(logger, 'mod_runtime_stopped', { modId, intentional: true, ...exitDetails, output: outputDiagnostics() });
+    }
   });
   child.once('error', () => {
     const wrapped = hostError('mod_host_error');
@@ -441,7 +627,7 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
 
   // Deliberately send only identity and entrypoint. Database ownership and path
   // remain in core and are never part of the child activation context.
-  child.send({ type: 'activate', modId: mod.id, serverPath: mod.server, management: (mod.systemCapabilities || []).includes('mod-management-v1'), ...(systemCapability ? { systemCapability, controllerInstanceId } : {}) }, (error) => {
+  child.send({ type: 'activate', modId: mod.id, serverPath: mod.server, management: (mod.systemCapabilities || []).includes('mod-management-v1'), coreApi: (mod.systemCapabilities || []).includes('core-api-v1'), ...(systemCapability ? { systemCapability, controllerInstanceId } : {}) }, (error) => {
     if (!error || activationSettled) return;
     activationSettled = true;
     clearTimeout(activationTimer);
@@ -508,9 +694,11 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
         if (!operationId || !targetId || !parentRunId || !toolCallId || !request.process || typeof request.process !== 'object' || Array.isArray(request.process)) return Promise.reject(hostError('remote_process_request_invalid'));
         let operation;
         const traceContext = traceContextCarrier(request.traceContext);
+        const telemetryConfiguration = remoteTelemetryConfiguration(request.telemetryConfiguration);
         try {
           operation = JSON.parse(JSON.stringify({ operationId, targetId, parentRunId, toolCallId, process: request.process,
             ...(traceContext ? { traceContext } : {}),
+            ...(telemetryConfiguration ? { telemetryConfiguration } : {}),
             ...(request.protectedBindingMetadata ? { protectedBindingMetadata: request.protectedBindingMetadata } : {}),
             ...(request.protectedValues ? { protectedValues: request.protectedValues } : {}) }));
         } catch { return Promise.reject(hostError('remote_process_request_invalid')); }
@@ -560,9 +748,10 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
         if (!operationId || !targetId || !parentRunId || !toolCallId || !NATIVE_FILESYSTEM_TOOLS.has(tool)) return Promise.reject(hostError('remote_filesystem_request_invalid'));
         let operation;
         const traceContext = traceContextCarrier(request.traceContext);
+        const telemetryConfiguration = remoteTelemetryConfiguration(request.telemetryConfiguration);
         try {
           const args = jsonObject(request.operation?.arguments || {}, 'remote_filesystem_request_invalid');
-          operation = { operationId, targetId, parentRunId, toolCallId, tool, arguments: args, ...(traceContext ? { traceContext } : {}) };
+          operation = { operationId, targetId, parentRunId, toolCallId, tool, arguments: args, ...(traceContext ? { traceContext } : {}), ...(telemetryConfiguration ? { telemetryConfiguration } : {}) };
         } catch { return Promise.reject(hostError('remote_filesystem_request_invalid')); }
         const requestId = randomUUID();
         return new Promise((resolve, reject) => {
@@ -610,7 +799,7 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
         fail(hostError('mod_tool_cancelled'));
       };
       abortSignal?.addEventListener('abort', cancel, { once: true });
-      const timer = setTimeout(() => {
+      const timer = routeId === 'tool:burrow_api_request' && (mod.systemCapabilities || []).includes('core-api-v1') ? null : setTimeout(() => {
         if (!pending.has(requestId)) return;
         pending.delete(requestId);
         abortSignal?.removeEventListener('abort', cancel);
@@ -652,13 +841,22 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
     return () => { admissionsPaused = false; };
   }
 
+  // loadMods commits after Core validates routes/tools and completes load-time
+  // publication. A crash during that work is one activation failure, not a second
+  // runtime failure for a mod that never became available.
+  function commitActivation() {
+    if (unavailable || stopped || closing) return false;
+    activationCommitted = true;
+    return true;
+  }
+
   function close() {
     if (closePromise) return closePromise;
     closing = true;
     cancelCapabilities();
     revokeSystemController('system_controller_shutdown');
     closePromise = (async () => {
-      if (stopped) return exited;
+      if (stopped) return closed;
       if (!activationSettled) {
         activationSettled = true;
         clearTimeout(activationTimer);
@@ -667,11 +865,11 @@ export function startModHost({ mod, store, logger = console, systemCapability = 
       rejectPending(hostError('mod_host_closed', mod.id));
       if (child.connected) child.send({ type: 'shutdown' }, () => {});
       const timer = setTimeout(() => { if (!stopped) child.kill('SIGKILL'); }, finiteTimeout(cleanupTimeoutMs, 5_000));
-      try { await exited; } finally { clearTimeout(timer); }
+      try { await closed; } finally { clearTimeout(timer); }
       if (shutdownError) throw shutdownError;
     })();
     return closePromise;
   }
 
-  return { child, activated, pauseAdmissions, invoke, invokeTool, resolveProtectedReference, close, exited, pendingCount: () => pending.size, activeOperationCount: () => pending.size + activeCapabilities.size + pendingSystemProcess.size + pendingSystemFilesystem.size, pendingDiagnostics: () => [...activeCapabilities.values()].map(({ method, startedAt }) => ({ kind: "capability", operation: method, status: "pending", elapsedMs: Math.max(0, Date.now() - startedAt) })), pendingSystemProcessCount: () => pendingSystemProcess.size, pendingSystemFilesystemCount: () => pendingSystemFilesystem.size, controllerInstanceId };
+  return { child, activated, commitActivation, get exitDetails() { return exitDetails; }, outputDiagnostics, pauseAdmissions, invoke, invokeTool, resolveProtectedReference, close, exited, closed, pendingCount: () => pending.size, activeOperationCount: () => pending.size + activeCapabilities.size + pendingSystemProcess.size + pendingSystemFilesystem.size, pendingDiagnostics: () => [...activeCapabilities.values()].map(({ method, startedAt }) => ({ kind: "capability", operation: method, status: "pending", elapsedMs: Math.max(0, Date.now() - startedAt) })), pendingSystemProcessCount: () => pendingSystemProcess.size, pendingSystemFilesystemCount: () => pendingSystemFilesystem.size, controllerInstanceId };
 }

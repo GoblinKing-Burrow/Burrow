@@ -2,8 +2,7 @@
 
 
 !!! warning "Earlier technical reference"
-    This page is retained from earlier documentation and has not been fully revalidated for the public 2026.10.19 release. Its revision-specific links and examples may describe older or development behavior. Start with the [current public-release user guide](../guide/installation.md); do not use this page alone to select installation commands, image tags, or security settings.
-
+    This page is retained from earlier documentation and has not been fully revalidated for the public 2026.10.19 release. Its revision-specific links and examples may describe older or development behavior. Start with the [current operator guide](../guide/installation.md); do not use this page alone to select installation commands, image tags, or security settings.
 
 BURROW is an operator-controlled runtime with native filesystem/process tools, model connections, MCP integrations, and installable code. Deploy it inside a trust boundary suitable for the data and credentials available to its service account. HTTP login, encrypted settings, and child processes each provide specific protections; together they do not establish hostile multi-tenant isolation.
 
@@ -51,7 +50,7 @@ The host box is a deployment trust boundary, not a claim that the components ins
 
 ## Secrets at rest
 
-`BURROW_SETTINGS_KEY` must base64-decode to exactly 32 bytes. Model/provider authentication, MCP secrets, UI OIDC client secrets, mod secrets, private mod-source credentials, and saved OpenTelemetry exporter headers use AES-256-GCM with fresh 12-byte nonces and authentication tags. Associated data binds ciphertext to its secret/connection/mod/source identity, with distinct format prefixes. Some decryptors accept historical prefixes for compatibility.
+`BURROW_SETTINGS_KEY` must base64-decode to exactly 32 bytes. Model/provider authentication, MCP secrets, UI OIDC client secrets, mod secrets, private mod-source credentials, and saved OpenTelemetry destination headers and credentials use AES-256-GCM with fresh 12-byte nonces and authentication tags. Associated data binds ciphertext to its secret/connection/mod/source identity, with distinct format prefixes. Some decryptors accept historical prefixes for compatibility.
 
 This protects the designated secret records, not every database field or every file. Conversation text, ordinary settings, browser caches, generated artifacts, and generic traces are not automatically encrypted by the settings-secret mechanism. A running process with the settings key can decrypt the records it can access. An environment-provided credential already exists in plaintext in that environment.
 ### Preserve the settings key
@@ -84,7 +83,7 @@ Generic trace payload handling bounds content but does not apply blanket redacti
 
 ## Telemetry export is data sharing
 
-OpenTelemetry export is disabled by default and requires a configured collector endpoint. Saved exporter headers are encrypted, but enabling export sends selected spans and metrics to that collector. Review the effective endpoint and provider-specific headers before enabling it. Environment overrides can supersede saved settings; keep exported operational metadata and collector access within the intended trust boundary.
+OpenTelemetry export is disabled by default. Current development supports multiple destinations; enabling export sends curated spans and supported metrics to every effective enabled destination. Saved destination headers and credentials are encrypted and write-only, but an endpoint edit with the same destination ID/provider preserves omitted secrets and can send them to the new endpoint. Trust that recipient before saving. Review each effective destination, enabled signal and provider-specific header; environment endpoint/header overrides select one environment transport instead of the saved list. Keep exported operational metadata and collector access within the intended trust boundary. See [OpenTelemetry configuration](../operations/observability.md#opentelemetry).
 
 ## Installed mods are trusted code
 
@@ -139,3 +138,9 @@ Corrections on this page were checked against public **2026.10.19**; any newer d
 - [backend/src/mod-runtime.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/mod-runtime.mjs)
 - [backend/src/postgres-otel-settings-store.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/postgres-otel-settings-store.mjs)
 - [backend/src/otel-settings.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/otel-settings.mjs)
+
+## Granted full Core API access
+
+The current `core-api-v1` system-mod capability permits a live, trusted administrator tool caller to reach the home Core's administrative `/api` routes. It is separate from read-only diagnostics and can include access-policy mutations. Explicit capability approval plus Core-owned administrator assignment are required; a manifest declaration, skill, argument or forwarded header cannot grant this authority. Existing external HTTP authentication and webhook-signature boundaries remain unchanged.
+
+A Core-private invocation identity retains the actual mod/agent/session/run actor rather than manufacturing a human login. Revocation stops later admissions, not already admitted side effects. Request/response failures do not imply mutation rollback. See [full Core API capability](../development/extensions.md#full-home-core-api-capability) before enabling this powerful boundary.

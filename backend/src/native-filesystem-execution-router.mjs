@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { remoteTelemetryConfiguration } from './remote-telemetry-configuration.mjs';
+import { startExecutionDispatch } from './execution-operational-telemetry.mjs';
 import { localExecutionTarget, remoteExecutionTarget, resolveProcessExecutionTarget } from './process-execution-router.mjs';
 
 const TOOLS = new Set(['files_read', 'files_list', 'files_find', 'files_inspect', 'files_search', 'files_write', 'files_edit', 'files_patch']);
@@ -37,24 +39,55 @@ export function createNativeFilesystemExecutionRouter({ localExecute, remoteCont
       catch (error) { return failure(operation?.tool || 'native_filesystem', operation?.arguments || {}, error); }
     }
     if (target.kind !== 'remote') throw new Error('execution_target_invalid');
-    if (!remoteController || typeof remoteController.executeNativeFilesystem !== 'function') return failure(request.operation?.tool || 'native_filesystem', request.operation?.arguments || {}, new Error('remote_native_filesystem_controller_unavailable'));
     const operation = request.operation || {};
-    const tool = required(operation.tool, 'tool');
-    if (!TOOLS.has(tool)) throw new Error('native_filesystem_tool_unsupported');
-    const parentRunId = required(context.parentRunId, 'parent_run_id');
-    const toolCallId = required(context.toolCallId, 'tool_call_id');
-    const operationId = context.operationId || nativeFilesystemOperationId({ parentRunId, toolCallId });
+    const available = typeof remoteController?.executeNativeFilesystem === 'function';
+    // Preserve validation errors for malformed requests when a controller exists.
+    const tool = available ? required(operation.tool, 'tool') : operation.tool || 'native_filesystem';
+    if (available && !TOOLS.has(tool)) throw new Error('native_filesystem_tool_unsupported');
+    const parentRunId = available ? required(context.parentRunId, 'parent_run_id') : context.parentRunId;
+    const toolCallId = available ? required(context.toolCallId, 'tool_call_id') : context.toolCallId;
+    const logger = context.traceLogger || operation.arguments?.traceLogger;
+    const traceDetails = {
+      tool, toolCallId: context.toolCallId || null,
+      executionTarget: 'remote', providerId: target.providerId, targetId: target.targetId,
+    };
+    // Local harnesses own their activity. Remote delegation bypasses those
+    // harnesses, so the router owns the corresponding Core tool activity.
+    const started = await logger?.toolStart?.(traceDetails);
+    const activityId = started?.payload?.activityId || null;
+    const operationId = available ? context.operationId || nativeFilesystemOperationId({ parentRunId, toolCallId }) : null;
+    let result;
     try {
-      const result = await remoteController.executeNativeFilesystem({
-      operationId,
-      targetId: required(target.targetId, 'target_id'),
-      parentRunId,
-      toolCallId,
-      ...(context.traceContext ? { traceContext: { ...context.traceContext } } : {}),
-      operation: { tool, arguments: Object.fromEntries(Object.entries(operation.arguments || {}).filter(([key, value]) => !['traceLogger', 'rootDir', 'artifactPrefix', 'runId'].includes(key) && (value == null || ['string', 'number', 'boolean'].includes(typeof value)))) },
-      }, { abortSignal: context.abortSignal || null });
-      return result && typeof result === 'object' ? { ...result, operationId: result.operationId || operationId } : result;
-    } catch (error) { return { ...failure(tool, operation.arguments || {}, error), operationId }; }
+      if (!available) throw new Error('remote_native_filesystem_controller_unavailable');
+      // Resolve only after toolStart's observer has opened the Core span; a
+      // carrier computed by the proposal before routing would point at the run.
+      const traceContext = context.telemetry?.traceContextForTool?.(parentRunId, activityId || toolCallId) || context.traceContext;
+      const telemetryConfiguration = remoteTelemetryConfiguration(context.telemetry?.remoteConfiguration?.(parentRunId));
+      const dispatch = {
+        operationId,
+        targetId: required(target.targetId, 'target_id'),
+        parentRunId,
+        toolCallId,
+        ...(traceContext ? { traceContext: { ...traceContext } } : {}),
+        ...(telemetryConfiguration ? { telemetryConfiguration } : {}),
+        operation: { tool, arguments: Object.fromEntries(Object.entries(operation.arguments || {}).filter(([key, value]) => !['traceLogger', 'rootDir', 'artifactPrefix', 'runId', 'telemetryConfiguration'].includes(key) && (value == null || ['string', 'number', 'boolean'].includes(typeof value)))) },
+      };
+      const completeDispatch = startExecutionDispatch({ controller: remoteController, target, context, operation: 'filesystem', operationId });
+      try {
+        result = await remoteController.executeNativeFilesystem(dispatch, { abortSignal: context.abortSignal || null });
+        completeDispatch(result);
+      } catch (error) { completeDispatch(null, error); throw error; }
+      if (result && typeof result === 'object') result = { ...result, operationId: result.operationId || operationId };
+    } catch (error) {
+      result = { ...failure(tool, operation.arguments || {}, error), ...(operationId ? { operationId } : {}) };
+    }
+    await (logger?.toolEnd || logger?.tool)?.({
+      ...traceDetails, ...(activityId ? { activityId } : {}),
+      operationId: result?.operationId || operationId,
+      ok: result?.ok === true, error: result?.error || null,
+      cancelled: result?.cancelled === true, timedOut: result?.timedOut === true,
+    });
+    return result;
   };
 }
 

@@ -482,7 +482,8 @@
           "404": {
             "$ref": "#/components/responses/ErrorResponse"
           }
-        }
+        },
+        "description": "Runtime-owned minion ancestry. Session/root selection is agent-scoped, includes descendants and necessary ended ancestors in parent-first order, and excludes siblings when a child is requested. Live children can be recovered from session metadata when subagent records have been retained away. Explicit root markers retain honest orphan descendants without inventing a parent or turning a child into a depth-zero root. Child maxDepth is the saved spawn-time budget, while root maxDepth is the current setting; these fields are observability, not authorization."
       }
     },
     "/api/chat/{runId}/cancel": {
@@ -1454,7 +1455,8 @@
           "404": {
             "$ref": "#/components/responses/ErrorResponse"
           }
-        }
+        },
+        "description": "Runtime-owned minion ancestry. Session/root selection is agent-scoped, includes descendants and necessary ended ancestors in parent-first order, and excludes siblings when a child is requested. Live children can be recovered from session metadata when subagent records have been retained away. Explicit root markers retain honest orphan descendants without inventing a parent or turning a child into a depth-zero root. Child maxDepth is the saved spawn-time budget, while root maxDepth is the current setting; these fields are observability, not authorization."
       }
     },
     "/api/archive/sessions": {
@@ -1478,7 +1480,7 @@
             "name": "date",
             "in": "query",
             "required": false,
-            "description": "calendar day in the requested timezone of session archive/list display timestamp (archivedAt, then updatedAt, then createdAt).",
+            "description": "Local day of retained visible message occurrence or catalog update/reset creation in the requested timezone.",
             "schema": {
               "type": "string",
               "format": "date"
@@ -1516,8 +1518,12 @@
           },
           "404": {
             "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
+            "$ref": "#/components/responses/ErrorResponse"
           }
-        }
+        },
+        "description": "List retained active/archived conversations and independent reset documents. Date and session-calendar discovery match retained visible message occurrence days (including compacted generations in the document’s canonical generation window), plus catalog update/reset-creation dates. Unknown message clocks are not inferred. Date-filtered rows include matchedDate in the requested timezone; clients must retain these matches even when the catalog timestamp differs. Search matches identity, names, titles and human-facing summaries, not internal run evidence. Opaque cursors preserve exact catalog ordering and must keep filters unchanged."
       }
     },
     "/api/archive/sessions/{agentId}/{sessionId}": {
@@ -1543,11 +1549,11 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Page size (1–200, default 100).",
+            "description": "Page size (clamped to 1–500, default 100).",
             "schema": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 200,
+              "maximum": 500,
               "default": 100
             }
           },
@@ -1562,19 +1568,17 @@
           {
             "name": "from",
             "in": "query",
-            "description": "Inclusive chat timestamp lower bound (ISO 8601).",
+            "description": "Inclusive chat timestamp lower bound (ISO 8601). Microseconds are preserved; YYYY-MM-DD means UTC midnight.",
             "schema": {
-              "type": "string",
-              "format": "date-time"
+              "type": "string"
             }
           },
           {
             "name": "to",
             "in": "query",
-            "description": "Inclusive chat timestamp upper bound (ISO 8601).",
+            "description": "Inclusive chat timestamp upper bound (ISO 8601). Microseconds are preserved; YYYY-MM-DD means UTC midnight.",
             "schema": {
-              "type": "string",
-              "format": "date-time"
+              "type": "string"
             }
           }
         ],
@@ -1590,9 +1594,12 @@
           },
           "409": {
             "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
+            "$ref": "#/components/responses/ErrorResponse"
           }
         },
-        "description": "Archive-only chat conversation reader. Newest page first; before selects older pages. Compacted generations are deduplicated by stable turn ID; reset snapshots remain separate. Missing retained generations and stale cursors return 409 rather than implying beginning of history."
+        "description": "Archive-only canonical chat reader. Newest page first; before selects older pages. SQL selects canonical live/compacted/reset winners before bounded hydration; no full-history Node export per page. Signed cursors bind raw interval scope and retained-row revision; mutation or physical rewrite invalidates with 400 archive_cursor_invalid. Deadline/lock exhaustion returns 504 archive_query_timeout, never an empty history."
       }
     },
     "/api/sessions/{sessionId}/rename": {
@@ -3524,6 +3531,9 @@
           },
           "400": {
             "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
+            "$ref": "#/components/responses/ErrorResponse"
           }
         }
       }
@@ -3561,6 +3571,210 @@
             "$ref": "#/components/responses/ErrorResponse"
           },
           "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/archive/dreams/groups": {
+      "get": {
+        "tags": [
+          "Archive"
+        ],
+        "summary": "List complete Dream groups by agent and local day",
+        "description": "Page complete agent/local-day groups across enabled and disabled agents, newest local day then agent ID descending. Each group combines real diaries (by createdAt) and retained Dream cycle receipts (by startedAt, falling back to createdAt then generatedAt); failure-only days remain visible. A matching search returns the whole group, not only matching entries. Phase attempts, unattributed cycle failures/running progress and diaries are separate; only an explicit diaryId is recorded as a link, and it may refer to a diary outside this group or no longer retained. No link is inferred from phase or day. Errors are sanitized; owner metadata, provider responses and receipt graphs are not returned.",
+        "operationId": "listArchiveDreamGroups",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AgentId"
+          },
+          {
+            "name": "date",
+            "in": "query",
+            "required": false,
+            "description": "Local day of diary creation or cycle start/creation, not diary entryDate.",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Case-insensitive substring of agent identity, local day, full diary narrative and ID/date, phase, run identity/status, or sanitized error.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "timezone",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "UTC"
+            },
+            "description": "IANA timezone defining local day/month boundaries (including DST); omitted or empty uses UTC."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum page size; larger values are clamped to 500.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 200
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque nextCursor from the previous page; keep q, date, agentId, and timezone unchanged.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ArchiveDreamGroupListResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/archive/dreams/groups/{agentId}/{day}": {
+      "get": {
+        "tags": [
+          "Archive"
+        ],
+        "summary": "Read a complete Dream agent/day group",
+        "description": "Read retained diaries, recorded phase attempts and unattributed cycle failure/running progress for one agent/local day; not a raw receipt graph or an exhaustive list of cycle receipts. Use the same timezone as the list or calendar. Phase timestamps are included only when recorded; cycle timing is labeled separately. Missing evidence returns 404.",
+        "operationId": "getArchiveDreamGroup",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PathAgentId"
+          },
+          {
+            "name": "day",
+            "in": "path",
+            "required": true,
+            "description": "Local creation day, YYYY-MM-DD.",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          },
+          {
+            "in": "query",
+            "name": "timezone",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "UTC"
+            },
+            "description": "IANA timezone defining local day/month boundaries (including DST); omitted or empty uses UTC."
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ArchiveDreamGroupDetailResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/archive/workflow-events": {
+      "get": {
+        "tags": [
+          "Archive"
+        ],
+        "summary": "List archived GitHub workflow completion events",
+        "description": "Read retained completion-event snapshots, including provenance captured at acceptance, newest createdAt then ID descending. This is a normally UI-authorized read-only Archive projection, not a webhook acknowledgment or proof of completed agent work. Result is boundary-redacted; instruction and error remain retained text; ownerId and traceDir are omitted. Search matches retained data before result redaction.",
+        "operationId": "listArchiveWorkflowEvents",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AgentId"
+          },
+          {
+            "name": "date",
+            "in": "query",
+            "required": false,
+            "description": "Local day of event acceptance createdAt, not GitHub completedAt.",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Case-insensitive substring of repository, workflow, run ID, SHA, conclusion, agent/session, instruction, status, chat run ID, error, or retained result JSON.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "timezone",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "UTC"
+            },
+            "description": "IANA timezone defining local day/month boundaries (including DST); omitted or empty uses UTC."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum rows in this page (1–500, default 100). Invalid or out-of-range values return 400 archive_limit_invalid.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 100
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque nextCursor from the previous page; keep q, date, agentId, and timezone unchanged.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ArchiveWorkflowEventListResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
             "$ref": "#/components/responses/ErrorResponse"
           }
         }
@@ -3668,6 +3882,9 @@
           },
           "400": {
             "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
+            "$ref": "#/components/responses/ErrorResponse"
           }
         }
       }
@@ -3725,6 +3942,9 @@
             "$ref": "#/components/responses/ErrorResponse"
           },
           "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
             "$ref": "#/components/responses/ErrorResponse"
           }
         }
@@ -3848,6 +4068,9 @@
           },
           "404": {
             "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
+            "$ref": "#/components/responses/ErrorResponse"
           }
         }
       }
@@ -3873,6 +4096,9 @@
             "$ref": "#/components/responses/ArchiveRunResponse"
           },
           "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
             "$ref": "#/components/responses/ErrorResponse"
           }
         }
@@ -3989,10 +4215,42 @@
           "Agents"
         ],
         "summary": "Read bulk agent UI overview",
-        "description": "Return registered agents with identities, current parent/child status, context usage, and model selections in one request. The optional sessions map selects the parent session for each agent.",
+        "description": "Return registered agents with identities, requested-session/descendant status, context usage, and model selections in one request. The optional sessions map selects each agent’s session. Status uses the same runtime-owned ancestry as /api/agent-status, including metadata-only live descendants and honest orphans. Context inspection is bounded to the requested session plus 12 descendants per agent; contextHydration.truncated reports omitted contexts, not a truncated status tree. Opt in to agent-wide minions with minionScope: agent (session is the default). status.minionScope: agent confirms a successful all-origin scan for that agent; disabled/error entries do not claim coverage. The anchor session and its activity remain independent. Ordinary unrelated chats are not minions; requested child anchors retain depth and appear once. Depth-two orphans without root metadata keep unknown roots. Context hydration remains bounded to the anchor plus 12 distinct minion sessions; session recovery and cancellation stay scoped.",
         "operationId": "getAgentOverview",
         "requestBody": {
-          "$ref": "#/components/requestBodies/JsonBody"
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "sessions": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "description": "Optional mapping of registered agent IDs to requested anchor sessions."
+                  },
+                  "minionScope": {
+                    "type": "string",
+                    "enum": [
+                      "session",
+                      "agent"
+                    ],
+                    "default": "session",
+                    "description": "Session subtree (default) or visible minions across all originating sessions of each agent."
+                  }
+                }
+              },
+              "example": {
+                "sessions": {
+                  "hatchet": "default"
+                },
+                "minionScope": "agent"
+              }
+            }
+          }
         },
         "responses": {
           "200": {
@@ -5482,7 +5740,7 @@
         "tags": [
           "Archive"
         ],
-        "summary": "List UTC days with retained Archive records in a month",
+        "summary": "List local days with retained Archive records in a month",
         "operationId": "listArchiveCalendarDates",
         "parameters": [
           {
@@ -5493,7 +5751,8 @@
               "type": "string",
               "enum": [
                 "sessions",
-                "dreams"
+                "dreams",
+                "workflow-events"
               ]
             }
           },
@@ -5526,8 +5785,12 @@
           },
           "400": {
             "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
+            "$ref": "#/components/responses/ErrorResponse"
           }
-        }
+        },
+        "description": "Days across retained records independently of list pagination. Sessions include visible message occurrence days across canonical live/compacted/reset windows plus catalog update/reset-creation dates. Unknown message clocks do not acquire invented dates. Dreams include diary creation and cycle receipt start/creation, including failure-only receipts; workflow-events use event acceptance createdAt. Calendar is not filtered by q."
       }
     },
     "/api/settings/timezone": {
@@ -6711,6 +6974,207 @@
         "description": "Save the per-agent minion default. Send null connectionId and model to clear and inherit the current parent turn."
       }
     },
+    "/api/agents/{agentId}/minion-settings": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Read an agent minion depth setting",
+        "operationId": "getAgentMinionSettings",
+        "description": "Read the per-agent maximum nesting depth (integer 0–2, default 1). This is independent of minion model selection. Zero disables spawning, one permits direct children, and two also permits grandchildren. Requires an enabled registered agent.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PathAgentId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The agent’s durable minion depth setting; defaults to one when unset.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentMinionSettingsResponse"
+                },
+                "example": {
+                  "ok": true,
+                  "maxDepth": 1
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Normal UI/API authentication is required when enabled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No registered agent has this ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "agent_not_found": {
+                    "value": {
+                      "ok": false,
+                      "status": 404,
+                      "error": "agent_not_found"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The registered agent is disabled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "agent_disabled": {
+                    "value": {
+                      "ok": false,
+                      "status": 409,
+                      "error": "agent_disabled"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Save an agent minion depth setting",
+        "operationId": "updateAgentMinionSettings",
+        "description": "Persist maxDepth for this agent only. maxDepth is required and must be a JSON integer 0, 1 or 2; missing, null, strings, booleans, fractions and out-of-range values are rejected without changing saved settings. This operation does not change model selection or expose any additional minion settings. Child status retains the saved spawn-time budget; root status reports the current setting.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PathAgentId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentMinionSettingsUpdate"
+              },
+              "example": {
+                "maxDepth": 1
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The agent’s durable minion depth setting; defaults to one when unset.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentMinionSettingsResponse"
+                },
+                "example": {
+                  "ok": true,
+                  "maxDepth": 1
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid maxDepth or malformed JSON. Saved settings are unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "minion_max_depth_invalid": {
+                    "value": {
+                      "ok": false,
+                      "status": 400,
+                      "error": "minion_max_depth_invalid"
+                    }
+                  },
+                  "invalid_json": {
+                    "value": {
+                      "ok": false,
+                      "status": 400,
+                      "error": "invalid_json"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Normal UI/API authentication is required when enabled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No registered agent has this ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "agent_not_found": {
+                    "value": {
+                      "ok": false,
+                      "status": 404,
+                      "error": "agent_not_found"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The registered agent is disabled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "examples": {
+                  "agent_disabled": {
+                    "value": {
+                      "ok": false,
+                      "status": 409,
+                      "error": "agent_disabled"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
     "/api/settings/browser-origin": {
       "get": {
         "tags": [
@@ -7324,7 +7788,7 @@
         "parameters": [],
         "responses": {
           "200": {
-            "$ref": "#/components/responses/SettingsResponse"
+            "$ref": "#/components/responses/OtelSettingsResponse"
           },
           "400": {
             "$ref": "#/components/responses/ErrorResponse"
@@ -7332,7 +7796,8 @@
           "404": {
             "$ref": "#/components/responses/ErrorResponse"
           }
-        }
+        },
+        "description": "Read saved and effective lists, safe runtime state and provider metadata. Secret values are never returned."
       },
       "put": {
         "tags": [
@@ -7346,47 +7811,26 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                  "enabled",
-                  "endpoint"
-                ],
-                "properties": {
-                  "enabled": {
-                    "type": "boolean"
-                  },
-                  "endpoint": {
-                    "type": "string",
-                    "maxLength": 2048,
-                    "description": "Saved OTLP/HTTP base endpoint. Environment overrides may take precedence."
-                  },
-                  "headers": {
-                    "type": "string",
-                    "maxLength": 8192,
-                    "writeOnly": true,
-                    "description": "Optional replacement OTLP header string. Omit to preserve the existing protected value."
-                  },
-                  "clearHeaders": {
-                    "type": "boolean",
-                    "description": "Remove the saved protected OTLP headers. Mutually exclusive with headers."
-                  }
-                }
+                "$ref": "#/components/schemas/OtelSettingsInput"
               }
             }
           }
         },
         "responses": {
           "200": {
-            "$ref": "#/components/responses/SettingsResponse"
+            "$ref": "#/components/responses/OtelSettingsResponse"
           },
           "400": {
             "$ref": "#/components/responses/ErrorResponse"
           },
           "404": {
             "$ref": "#/components/responses/ErrorResponse"
+          },
+          "409": {
+            "$ref": "#/components/responses/ErrorResponse"
           }
-        }
+        },
+        "description": "Atomically replace destinations or use the legacy scalar shape. Same-ID/provider edits preserve omitted secrets without reconfirmation; provider changes discard them. Hosted ingestion is not verified."
       }
     },
     "/api/settings/browser-tab": {
@@ -7641,6 +8085,9 @@
             "$ref": "#/components/responses/ErrorResponse"
           },
           "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
             "$ref": "#/components/responses/ErrorResponse"
           }
         }
@@ -8995,7 +9442,7 @@
         }
       },
       "AgentStatusResponse": {
-        "description": "AgentStatusResponse response.",
+        "description": "Requested session and visible descendant status with runtime-owned ancestry.",
         "content": {
           "application/json": {
             "schema": {
@@ -9005,7 +9452,7 @@
         }
       },
       "ActiveChatRunsResponse": {
-        "description": "ActiveChatRunsResponse response.",
+        "description": "Registered live runs and scoped descendant tree with runtime-owned ancestry.",
         "content": {
           "application/json": {
             "schema": {
@@ -9204,6 +9651,36 @@
           }
         }
       },
+      "ArchiveDreamGroupListResponse": {
+        "description": "Complete agent/local-day Dream group summaries.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ArchiveDreamGroupListResponse"
+            }
+          }
+        }
+      },
+      "ArchiveDreamGroupDetailResponse": {
+        "description": "Retained diaries and phase/cycle receipt attempts for one Dream group.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ArchiveDreamGroupDetailResponse"
+            }
+          }
+        }
+      },
+      "ArchiveWorkflowEventListResponse": {
+        "description": "Retained workflow completion snapshots for Archive inspection.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ArchiveWorkflowEventListResponse"
+            }
+          }
+        }
+      },
       "ArchiveContinuityCardListResponse": {
         "description": "Current warm continuity cards for Archive inspection. Cards are mutable continuity metadata, not immutable archived sessions or prompt authority.",
         "content": {
@@ -9335,7 +9812,7 @@
         }
       },
       "ArchiveCalendarResponse": {
-        "description": "UTC days with retained Archive sessions or Dreams, independent of list pagination.",
+        "description": "Local days with retained Archive sessions, Dreams or workflow events, independent of list pagination.",
         "content": {
           "application/json": {
             "schema": {
@@ -9430,6 +9907,16 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/ChatInputResumeResponse"
+            }
+          }
+        }
+      },
+      "OtelSettingsResponse": {
+        "description": "Saved and effective destination settings and safe provider/runtime metadata.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/OtelSettingsResponse"
             }
           }
         }
@@ -9833,6 +10320,12 @@
               "null"
             ],
             "additionalProperties": true
+          },
+          "modelFailure": {
+            "$ref": "#/components/schemas/ModelFailure"
+          },
+          "modelRecovery": {
+            "$ref": "#/components/schemas/ModelRecovery"
           }
         },
         "additionalProperties": true
@@ -9899,6 +10392,12 @@
               "null"
             ],
             "additionalProperties": true
+          },
+          "modelFailure": {
+            "$ref": "#/components/schemas/ModelFailure"
+          },
+          "modelRecovery": {
+            "$ref": "#/components/schemas/ModelRecovery"
           }
         },
         "additionalProperties": true
@@ -9949,7 +10448,8 @@
             "$ref": "#/components/schemas/JsonObject"
           }
         },
-        "additionalProperties": true
+        "additionalProperties": true,
+        "description": "NDJSON events include nonterminal model.recovery activity; see chat-stream-contract.md. Only run.completed/run.failed/run.cancelled/run.superseded are terminal."
       },
       "Error": {
         "type": "object",
@@ -10281,28 +10781,21 @@
       "AgentStatusResponse": {
         "type": "object",
         "required": [
-          "ok"
+          "ok",
+          "sessionId",
+          "agents"
         ],
         "properties": {
           "ok": {
             "type": "boolean"
           },
-          "agentId": {
+          "sessionId": {
             "type": "string"
           },
-          "agent": {
-            "type": "object",
-            "additionalProperties": true
-          },
-          "session": {
-            "type": "object",
-            "additionalProperties": true
-          },
-          "subagents": {
+          "agents": {
             "type": "array",
             "items": {
-              "type": "object",
-              "additionalProperties": true
+              "$ref": "#/components/schemas/AgentStatusEntry"
             }
           }
         },
@@ -10372,6 +10865,56 @@
                 },
                 "steeringReady": {
                   "type": "boolean"
+                },
+                "parentSessionId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Immediate owning session, not the root; null for a root. A retained-away parent is not fabricated."
+                },
+                "parentRunId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Immediate owning run ID when recorded; null for a root."
+                },
+                "subagentId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Runtime-owned child identity when recorded; null for a root or unavailable historical identity."
+                },
+                "depth": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 2,
+                  "description": "Root is 0, direct children are 1, grandchildren are 2. Historical children without a depth marker remain depth 1.",
+                  "enum": [
+                    0,
+                    1,
+                    2
+                  ]
+                },
+                "maxDepth": {
+                  "$ref": "#/components/schemas/MinionMaxDepth",
+                  "description": "Current agent setting for a depth-zero root; SAVED spawn-time lineage budget for a child (historical default 1), not its recalculated effective spawn permission."
+                },
+                "rootSessionId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Saved root session marker, or ancestry-derived root when available. Distinct from the immediate parent; may be null when unavailable."
+                },
+                "rootRunId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Saved root run marker, or ancestry-derived root run when available; null when unavailable."
                 }
               },
               "required": [
@@ -10381,6 +10924,13 @@
                 "lane"
               ]
             }
+          },
+          "subagents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubagentTreeEntry"
+            },
+            "description": "Scoped descendant tree including ended ancestors needed by visible/live descendants. Includes metadata-only live children when durable records are absent."
           }
         },
         "additionalProperties": true
@@ -11428,6 +11978,723 @@
         },
         "additionalProperties": false
       },
+      "ArchiveDreamPhaseAttemptStatus": {
+        "type": "string",
+        "enum": [
+          "unknown",
+          "running",
+          "completed",
+          "failed",
+          "partial",
+          "interrupted"
+        ]
+      },
+      "ArchiveDreamCycleAttemptStatus": {
+        "type": "string",
+        "enum": [
+          "unknown",
+          "running",
+          "failed",
+          "partial",
+          "interrupted"
+        ]
+      },
+      "ArchiveDreamDiarySummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "entryDate",
+          "createdAt",
+          "excerpt"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "entryDate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "excerpt": {
+            "type": "string",
+            "description": "Trimmed first 320 characters of retained diary Markdown."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamDiary": {
+        "type": "object",
+        "description": "Actual retained diary narrative, without source references or model/runtime metadata.",
+        "required": [
+          "id",
+          "phase",
+          "entryDate",
+          "createdAt",
+          "markdown"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "phase": {
+            "type": "string"
+          },
+          "entryDate": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Diary entry date; not the local creation day used to group records."
+          },
+          "createdAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "markdown": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamPhaseErrors": {
+        "type": "object",
+        "description": "Present diagnostic stages have bounded, redacted error text.",
+        "properties": {
+          "extraction": {
+            "type": "string"
+          },
+          "diary": {
+            "type": "string"
+          },
+          "reconciliation": {
+            "type": "string"
+          },
+          "phase": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamPhaseAttempt": {
+        "type": "object",
+        "description": "Receipt phase evidence. A retry failure does not invalidate an earlier diary.",
+        "required": [
+          "runId",
+          "status",
+          "error",
+          "errors",
+          "startedAt",
+          "completedAt",
+          "runStartedAt",
+          "runCompletedAt",
+          "diaryId"
+        ],
+        "properties": {
+          "runId": {
+            "type": "string",
+            "description": "Dream cycle receipt run identity."
+          },
+          "status": {
+            "$ref": "#/components/schemas/ArchiveDreamPhaseAttemptStatus"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "First sanitized phase error, if any."
+          },
+          "errors": {
+            "$ref": "#/components/schemas/ArchiveDreamPhaseErrors"
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Explicitly recorded phase start, not inferred from cycle timing."
+          },
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Explicitly recorded phase completion, not inferred from cycle timing."
+          },
+          "runStartedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Cycle start, falling back to receipt createdAt then generatedAt."
+          },
+          "runCompletedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Cycle completion, not phase completion."
+          },
+          "diaryId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Explicit receipt diary ID only; may identify a diary outside this group or no longer retained. No association is inferred from matching day or phase."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamCycleAttempt": {
+        "type": "object",
+        "description": "Unattributed cycle-level failure/interruption or running progress; not assigned to a phase.",
+        "required": [
+          "runId",
+          "status",
+          "error",
+          "startedAt",
+          "completedAt"
+        ],
+        "properties": {
+          "runId": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ArchiveDreamCycleAttemptStatus"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sanitized unattributed cycle error, if any."
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamPhaseSummary": {
+        "type": "object",
+        "required": [
+          "phase",
+          "diaryCount",
+          "attemptCount",
+          "latestStatus",
+          "latestError",
+          "latestDiary"
+        ],
+        "properties": {
+          "phase": {
+            "type": "string",
+            "enum": [
+              "light",
+              "deep",
+              "rem"
+            ]
+          },
+          "diaryCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "attemptCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "latestStatus": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ArchiveDreamPhaseAttemptStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "latestError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latestDiary": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ArchiveDreamDiarySummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamPhaseDetail": {
+        "type": "object",
+        "description": "Real diaries and receipt phase attempts remain separate; only an explicit diaryId records a link, which need not resolve within this group.",
+        "required": [
+          "phase",
+          "diaries",
+          "attempts"
+        ],
+        "properties": {
+          "phase": {
+            "type": "string",
+            "enum": [
+              "light",
+              "deep",
+              "rem"
+            ]
+          },
+          "diaries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArchiveDreamDiary"
+            }
+          },
+          "attempts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArchiveDreamPhaseAttempt"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamPhaseSummaries": {
+        "type": "object",
+        "required": [
+          "light",
+          "deep",
+          "rem"
+        ],
+        "properties": {
+          "light": {
+            "$ref": "#/components/schemas/ArchiveDreamPhaseSummary"
+          },
+          "deep": {
+            "$ref": "#/components/schemas/ArchiveDreamPhaseSummary"
+          },
+          "rem": {
+            "$ref": "#/components/schemas/ArchiveDreamPhaseSummary"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamPhaseDetails": {
+        "type": "object",
+        "required": [
+          "light",
+          "deep",
+          "rem"
+        ],
+        "properties": {
+          "light": {
+            "$ref": "#/components/schemas/ArchiveDreamPhaseDetail"
+          },
+          "deep": {
+            "$ref": "#/components/schemas/ArchiveDreamPhaseDetail"
+          },
+          "rem": {
+            "$ref": "#/components/schemas/ArchiveDreamPhaseDetail"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamOtherDiarySummary": {
+        "type": "object",
+        "required": [
+          "diaryCount",
+          "latestDiary"
+        ],
+        "properties": {
+          "diaryCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "latestDiary": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ArchiveDreamDiarySummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamCycleAttemptSummary": {
+        "type": "object",
+        "required": [
+          "count",
+          "latestStatus",
+          "latestError"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "latestStatus": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ArchiveDreamCycleAttemptStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "latestError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamGroupSummary": {
+        "type": "object",
+        "description": "One whole agent/local-day group; list counts cover all retained evidence in that group.",
+        "required": [
+          "agentId",
+          "agentName",
+          "day",
+          "timezone",
+          "createdAt",
+          "phases",
+          "otherDiaries",
+          "cycleAttempts"
+        ],
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "agentName": {
+            "type": "string"
+          },
+          "day": {
+            "type": "string",
+            "format": "date",
+            "description": "Local creation day in timezone, not diary entryDate."
+          },
+          "timezone": {
+            "type": "string",
+            "description": "Resolved IANA timezone used for grouping."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Latest diary or receipt creation timestamp within the group."
+          },
+          "phases": {
+            "$ref": "#/components/schemas/ArchiveDreamPhaseSummaries"
+          },
+          "otherDiaries": {
+            "$ref": "#/components/schemas/ArchiveDreamOtherDiarySummary"
+          },
+          "cycleAttempts": {
+            "$ref": "#/components/schemas/ArchiveDreamCycleAttemptSummary"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamGroup": {
+        "type": "object",
+        "description": "Retained diary, phase-attempt and unattributed cycle evidence for one agent/local day, including nonstandard phase diaries. Cycle attempts are only unattributed failures/interruption or running progress, not every receipt.",
+        "required": [
+          "agentId",
+          "agentName",
+          "day",
+          "timezone",
+          "createdAt",
+          "phases",
+          "otherDiaries",
+          "cycleAttempts"
+        ],
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "agentName": {
+            "type": "string"
+          },
+          "day": {
+            "type": "string",
+            "format": "date",
+            "description": "Local creation day in timezone, not diary entryDate."
+          },
+          "timezone": {
+            "type": "string",
+            "description": "Resolved IANA timezone used for grouping."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Latest diary or receipt creation timestamp within the group."
+          },
+          "phases": {
+            "$ref": "#/components/schemas/ArchiveDreamPhaseDetails"
+          },
+          "otherDiaries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArchiveDreamDiary"
+            }
+          },
+          "cycleAttempts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArchiveDreamCycleAttempt"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamGroupListResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "groups",
+          "nextCursor",
+          "hasMore"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArchiveDreamGroupSummary"
+            }
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as cursor for the next page with the same filters; null when there is no next page."
+          },
+          "hasMore": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveDreamGroupDetailResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "group"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "group": {
+            "$ref": "#/components/schemas/ArchiveDreamGroup"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveWorkflowEvent": {
+        "type": "object",
+        "description": "GitHub completion-event snapshot and provenance captured at acceptance. ownerId and traceDir are omitted; result is redacted. instruction and error remain retained text.",
+        "required": [
+          "id",
+          "watchId",
+          "repository",
+          "workflow",
+          "runId",
+          "runAttempt",
+          "headSha",
+          "conclusion",
+          "url",
+          "completedAt",
+          "agentId",
+          "sessionId",
+          "instruction",
+          "status",
+          "chatRunId",
+          "result",
+          "error",
+          "createdAt",
+          "startedAt",
+          "finishedAt",
+          "agentName"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "watchId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "workflow": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*$",
+            "maxLength": 128
+          },
+          "runAttempt": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "headSha": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{40,64}$"
+          },
+          "conclusion": {
+            "type": "string",
+            "enum": [
+              "success",
+              "failure",
+              "neutral",
+              "cancelled",
+              "skipped",
+              "timed_out",
+              "action_required",
+              "startup_failure",
+              "stale"
+            ]
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "GitHub Actions run URL validated against repository and run ID."
+          },
+          "completedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "instruction": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "succeeded",
+              "failed",
+              "interrupted"
+            ],
+            "description": "pending/running are outstanding; succeeded/failed are terminal; interrupted is retained for reconciliation, not blindly replayed. Webhook receipt accepted=true means only durable acceptance, not handled."
+          },
+          "chatRunId": {
+            "type": "string"
+          },
+          "result": {
+            "description": "Retained runtime result, which may be any JSON value (including null); recursively redacted and traversal-bounded for the Archive projection. Redaction is boundary-based, not a guarantee that arbitrary free-text secrets are removed."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "finishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "agentName": {
+            "type": "string",
+            "description": "Current agent name, falling back to agentId."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveWorkflowEventListResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "events",
+          "hasMore",
+          "nextCursor"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ArchiveWorkflowEvent"
+            }
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as cursor for the next page with the same filters; null when there is no next page."
+          }
+        },
+        "additionalProperties": false
+      },
       "ArchiveSessionListItem": {
         "type": "object",
         "required": [
@@ -11496,7 +12763,8 @@
             "type": [
               "integer",
               "null"
-            ]
+            ],
+            "description": "Visible chat count when known; reset snapshots omit stale inherited tail counts (null) rather than claiming a complete visible count."
           },
           "archived": {
             "type": "boolean"
@@ -11508,7 +12776,13 @@
             ]
           },
           "sourceSessionId": {
-            "type": "string"
+            "type": "string",
+            "description": "Proven original session of a reset document, preserved through later session renames; never inferred from a UUID."
+          },
+          "matchedDate": {
+            "type": "string",
+            "format": "date",
+            "description": "Authoritative local-day match for a date-filtered list; may differ from the catalog timestamp."
           }
         },
         "additionalProperties": true
@@ -13559,7 +14833,8 @@
             "type": "string",
             "enum": [
               "sessions",
-              "dreams"
+              "dreams",
+              "workflow-events"
             ]
           },
           "month": {
@@ -15250,6 +16525,12 @@
           "blockers": {
             "type": "array",
             "items": {}
+          },
+          "modelFailure": {
+            "$ref": "#/components/schemas/ModelFailure"
+          },
+          "modelRecovery": {
+            "$ref": "#/components/schemas/ModelRecovery"
           }
         },
         "additionalProperties": false
@@ -15458,6 +16739,1109 @@
           }
         },
         "additionalProperties": false
+      },
+      "ModelFailure": {
+        "type": "object",
+        "description": "Curated producer-proven failure origin. Not provider/error prose. retryable denotes eligibility, not permission to replay tools.",
+        "required": [
+          "origin",
+          "code",
+          "retryable"
+        ],
+        "properties": {
+          "origin": {
+            "type": "string",
+            "enum": [
+              "upstream",
+              "burrow",
+              "unknown",
+              "cancelled"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelRecoveryRecord": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "recovering",
+              "resumed",
+              "exhausted",
+              "blocked",
+              "requires_investigation",
+              "cancelled"
+            ]
+          },
+          "logicalRequestId": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "continueWithToolResults"
+            ]
+          },
+          "attempt": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "maxAttempts": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "delayMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3600000
+          },
+          "retryCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000
+          },
+          "originalFailure": {
+            "$ref": "#/components/schemas/ModelFailure"
+          },
+          "lastFailure": {
+            "$ref": "#/components/schemas/ModelFailure"
+          },
+          "failover": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "maxLength": 128
+              },
+              "action": {
+                "type": "string",
+                "enum": [
+                  "blocked",
+                  "retry",
+                  "requires_investigation",
+                  "cancelled"
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "action"
+            ],
+            "additionalProperties": false
+          },
+          "partialOutput": {
+            "type": "object",
+            "properties": {
+              "textChars": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000000000
+              },
+              "thoughtChars": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000000000
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelRecovery": {
+        "type": "object",
+        "required": [
+          "version",
+          "retryCount",
+          "requests"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "const": 1
+          },
+          "retryCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000
+          },
+          "requests": {
+            "type": "array",
+            "maxItems": 32,
+            "items": {
+              "$ref": "#/components/schemas/ModelRecoveryRecord"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "OtelProviderId": {
+        "type": "string",
+        "enum": [
+          "openobserve",
+          "grafana-tempo",
+          "grafana-cloud",
+          "jaeger",
+          "signoz",
+          "uptrace",
+          "elastic",
+          "datadog",
+          "new-relic",
+          "honeycomb",
+          "splunk",
+          "custom"
+        ]
+      },
+      "OtelProtocol": {
+        "type": "string",
+        "enum": [
+          "http/json",
+          "http/protobuf"
+        ]
+      },
+      "OtelMetricsTemporality": {
+        "type": "string",
+        "enum": [
+          "cumulative",
+          "delta"
+        ]
+      },
+      "OtelDestinationConnection": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Nonsecret provider connection fields. Direct is the default for Datadog and Splunk; site/realm do not synthesize endpoints.",
+        "properties": {
+          "organization": {
+            "type": "string",
+            "description": "OpenObserve organization used when deriving an /api/<organization> base."
+          },
+          "stream": {
+            "type": "string",
+            "description": "OpenObserve stream-name header."
+          },
+          "tenantId": {
+            "type": "string",
+            "description": "Grafana Tempo X-Scope-OrgID header."
+          },
+          "instanceId": {
+            "type": "string",
+            "description": "Grafana Cloud Basic authentication username."
+          },
+          "dataset": {
+            "type": "string",
+            "description": "Honeycomb dataset header."
+          },
+          "site": {
+            "type": "string",
+            "description": "Provider site metadata."
+          },
+          "realm": {
+            "type": "string",
+            "description": "Provider realm metadata."
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "",
+              "direct",
+              "collector"
+            ],
+            "description": "Only for Datadog and Splunk; blank behaves like direct."
+          }
+        }
+      },
+      "OtelDestinationTls": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "verify": {
+            "type": "boolean",
+            "default": true,
+            "description": "Verify the HTTPS server certificate. Custom CA material belongs in write-only credentials.caCertificate."
+          }
+        }
+      },
+      "OtelDestinationCredentials": {
+        "type": "object",
+        "additionalProperties": false,
+        "writeOnly": true,
+        "description": "Write-only fields encrypted at rest. For the same ID and provider, omitted or empty-string fields preserve the saved values; nonempty fields replace individual values.",
+        "properties": {
+          "username": {
+            "type": "string",
+            "writeOnly": true,
+            "description": "Provider credential username."
+          },
+          "password": {
+            "type": "string",
+            "writeOnly": true,
+            "description": "Provider credential password."
+          },
+          "token": {
+            "type": "string",
+            "writeOnly": true,
+            "description": "Provider credential token or full OpenObserve Authorization value."
+          },
+          "caCertificate": {
+            "type": "string",
+            "writeOnly": true,
+            "description": "Custom CA PEM for this destination."
+          }
+        }
+      },
+      "OtelDestinationInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name",
+          "provider",
+          "enabled"
+        ],
+        "description": "One operator-owned destination. Enabled rows need at least one supported signal and a URL for each enabled signal. Mode/signal/temporality constraints are provider-specific; see docs/otel-destination-contract.md. Direct Datadog and Splunk require exact URLs for enabled signals.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,80}$"
+          },
+          "name": {
+            "type": "string",
+            "description": "Nonempty display name, at most 160 characters after trimming.",
+            "pattern": "\\S"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/OtelProviderId"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "OTLP/HTTP base URL; enabled signals derive /v1/traces or /v1/metrics when no exact URL is provided. HTTP(S) without userinfo, query or fragment; empty is allowed."
+          },
+          "tracesEndpoint": {
+            "type": "string",
+            "description": "Exact OTLP/HTTP trace URL; no signal path is appended. HTTP(S) without userinfo, query or fragment; empty is allowed."
+          },
+          "metricsEndpoint": {
+            "type": "string",
+            "description": "Exact OTLP/HTTP metric URL; no signal path is appended. HTTP(S) without userinfo, query or fragment; empty is allowed."
+          },
+          "protocol": {
+            "$ref": "#/components/schemas/OtelProtocol"
+          },
+          "tracesEnabled": {
+            "type": "boolean",
+            "description": "Default true."
+          },
+          "metricsEnabled": {
+            "type": "boolean",
+            "description": "Provider-dependent default; Tempo, Jaeger, and direct Splunk do not support metrics."
+          },
+          "metricsTemporality": {
+            "$ref": "#/components/schemas/OtelMetricsTemporality"
+          },
+          "connection": {
+            "$ref": "#/components/schemas/OtelDestinationConnection"
+          },
+          "tls": {
+            "$ref": "#/components/schemas/OtelDestinationTls"
+          },
+          "headers": {
+            "type": "string",
+            "writeOnly": true,
+            "description": "Comma-separated OTLP key=value pairs. Omitted or blank preserves the same ID/provider value; explicit case-insensitive names override provider headers."
+          },
+          "clearHeaders": {
+            "type": "boolean",
+            "description": "True removes stored headers and cannot be combined with headers."
+          },
+          "credentials": {
+            "$ref": "#/components/schemas/OtelDestinationCredentials"
+          },
+          "clearCredentials": {
+            "type": "boolean",
+            "description": "True removes all saved credential fields and cannot be combined with credentials."
+          }
+        },
+        "allOf": [
+          {
+            "not": {
+              "required": [
+                "headers",
+                "clearHeaders"
+              ],
+              "properties": {
+                "clearHeaders": {
+                  "const": true
+                },
+                "headers": {}
+              }
+            }
+          },
+          {
+            "not": {
+              "required": [
+                "credentials",
+                "clearCredentials"
+              ],
+              "properties": {
+                "clearCredentials": {
+                  "const": true
+                },
+                "credentials": {}
+              }
+            }
+          }
+        ]
+      },
+      "OtelDestinationPublic": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "provider",
+          "enabled",
+          "endpoint",
+          "tracesEndpoint",
+          "metricsEndpoint",
+          "protocol",
+          "tracesEnabled",
+          "metricsEnabled",
+          "metricsTemporality",
+          "connection",
+          "tls",
+          "headersConfigured",
+          "credentialsConfigured",
+          "credentialFields"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,80}$"
+          },
+          "name": {
+            "type": "string",
+            "description": "Nonempty display name, at most 160 characters after trimming.",
+            "pattern": "\\S"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/OtelProviderId"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "OTLP/HTTP base URL; enabled signals derive /v1/traces or /v1/metrics when no exact URL is provided. HTTP(S) without userinfo, query or fragment; empty is allowed."
+          },
+          "tracesEndpoint": {
+            "type": "string",
+            "description": "Exact OTLP/HTTP trace URL; no signal path is appended. HTTP(S) without userinfo, query or fragment; empty is allowed."
+          },
+          "metricsEndpoint": {
+            "type": "string",
+            "description": "Exact OTLP/HTTP metric URL; no signal path is appended. HTTP(S) without userinfo, query or fragment; empty is allowed."
+          },
+          "protocol": {
+            "$ref": "#/components/schemas/OtelProtocol"
+          },
+          "tracesEnabled": {
+            "type": "boolean",
+            "description": "Default true."
+          },
+          "metricsEnabled": {
+            "type": "boolean",
+            "description": "Provider-dependent default; Tempo, Jaeger, and direct Splunk do not support metrics."
+          },
+          "metricsTemporality": {
+            "$ref": "#/components/schemas/OtelMetricsTemporality"
+          },
+          "connection": {
+            "$ref": "#/components/schemas/OtelDestinationConnection"
+          },
+          "tls": {
+            "$ref": "#/components/schemas/OtelDestinationTls"
+          },
+          "headersConfigured": {
+            "type": "boolean",
+            "description": "Whether protected headers are configured."
+          },
+          "credentialsConfigured": {
+            "type": "boolean",
+            "description": "Whether any credential field is configured."
+          },
+          "credentialFields": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "username",
+                "password",
+                "token",
+                "caCertificate"
+              ]
+            },
+            "description": "Names of configured credential fields; values are never returned."
+          },
+          "legacy": {
+            "type": "boolean",
+            "readOnly": true,
+            "description": "True only for an existing scalar single-endpoint configuration projected as a destination; its provider was never recorded. False for authoritative saved destinations and environment transport. Display metadata only, not inferred from id/name/endpoint and not accepted in PUT. The first successful destination-list save adopts the entry and returns false. An unchanged ID/provider preserves omitted secrets; changing the provider intentionally discards the former secrets."
+          }
+        },
+        "additionalProperties": false,
+        "description": "Safe saved or effective destination; contains no protected values."
+      },
+      "OtelProviderMetadata": {
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "description",
+          "protocols",
+          "defaultProtocol",
+          "traces",
+          "metrics",
+          "defaultTemporality",
+          "documentationUrl"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/OtelProviderId"
+          },
+          "label": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "protocols": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OtelProtocol"
+            }
+          },
+          "defaultProtocol": {
+            "$ref": "#/components/schemas/OtelProtocol"
+          },
+          "traces": {
+            "type": "boolean"
+          },
+          "metrics": {
+            "type": "boolean"
+          },
+          "defaultTemporality": {
+            "$ref": "#/components/schemas/OtelMetricsTemporality"
+          },
+          "documentationUrl": {
+            "type": "string"
+          },
+          "guidance": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "description": "Provider preset, not verification of a hosted connection. Splunk metrics are collector-only."
+      },
+      "OtelLegacySettingsInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "endpoint"
+        ],
+        "description": "Legacy scalar form. A non-equivalent saved destination list returns 409 instead of being discarded.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "Legacy OTLP/HTTP base URL without userinfo, query or fragment. May be empty when disabled."
+          },
+          "headers": {
+            "type": "string",
+            "writeOnly": true,
+            "description": "Replacement OTLP headers. Blank or omitted preserves the existing value."
+          },
+          "clearHeaders": {
+            "type": "boolean",
+            "description": "True removes saved headers; cannot be combined with headers."
+          }
+        },
+        "allOf": [
+          {
+            "not": {
+              "required": [
+                "headers",
+                "clearHeaders"
+              ],
+              "properties": {
+                "clearHeaders": {
+                  "const": true
+                },
+                "headers": {}
+              }
+            }
+          }
+        ]
+      },
+      "OtelDestinationSettingsInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "destinations"
+        ],
+        "description": "Atomically replace the complete list. IDs must be unique. When master enabled is true at least one destination must be enabled; an empty list is allowed when disabled.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "destinations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OtelDestinationInput"
+            }
+          }
+        }
+      },
+      "OtelSettingsInput": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/OtelLegacySettingsInput"
+          },
+          {
+            "$ref": "#/components/schemas/OtelDestinationSettingsInput"
+          }
+        ]
+      },
+      "OtelSavedSettings": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "endpoint",
+          "headersConfigured",
+          "destinations"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "Legacy scalar projection of the saved list."
+          },
+          "headersConfigured": {
+            "type": "boolean"
+          },
+          "streamName": {
+            "type": "string",
+            "description": "Legacy stream-name projection when configured."
+          },
+          "destinations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OtelDestinationPublic"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "OtelEffectiveSettings": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "endpoint",
+          "headersConfigured",
+          "source",
+          "endpointSource",
+          "headersSource",
+          "restartRequired",
+          "destinations"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "Legacy scalar projection of the effective transport."
+          },
+          "headersConfigured": {
+            "type": "boolean"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "environment",
+              "database",
+              "default"
+            ]
+          },
+          "endpointSource": {
+            "type": "string",
+            "enum": [
+              "environment",
+              "database",
+              "default"
+            ]
+          },
+          "headersSource": {
+            "type": "string",
+            "enum": [
+              "environment",
+              "database",
+              "default"
+            ]
+          },
+          "restartRequired": {
+            "type": "boolean"
+          },
+          "destinations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OtelDestinationPublic"
+            },
+            "description": "Environment endpoint/header overrides replace saved transport with one effective environment destination."
+          }
+        },
+        "additionalProperties": false
+      },
+      "OtelExportFailure": {
+        "type": "object",
+        "required": [
+          "signal",
+          "reason"
+        ],
+        "properties": {
+          "signal": {
+            "type": "string",
+            "enum": [
+              "traces",
+              "metrics"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "partial_success",
+              "http_error",
+              "timeout",
+              "connection_error",
+              "export_failed"
+            ]
+          },
+          "httpStatus": {
+            "type": "integer"
+          },
+          "rejectedItems": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false,
+        "description": "Safe category, numeric HTTP status and bounded partial-success rejection count when known; never raw collector text."
+      },
+      "OtelRuntimeDestinationStatus": {
+        "type": "object",
+        "required": [
+          "id",
+          "enabled",
+          "tracesEnabled",
+          "metricsEnabled",
+          "failures",
+          "dropped",
+          "lastExportFailure"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "tracesEnabled": {
+            "type": "boolean"
+          },
+          "metricsEnabled": {
+            "type": "boolean"
+          },
+          "failures": {
+            "type": "object",
+            "properties": {
+              "start": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "export": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "shutdown": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": true
+          },
+          "dropped": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lastExportFailure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OtelExportFailure"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": true
+      },
+      "OtelRuntimeStatus": {
+        "type": "object",
+        "description": "Safe aggregate and per-destination runtime status; delivery does not prove hosted ingestion.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "sdkStarted": {
+            "type": "boolean"
+          },
+          "activeRuns": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "drainingRuntimes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failures": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "dropped": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lastExportFailure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OtelExportFailure"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "serviceName": {
+            "type": "string"
+          },
+          "destinations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OtelRuntimeDestinationStatus"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "OtelSettingsResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "settings",
+          "effective",
+          "providers"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "settings": {
+            "$ref": "#/components/schemas/OtelSavedSettings"
+          },
+          "effective": {
+            "$ref": "#/components/schemas/OtelEffectiveSettings"
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OtelProviderMetadata"
+            }
+          },
+          "runtime": {
+            "$ref": "#/components/schemas/OtelRuntimeStatus"
+          }
+        },
+        "additionalProperties": false
+      },
+      "MinionMaxDepth": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 2,
+        "default": 1,
+        "description": "Maximum nesting from the depth-zero root. 0 disables spawning; 1 permits direct children; 2 also permits grandchildren. The spawn tool is absent at an allowed leaf.",
+        "enum": [
+          0,
+          1,
+          2
+        ]
+      },
+      "AgentMinionSettingsUpdate": {
+        "type": "object",
+        "required": [
+          "maxDepth"
+        ],
+        "properties": {
+          "maxDepth": {
+            "$ref": "#/components/schemas/MinionMaxDepth"
+          }
+        },
+        "additionalProperties": true,
+        "description": "The only supported minion setting is maxDepth. It is required even though the default for an unset agent is 1; unknown fields do not create additional settings."
+      },
+      "AgentMinionSettingsResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "maxDepth"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "maxDepth": {
+            "$ref": "#/components/schemas/MinionMaxDepth"
+          }
+        },
+        "additionalProperties": false
+      },
+      "AgentStatusEntry": {
+        "type": "object",
+        "description": "Runtime-owned minion ancestry. Session/root selection is agent-scoped, includes descendants and necessary ended ancestors in parent-first order, and excludes siblings when a child is requested. Live children can be recovered from session metadata when subagent records have been retained away. Explicit root markers retain honest orphan descendants without inventing a parent or turning a child into a depth-zero root. Child maxDepth is the saved spawn-time budget, while root maxDepth is the current setting; these fields are observability, not authorization.",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "runId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Current registered run ID when live; saved child run ID when available, otherwise null."
+          },
+          "parentSessionId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Immediate owning session, not the root; null for a root. A retained-away parent is not fabricated."
+          },
+          "parentRunId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Immediate owning run ID when recorded; null for a root."
+          },
+          "subagentId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Runtime-owned child identity when recorded; null for a root or unavailable historical identity."
+          },
+          "depth": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2,
+            "description": "Root is 0, direct children are 1, grandchildren are 2. Historical children without a depth marker remain depth 1.",
+            "enum": [
+              0,
+              1,
+              2
+            ]
+          },
+          "maxDepth": {
+            "$ref": "#/components/schemas/MinionMaxDepth",
+            "description": "Current agent setting for a depth-zero root; SAVED spawn-time lineage budget for a child (historical default 1), not its recalculated effective spawn permission."
+          },
+          "rootSessionId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Saved root session marker, or ancestry-derived root when available. Distinct from the immediate parent; may be null when unavailable."
+          },
+          "rootRunId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Saved root run marker, or ancestry-derived root run when available; null when unavailable."
+          },
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "THINKING",
+              "STREAMING",
+              "VERIFYING",
+              "CANCELLING",
+              "DONE",
+              "ERROR",
+              "IDLE"
+            ]
+          },
+          "since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "result": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "SubagentTreeEntry": {
+        "type": "object",
+        "description": "Runtime-owned minion ancestry. Session/root selection is agent-scoped, includes descendants and necessary ended ancestors in parent-first order, and excludes siblings when a child is requested. Live children can be recovered from session metadata when subagent records have been retained away. Explicit root markers retain honest orphan descendants without inventing a parent or turning a child into a depth-zero root. Child maxDepth is the saved spawn-time budget, while root maxDepth is the current setting; these fields are observability, not authorization.",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "runId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Current registered run ID when live; saved child run ID when available, otherwise null."
+          },
+          "parentSessionId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Immediate owning session, not the root; null for a root. A retained-away parent is not fabricated."
+          },
+          "parentRunId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Immediate owning run ID when recorded; null for a root."
+          },
+          "subagentId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Runtime-owned child identity when recorded; null for a root or unavailable historical identity."
+          },
+          "depth": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2,
+            "description": "Root is 0, direct children are 1, grandchildren are 2. Historical children without a depth marker remain depth 1.",
+            "enum": [
+              0,
+              1,
+              2
+            ]
+          },
+          "maxDepth": {
+            "$ref": "#/components/schemas/MinionMaxDepth",
+            "description": "Current agent setting for a depth-zero root; SAVED spawn-time lineage budget for a child (historical default 1), not its recalculated effective spawn permission."
+          },
+          "rootSessionId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Saved root session marker, or ancestry-derived root when available. Distinct from the immediate parent; may be null when unavailable."
+          },
+          "rootRunId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Saved root run marker, or ancestry-derived root run when available; null when unavailable."
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phase": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "final": {
+            "type": "boolean"
+          },
+          "source": {
+            "type": "string",
+            "const": "subagent"
+          },
+          "result": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
       }
     },
     "securitySchemes": {

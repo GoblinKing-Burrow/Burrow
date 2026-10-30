@@ -1,3 +1,5 @@
+import { operationalTelemetry } from './operational-telemetry.mjs';
+import { performance } from 'node:perf_hooks';
 const queueStates = new WeakMap();
 
 function statesFor(queues) {
@@ -51,15 +53,23 @@ export function serializeSessionAdmission(queues, key, operation, signal = null,
   const state = stateFor(queues, key);
   const generation = state.generation;
   const previous = queues.get(key) || Promise.resolve();
-  let admitted = false;
+  // A grace period is opt-in, and release requires an affirmative durable fence.
+  // In particular Number(null) must not turn the default into a zero-ms release.
+  const hasDeadline = typeof cancellationGraceMs === 'number'
+    && Number.isFinite(cancellationGraceMs) && cancellationGraceMs >= 0
+    && typeof onCancellationDeadline === 'function';
+  const operationToken = {}; // private pairing identity, never a metric label
+  let admitted = false, overdue = false, overdueAt = null;
   let onAbort;
   let timer = null;
   let deadlineReject;
   const deadline = new Promise((_, reject) => { deadlineReject = reject; });
   const releaseDeadline = async () => {
+    overdue = true; overdueAt = performance.now();
+    operationalTelemetry('run-drain-overdue', { operationToken, outcome:'deadline_exceeded', durationMs:cancellationGraceMs });
     try {
       const fenced = await onCancellationDeadline?.();
-      if (fenced === false || (fenced && typeof fenced === 'object' && fenced.ok === false)) return;
+      if (fenced !== true && fenced?.ok !== true) return;
       deadlineReject(signal?.reason || new Error('agent_cancellation_deadline_exceeded'));
     } catch {
       // Keep the lane occupied when durable fencing fails. Releasing it would
@@ -69,7 +79,7 @@ export function serializeSessionAdmission(queues, key, operation, signal = null,
   const cancelled = new Promise((_, reject) => {
     onAbort = () => {
       if (!admitted) return reject(signal.reason || new Error('agent_stopped'));
-      if (Number.isFinite(Number(cancellationGraceMs)) && Number(cancellationGraceMs) >= 0 && timer === null) {
+      if (hasDeadline && timer === null) {
         timer = setTimeout(() => { void releaseDeadline(); }, Number(cancellationGraceMs));
       }
     };
@@ -81,7 +91,9 @@ export function serializeSessionAdmission(queues, key, operation, signal = null,
     admitted = true;
     return operation();
   });
-  const current = Number.isFinite(Number(cancellationGraceMs)) && Number(cancellationGraceMs) >= 0
+  const observeDrain = () => { if (overdue) { overdue = false; operationalTelemetry('run-drain-overdue',{ operationToken, outcome:'drained',durationMs:Math.max(0,performance.now()-overdueAt) }); } };
+  execution.then(observeDrain,observeDrain);
+  const current = hasDeadline
     ? Promise.race([execution, deadline])
     : execution;
   queues.set(key, current);

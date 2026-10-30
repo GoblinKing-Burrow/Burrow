@@ -40,6 +40,7 @@ const collection = {
     { key: 'agentId', value: 'hatchet' },
     { key: 'sessionId', value: 'default' },
     { key: 'archiveSessionId', value: 'default.reset.2026-08-15T20-05-44-730Z' },
+    { key: 'archiveDay', value: '2026-08-09' },
     { key: 'runId', value: 'manual-run' },
     { key: 'inputId', value: '00000000-0000-4000-8000-000000000000' },
     { key: 'generation', value: '0' },
@@ -78,7 +79,7 @@ const collection = {
     ]),
     folder('Agents', [
       req('List agents', 'GET', '/api/agents', { query: [['includeDisabled', 'true']] }),
-      req('Agent overview', 'POST', '/api/agents/overview', { body: { sessions: { '{{agentId}}': '{{sessionId}}' } } }),
+      req('Agent overview', 'POST', '/api/agents/overview', { body: { sessions: { '{{agentId}}': '{{sessionId}}' }, minionScope: 'agent' } }),
       req('Create agent', 'POST', '/api/agents', { body: { id: 'new-agent', name: 'New Agent', modelProfile: 'default' } }),
       req('Update agent', 'PATCH', '/api/agents/{{agentId}}', { body: { name: 'Hatchet', enabled: true, contextConfig: { version: 1 } } }),
       req('Delete agent', 'DELETE', '/api/agents/{{agentId}}'),
@@ -87,6 +88,8 @@ const collection = {
         { kind: 'SOUL', markdown: '# SOUL\n' }, { kind: 'RULES', markdown: '# RULES\n' }, { kind: 'ORIENTATION', markdown: '# ORIENTATION\n' }, { kind: 'TOOLS', markdown: '# TOOLS\n' },
       ] } }),
       req('Get agent model selection', 'GET', '/api/agents/{{agentId}}/model-selection'),
+      req('Get minion depth', 'GET', '/api/agents/{{agentId}}/minion-settings'),
+      req('Set minion depth', 'PUT', '/api/agents/{{agentId}}/minion-settings', { body: { maxDepth: 1 } }),
       req('Get minion model default', 'GET', '/api/agents/{{agentId}}/minion-model-selection'),
       req('Set minion model default', 'PUT', '/api/agents/{{agentId}}/minion-model-selection', { body: { connectionId: '{{connectionId}}', model: 'gpt-5.6-luna', reasoningEffort: 'off', temperature: 0.2 } }),
       req('Clear minion model default', 'PUT', '/api/agents/{{agentId}}/minion-model-selection', { body: { connectionId: null, model: null } }),
@@ -111,6 +114,10 @@ const collection = {
       req('Get Tiddle rolling-continuity status', 'GET', '/api/settings/tiddle', { query: [['agentId', '{{agentId}}']] }),
       req('List Tiddle warm cards', 'GET', '/api/tiddle/cards', { query: [['agentId', '{{agentId}}'], ['scope', ''], ['limit', '100']] }),
       req('Read Tiddle Signal history', 'GET', '/api/tiddle/history', { query: [['agentId', '{{agentId}}'], ['cardId', ''], ['since', ''], ['limit', '100']] }),
+    ]),
+    folder('Settings / OpenTelemetry', [
+      req('Read OpenTelemetry destinations', 'GET', '/api/settings/opentelemetry'),
+      req('Save named OpenTelemetry destinations', 'PUT', '/api/settings/opentelemetry', { body: { enabled: false, destinations: [{ id: 'collector', name: 'Collector', provider: 'custom', enabled: false, endpoint: 'https://collector.example:4318', protocol: 'http/protobuf', tracesEnabled: true, metricsEnabled: true, metricsTemporality: 'cumulative', connection: {}, tls: { verify: true } }] }, description: 'Atomically replaces the saved list. Omit protected headers/credentials to preserve them for the same ID/provider. Disabled example; adjust before enabling. See docs/otel-destination-contract.md.' }),
     ]),
     folder('Settings / Skills', [
       req('List text skills', 'GET', '/api/settings/skills'),
@@ -163,6 +170,10 @@ const collection = {
       req('Search all HC evidence', 'GET', '/api/session/search', { query: [['scope', 'burrow'], ['q', 'search terms'], ['role', 'any'], ['limit', '50'], ['archived', 'true']] }),
     ]),
     folder('Sessions', [
+      req('List Archive calendar dates', 'GET', '/api/archive/calendar', { query: [['kind', 'dreams', 'Also sessions or workflow-events'], ['month', '2026-08'], ['agentId', '{{agentId}}'], ['timezone', 'UTC']] }),
+      req('List Dream day groups', 'GET', '/api/archive/dreams/groups', { query: [['agentId', '{{agentId}}'], ['date', ''], ['q', ''], ['timezone', 'UTC'], ['limit', '200'], ['cursor', '']], description: 'Pages complete agent/local-day groups; keep filters unchanged with nextCursor.' }),
+      req('Read Dream day group', 'GET', '/api/archive/dreams/groups/{{agentId}}/{{archiveDay}}', { query: [['timezone', 'UTC']] }),
+      req('List archived workflow events', 'GET', '/api/archive/workflow-events', { query: [['agentId', '{{agentId}}'], ['date', ''], ['q', ''], ['timezone', 'UTC'], ['limit', '100'], ['cursor', '']], description: 'Normally UI-authorized, retained snapshots; date is the event acceptance day.' }),
       req('List archive Dreams', 'GET', '/api/archive/dreams', { query: [['agentId', '{{agentId}}'], ['limit', '200']] }),
       req('Read archive Dream', 'GET', '/api/archive/dreams/{{agentId}}/{{dreamEntryId}}'),
       req('List archive continuity cards', 'GET', '/api/archive/continuity/cards', { query: [['agentId', '{{agentId}}'], ['scope', ''], ['limit', '200']] }),

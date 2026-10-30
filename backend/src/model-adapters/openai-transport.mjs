@@ -1,5 +1,7 @@
 import { DEFAULT_MAX_RESPONSE_BYTES, MAX_MODEL_TEXT_CHARS, MAX_SSE_CARRY_CHARS, MAX_SSE_EVENT_CHARS, boundedText, normalizeToolCall, jsonText } from './adapter-primitives.mjs';
 import { isGoogleOpenAICompatible } from './google-wire.mjs';
+import { readProviderChunk } from './provider-fetch.mjs';
+import { markProviderEnvelopeFailure, markProviderStreamTruncated } from '../model-failure.mjs';
 function trimSlash(value) { return String(value || '').replace(/\/+$/, ''); }
 
 export function openAIEnvelopeError(data, mode) {
@@ -276,7 +278,7 @@ function compactResponseCompletion(response = {}) {
   };
 }
 
-async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_RESPONSE_BYTES, onTextDelta = null, onThoughtDelta = null } = {}) {
+async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_RESPONSE_BYTES, onTextDelta = null, onThoughtDelta = null, onToolDelta = null } = {}) {
   // A provider terminal owns the result; transport teardown is best effort and
   // must not keep a completed/failed generation waiting for the peer's EOF.
   const cancelStream = (stream) => {
@@ -294,6 +296,7 @@ async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_R
   let finalData = null;
   let streamError = null;
   let streamErrorDetails = null;
+  let providerErrorEnvelope = null;
   let finishReason = null;
   let terminalSeen = false;
   let terminalEventSeen = false;
@@ -306,11 +309,12 @@ async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_R
   };
   let dataLines = [];
   let dataChars = 0;
-  const emit = async (delta) => {
+  const emit = async (delta, terminalSnapshot = false) => {
     const safe = boundedAppend(text, delta);
     if (!safe) return;
     text += safe;
-    await notifyStreamDelta(onTextDelta, safe, text.length);
+    if (terminalSnapshot) { try { await onTextDelta?.({ delta: safe, totalChars: text.length }, true); } catch {} }
+    else await notifyStreamDelta(onTextDelta, safe, text.length);
   };
   const emitThought = async (delta) => {
     const remaining = Math.max(0, MAX_MODEL_TEXT_CHARS - thoughtChars);
@@ -338,9 +342,12 @@ async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_R
         recordToolCallFailure(responseFunctionCallFailure(responseToolCalls, event));
         if (!toolCallFailure && !mergeResponseFunctionCall(responseToolCalls, event)) recordToolCallFailure('model_tool_call_conflict');
       }
+      // IDs, function names, item-added and final snapshots are metadata.
+      // Only nonempty argument bytes constitute a streaming tool delta.
       if (event?.type === 'response.function_call_arguments.delta') {
         recordToolCallFailure(responseFunctionCallFailure(responseToolCalls, event));
         if (!toolCallFailure && !mergeResponseFunctionCall(responseToolCalls, event)) recordToolCallFailure('model_tool_call_conflict');
+        if (!toolCallFailure && typeof event.delta === 'string' && event.delta.length) await onToolDelta?.();
       }
       if (event?.type === 'response.function_call_arguments.done') {
         recordToolCallFailure(responseFunctionCallFailure(responseToolCalls, event));
@@ -351,7 +358,7 @@ async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_R
         terminalSeen = event.response.status === 'completed';
         finalData = compactResponseCompletion(event.response);
         usage = finalData.usage || usage;
-        if (!text && finalData.output_text) await emit(finalData.output_text);
+        if (!text && finalData.output_text) await emit(finalData.output_text, true);
         for (const call of (finalData.output || [])) {
           const prior = responseToolCalls.find((item) => item?.call_id === call.call_id);
           if (prior && ((prior.name && prior.name !== call.name) || (prior.arguments && prior.arguments !== call.arguments))) {
@@ -372,7 +379,11 @@ async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_R
         terminalEventSeen = true;
         const responseError = event.response?.error && typeof event.response.error === 'object' ? event.response.error : {};
         const eventError = event.error && typeof event.error === 'object' ? event.error : {};
-        const providerError = Object.keys(eventError).length ? eventError : responseError;
+        // Responses `error` events also carry code/message directly on the
+        // event. Preserve that structured terminal evidence, not just its prose.
+        const providerError = Object.keys(eventError).length ? eventError
+          : Object.keys(responseError).length ? responseError : event.type === 'error' ? event : {};
+        providerErrorEnvelope = providerError;
         const fallbackMessage = typeof event.error === 'string' ? event.error : null;
         streamError = boundedText(providerError.message || event.message || fallbackMessage || 'model_stream_failed', 500);
         streamErrorDetails = {
@@ -390,6 +401,9 @@ async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_R
     // Providers may send a terminal usage-only event with choices: []. Keep
     // its bounded telemetry before handling the normal choice path.
     if (event?.usage && typeof event.usage === 'object') usage = compactUsage(event.usage) || usage;
+    if (event?.error && typeof event.error === 'object') {
+      providerErrorEnvelope = event.error; streamError = boundedText(event.error.message || 'model_stream_failed', 500); return;
+    }
     const choice = event?.choices?.[0];
     if (!choice) return;
     if (typeof choice.delta?.content === 'string') await emit(choice.delta.content);
@@ -400,12 +414,13 @@ async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_R
     for (const call of choice.delta?.tool_calls || []) {
       recordToolCallFailure(streamToolCallFailure(toolCalls, call));
       if (!toolCallFailure && !mergeStreamToolCall(toolCalls, call)) recordToolCallFailure('model_tool_call_conflict');
+      if (!toolCallFailure && typeof call?.function?.arguments === 'string' && call.function.arguments.length) await onToolDelta?.();
     }
     if (choice.finish_reason) finishReason = choice.finish_reason;
   };
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readProviderChunk(reader);
       if (done) break;
       bytes += value?.byteLength ?? value?.length ?? 0;
       buffer += decoder.decode(value, { stream: true });
@@ -460,8 +475,15 @@ async function readResponseSseBounded(response, { mode, maxBytes = DEFAULT_MAX_R
   } finally {
     reader.releaseLock?.();
   }
-  if (!streamError && (!terminalSeen || (mode !== 'openai-responses' && !finishReason))) streamError = 'model_stream_incomplete';
-  if (streamError) return { ok: false, bytes, error: streamError, errorDetails: streamErrorDetails, data: null, streamedTextChars: text.length };
+  if (!streamError && (!terminalSeen || (mode !== 'openai-responses' && !finishReason))) {
+    // A malformed explicit terminal is not the same as a truncated transport.
+    if (!terminalEventSeen) return markProviderStreamTruncated({ ok: false, bytes, error: 'model_stream_incomplete', errorDetails: streamErrorDetails, data: null, streamedTextChars: text.length });
+    streamError = 'model_stream_incomplete';
+  }
+  if (streamError) {
+    const failure = { ok: false, bytes, error: streamError, errorDetails: streamErrorDetails, data: null, streamedTextChars: text.length };
+    return providerErrorEnvelope ? markProviderEnvelopeFailure(failure, providerErrorEnvelope) : failure;
+  }
   const data = mode === 'openai-responses'
     ? (finalData ? { ...finalData, ...(text ? { output_text: text } : {}), ...(responseToolCalls.length ? { output: responseToolCalls.filter(Boolean) } : finalData.output ? { output: finalData.output } : {}) } : { status: streamError ? 'failed' : 'completed', output_text: text, output: responseToolCalls.filter(Boolean) })
     : { choices: [{ index: 0, finish_reason: finishReason, message: { role: 'assistant', content: text, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) } }], usage };

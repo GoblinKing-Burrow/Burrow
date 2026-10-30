@@ -1,4 +1,6 @@
-import { createHash } from 'node:crypto';
+import { projectModelRecoveryMetadata } from './model-recovery-projection.mjs';
+import { createHash, randomUUID } from 'node:crypto';
+import { canSpawnMinion, nextMinionDepth, resolveTurnMinionDepth } from './minion-depth.mjs';
 import { withTraceGuard } from './trace-guard.mjs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -163,7 +165,7 @@ function childFrom({ parentSessionId, parentConversationId, parentRunId, childSe
   };
 }
 
-async function resolveRemoteTarget(targetRequest, executionContext, runId) {
+async function resolveRemoteTarget(targetRequest, executionContext, runId, abortSignal) {
   if (!targetRequest || typeof targetRequest !== 'object') throw new Error('target_required');
   if (targetRequest.kind !== 'filesystem') throw new Error(`unsupported_target_kind:${targetRequest.kind || 'missing'}`);
   const root = compactString(targetRequest.root);
@@ -173,8 +175,11 @@ async function resolveRemoteTarget(targetRequest, executionContext, runId) {
     remoteController: executionContext?.processExecutionController || null,
   });
   const result = await route({ target: resolveNativeFilesystemExecutionTarget(executionContext || {}), operation: { tool: 'files_inspect', arguments: { path: root } } }, {
-    parentRunId: runId || executionContext?.parentRunId || 'subagent-target-validation',
+    parentRunId: executionContext?.parentRunId || runId || 'subagent-target-validation',
     toolCallId: `spawn-target-${Date.now()}`,
+    abortSignal,
+    telemetry: executionContext?.telemetry || null,
+    traceContext: executionContext?.traceContext || null,
   });
   if (!result?.ok || result.type !== 'directory') throw new Error(result?.error || 'target_root_not_found');
   return Object.freeze({ kind: 'filesystem', root: result.path || root, boundaries: [] });
@@ -194,7 +199,22 @@ export async function executeSpawnSubagentTool({
   childRunner = null,
   abortSignal = executionContext?.abortSignal || null,
 } = {}) {
+  abortSignal?.throwIfAborted();
   const activityId = compactString(args.activityId) || null;
+  const parentDepth = executionContext?.minionDepth || await resolveTurnMinionDepth({
+    metadata: executionContext?.stores?.metadata,
+    conversations: executionContext?.conversationStore || executionContext?.stores?.conversations,
+    agentId: executionContext?.agentId,
+    sessionId: sessionId || executionContext?.sessionId || 'default',
+    runId,
+  });
+  if (!canSpawnMinion(parentDepth)) {
+    const result = { tool: 'spawn_subagent', ok: false, spawned: false, status: 'failed',
+      blockers: ['minion_depth_limit_reached'], warnings: [], evidence: [], record: null,
+      summary: 'Minion depth limit reached.', depth: parentDepth.depth, maxDepth: parentDepth.maxDepth };
+    await (traceLogger?.toolEnd || traceLogger?.tool)?.({ tool: 'spawn_subagent', ...(activityId ? { activityId } : {}), ok: false, status: result.status, blockers: result.blockers });
+    return result;
+  }
   const task = compactString(args.task || args.purpose || args.reason);
   const blockers = [];
   if (!task) blockers.push('subagent_task_required');
@@ -223,7 +243,7 @@ export async function executeSpawnSubagentTool({
     try {
       const remote = resolveNativeFilesystemExecutionTarget(executionContext || {}).kind === 'remote';
       target = remote
-        ? await resolveRemoteTarget(args.target, executionContext, runId)
+        ? await resolveRemoteTarget(args.target, executionContext, runId, abortSignal)
         : await resolveExecutionTarget(args.target, { filesystemBoundaries: executionContext?.filesystemBoundaries || [] });
       if (!remote) {
         const refined = await refineRepositoryTarget(target);
@@ -260,6 +280,7 @@ export async function executeSpawnSubagentTool({
   const parentSessionId = sessionId || executionContext?.sessionId || 'default';
   const parentConversationId = conversationId || executionContext?.conversationId || null;
   const parentRunId = runId || traceLogger?.runId || null;
+  const minionDepth = nextMinionDepth(parentDepth, { sessionId: parentSessionId, runId: parentRunId });
   const capability = compactString(args.capability || args.profile || 'spawn_subagent') || 'spawn_subagent';
   const label = compactString(args.label).slice(0, 80) || null;
   const spawnRequest = {
@@ -278,7 +299,7 @@ export async function executeSpawnSubagentTool({
   const conversationStore = executionContext?.conversationStore || executionContext?.stores?.conversations;
   if (!conversationStore) throw new Error('conversation_store_required');
   if (typeof executionContext?.agentId !== 'string' || !executionContext.agentId.trim()) throw new Error('agent_id_required');
-  const id = safeId(args.id || `subagent-${Date.now()}`);
+  const id = safeId(args.id || `subagent-${Date.now()}-${randomUUID().slice(0, 8)}`);
   const childSessionId = subagentChildSessionId(id);
   const owner = { agentId: executionContext.agentId, sessionId: parentSessionId, conversationId: parentConversationId, turnId: parentRunId, parentRunId, requestedBy: 'model-tool' };
   const scope = { workspaceRoot: target.root, baseRoot: target.root, target };
@@ -292,7 +313,7 @@ export async function executeSpawnSubagentTool({
     mayExecute: true,
     mayNetwork: true,
     mayCommit: executionPolicyAllowsCommit(executionPolicy),
-    allowedTools: ['shell_exec', 'files_list', 'files_find', 'files_inspect', 'files_search', 'git_status', 'git_diff', 'files_read', 'files_write', 'files_edit', 'files_patch', 'spawn_subagent'],
+    allowedTools: ['shell_exec', 'files_list', 'files_find', 'files_inspect', 'files_search', 'git_status', 'git_diff', 'files_read', 'files_write', 'files_edit', 'files_patch', ...(canSpawnMinion(minionDepth) ? ['spawn_subagent'] : [])],
     toolSurface: 'normal-runtime-tools',
   };
   const traceDir = traceLogger?.traceDir ? path.join(traceLogger.traceDir, 'subagents', id) : null;
@@ -307,6 +328,7 @@ export async function executeSpawnSubagentTool({
       dataRoot,
       id,
       owner,
+      minionDepth,
       purpose: task,
       label,
       scope,
@@ -326,18 +348,30 @@ export async function executeSpawnSubagentTool({
     return reused;
   }
   const queued = claim.queued;
-  await startSubagentChildSession({ dataRoot, id, workerProfile: 'spawn_subagent', purpose: task, owner, trace: { runId: id, childSessionId, traceDir }, model: modelSelection, conversationStore });
+  await startSubagentChildSession({ dataRoot, id, workerProfile: 'spawn_subagent', purpose: task, owner, minionDepth, trace: { runId: id, childSessionId, traceDir }, model: modelSelection, conversationStore });
   const spawnedAt = new Date().toISOString();
   const running = await updateSubagentStatus({ dataRoot, id, status: 'running', phase: 'spawned', trace: { runId: id, childSessionId, traceDir }, activity: { kind: 'run', status: 'running', phase: 'spawned', label: 'Subagent spawned', sequence: 0, startedAt: spawnedAt, lastActualActivityAt: spawnedAt }, provenance: { source: 'spawn-subagent-tool', reason: 'spawned' } });
 
   const remoteExecution = resolveNativeFilesystemExecutionTarget(executionContext || {}).kind === 'remote';
+  // Capture the live spawn-tool carrier before dispatch. In-process children
+  // must receive the same immediate parent as OS children, not the parent run.
+  const parentTraceContext = executionContext?.telemetry?.traceContextForTool?.(parentRunId, activityId) || executionContext?.traceContext || null;
+  const childParentExecutionContext = executionContext ? {
+    ...executionContext,
+    // Keep server-only dependencies that createExecutionContext hides from JSON.
+    conversationStore: executionContext.conversationStore,
+    stores: executionContext.stores,
+    telemetry: executionContext.telemetry,
+    abortSignal: executionContext.abortSignal,
+    traceContext: parentTraceContext,
+  } : null;
   let childRun;
   try {
     abortSignal?.throwIfAborted();
     if (remoteExecution && typeof childRunner !== 'function') throw new Error('subagent_child_runner_required');
     childRun = remoteExecution || childRunner
-      ? { ok: true, spawned: true, exitCode: 0, durationMs: null, result: await childRunner({ id, task, target, dataRoot, childSessionId, owner, modelConfig: childModelConfig, traceDir, executionPolicy, parentExecutionContext: executionContext, signal: abortSignal }) }
-      : await runSubagentProcess({ args: { id, task, target, dataRoot, childSessionId, owner, modelConfig: childModelConfig, traceDir, executionPolicy, executionBoundaries: executionContext?.executionBoundaries || null, traceContext: executionContext?.telemetry?.traceContextForTool?.(parentRunId, activityId) || executionContext?.traceContext || null, otelConfiguration: executionContext?.telemetry?.remoteConfiguration?.() || null }, signal: abortSignal });
+      ? { ok: true, spawned: true, exitCode: 0, durationMs: null, result: await childRunner({ id, task, target, dataRoot, childSessionId, owner, minionDepth, modelConfig: childModelConfig, traceDir, executionPolicy, parentExecutionContext: childParentExecutionContext, signal: abortSignal }) }
+      : await runSubagentProcess({ args: { id, task, target, dataRoot, childSessionId, owner, minionDepth, modelConfig: childModelConfig, traceDir, executionPolicy, executionBoundaries: executionContext?.executionBoundaries || null, traceContext: parentTraceContext, otelConfiguration: executionContext?.telemetry?.remoteConfiguration?.(parentRunId) || null }, signal: abortSignal });
   } catch (error) {
     const code = compactString(error?.code || error?.message || 'subagent_child_dispatch_failed').split(':')[0];
     childRun = {
@@ -358,6 +392,7 @@ export async function executeSpawnSubagentTool({
   const child = childFrom({ parentSessionId, parentConversationId, parentRunId, childSessionId, receiptRefs: receiptRef ? [receiptRef] : [], dataRoot });
   const result = {
     ok: status === 'succeeded',
+    ...projectModelRecoveryMetadata(childResult),
     summary: childResult.summary || (status === 'succeeded' ? 'Minion completed.' : 'Minion failed.'),
     blockers: childResult.blockers || [],
     warnings: [...targetWarnings, ...(childResult.warnings || [])],

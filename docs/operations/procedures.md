@@ -4,7 +4,6 @@
 !!! warning "Earlier technical reference"
     This page is retained from earlier documentation and has not been fully revalidated for the public 2026.10.19 release. Its revision-specific links and examples may describe older or development behavior. Start with the [current operator guide](../guide/installation.md); do not use this page alone to select installation commands, image tags, or security settings.
 
-
 These retained recipes include targeted corrections against public **2026.10.19** and assume the default native user installation. For containers, use the corresponding [container commands](containers.md). Replace example agent/session IDs with real values and run as the installation owner.
 
 ## Start, stop, inspect
@@ -70,7 +69,7 @@ Stop also holds all current and future main queue inputs; **Resume queue** relea
 4. Follow progress in chat and inspect the task's saved execution/history. The current board does not continuously poll task execution; use **Refresh history** or reopen the task for newer records. The assigned agent runs the task in its **default** conversation, with project context scoped to this task run.
 5. Inspect the default conversation and **Archive → Proof** for its final answer, blockers, and verification. Update the board status to reflect the reviewed outcome.
 
-The dispatch lookup is awaited in this release; the former unassigned-task warning is obsolete. Execution success does not automatically move a task to Done. An uncertain dispatch response requires checking the active chat and retained task receipt. Check runtime activity and the task's persisted execution before retrying; a disconnected browser does not prove dispatch failed. Project paths supply context, not filesystem authorization. Sources: , , .
+The dispatch lookup is awaited in this release; the former unassigned-task warning is obsolete. Execution success does not automatically move a task to Done. An uncertain dispatch response requires checking the active chat and retained task receipt. Check runtime activity and the task's persisted execution before retrying; a disconnected browser does not prove dispatch failed. Project paths supply context, not filesystem authorization.
 
 ## Recover a prior decision or saved memory
 
@@ -80,7 +79,7 @@ The dispatch lookup is awaited in this release; the former unassigned-task warni
 4. For an explicit saved memory, open **Brains**, select **Agent owner**, and search. Open the entry to inspect its content, source references, origin, and revision.
 5. To correct it, edit and choose **Save memory**. On a conflict, preserve your intended wording elsewhere, **Reload memory**, compare, and reapply only the desired correction.
 
-Brains records are agent-owned saved context, not verification of current runtime state. Legacy migration details explain origin; they do not certify present truth. Brains does not provide the old global knowledge, Recall, or purge controls. Sources: , , .
+Brains records are agent-owned saved context, not verification of current runtime state. Legacy migration details explain origin; they do not certify present truth. Brains does not provide the old global knowledge, Recall, or purge controls.
 
 ### Delete saved memories deliberately
 
@@ -89,7 +88,7 @@ Brains records are agent-owned saved context, not verification of current runtim
 3. Inspect each bulk result: these are separate deletions, so some can succeed while others conflict or fail.
 4. **Reload list** and review current revisions before retrying failed entries.
 
-These controls delete immediately without a separate UI confirmation. Memory deletion does not delete conversation originals, attachments, browser caches, or other retained evidence. The legacy Albdruck conversation-purge route adapter is not mounted in this release; its historical procedure is not a supported erasure workflow. Sources: , .
+These controls delete immediately without a separate UI confirmation. Memory deletion does not delete conversation originals, attachments, browser caches, or other retained evidence. The legacy Albdruck conversation-purge route adapter is not mounted in this release; its historical procedure is not a supported erasure workflow.
 
 ## Retention maintenance
 
@@ -97,9 +96,9 @@ Use **Settings → General → Trace retention** for managed trace cleanup:
 
 1. Take a recovery backup if traces may be needed for incident review.
 2. Choose the maximum age and/or storage limit and a cadence between 15 minutes and 7 days. **Maximum storage** now uses an explicit MiB/GiB selector; changing units preserves the underlying byte limit. Enable managed cleanup only when those limits are intended.
-3. Choose **Save policy**. Expect confirmation that the policy was saved.
+3. Choose **Apply policy** only after reviewing its limits. **Applying an enabled policy can start scheduled deletion immediately, without Preview or Run now.** Check the applied result.
 4. Choose **Preview cleanup** and inspect the trace count and reclaimable bytes. The UI summarizes the plan; it does not display individual paths.
-5. If the saved, previewed policy is still the intended one, choose **Run now**. Any form edit requires saving and previewing again.
+5. If the saved, previewed policy is still the intended one, choose **Run now**. Any form edit requires applying and previewing again.
 6. Check the cleanup result, last-run status, next-run status, and any error. A zero count may simply mean no trace qualifies.
 
 Managed cleanup is disabled until enabled with at least one limit. This surface removes trace data, not Brains records or a selected conversation. If a save/preview fails, resolve that error before proceeding. Do not use a different policy surface merely to bypass the guard. ]

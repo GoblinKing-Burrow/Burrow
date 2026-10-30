@@ -1637,7 +1637,52 @@
       "page": "reference/api.md",
       "inPinnedOpenApi": false,
       "routeFamilySource": "backend/scripts/burrow-ui.mjs"
+    },
+    {
+      "method": "GET",
+      "path": "/api/agents/{agentId}/minion-settings",
+      "operationId": "getAgentMinionSettings",
+      "page": "reference/api/settings.md",
+      "inPinnedOpenApi": false,
+      "routeFamilySource": "backend/scripts/ui/settings-routes.mjs"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/agents/{agentId}/minion-settings",
+      "operationId": "updateAgentMinionSettings",
+      "page": "reference/api/settings.md",
+      "inPinnedOpenApi": false,
+      "routeFamilySource": "backend/scripts/ui/settings-routes.mjs"
+    },
+    {
+      "method": "GET",
+      "path": "/api/archive/dreams/groups",
+      "operationId": "listArchiveDreamGroups",
+      "page": "reference/api/sessions.md",
+      "inPinnedOpenApi": false,
+      "routeFamilySource": "backend/scripts/ui/session-routes.mjs"
+    },
+    {
+      "method": "GET",
+      "path": "/api/archive/dreams/groups/{agentId}/{day}",
+      "operationId": "getArchiveDreamGroup",
+      "page": "reference/api/sessions.md",
+      "inPinnedOpenApi": false,
+      "routeFamilySource": "backend/scripts/ui/session-routes.mjs"
+    },
+    {
+      "method": "GET",
+      "path": "/api/archive/workflow-events",
+      "operationId": "listArchiveWorkflowEvents",
+      "page": "reference/api/sessions.md",
+      "inPinnedOpenApi": false,
+      "routeFamilySource": "backend/scripts/ui/session-routes.mjs"
     }
   ],
-  "contractArtifactSourceBaseline": "d6490825401405ce719e007fd96a487c5b0cde56"
+  "contractArtifactSourceBaseline": "d6490825401405ce719e007fd96a487c5b0cde56",
+  "latestSourceAdditionReview": {
+    "date": "2026-10-30",
+    "sourceCommit": "bea2171508d1821440ed5c554a688768848699c9",
+    "scope": "Grouped Dream list/detail and workflow-event Archive GET additions; retained pinned artifact remains historical."
+  }
 }

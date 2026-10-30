@@ -1,4 +1,5 @@
 import { normalizePostgresPool } from './postgres-foundation.mjs';
+import { archiveReadQuery } from './postgres-archive-read.mjs';
 import { operatorTimezone } from './timezone.mjs';
 import { PostgresSettingsMetadataStore } from './postgres-settings-metadata-store.mjs';
 import { randomUUID } from 'node:crypto';
@@ -118,6 +119,15 @@ export class PostgresDreamCycleReceiptStore {
       }
       return count;
     });
+  }
+  // Archive needs the entire retained history, not the bounded Settings activity
+  // view. Keep the latter's latest/limit semantics unchanged.
+  async listArchiveDreamCycleReceipts({ agentId, signal, deadline } = {}) {
+    const id = text(agentId); if (!id) throw new Error('dream_cycle_agent_required');
+    const sql = 'SELECT receipt_json FROM dream_cycle_receipts WHERE agent_id=$1 ORDER BY updated_at DESC,run_id DESC';
+    const result = signal || deadline !== undefined
+      ? await archiveReadQuery(this.pool, sql, [id], { signal, deadline }) : await this.pool.query(sql, [id]);
+    return result.rows.map((row) => parse(row.receipt_json));
   }
   async latestDreamCycleReceipts(options = {}) { return this.latest(options); }
 

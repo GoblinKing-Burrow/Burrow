@@ -9,6 +9,7 @@ import { writeFileEnvelope } from './harness/write-file.mjs';
 import { applyPatchEnvelope } from './harness/apply-patch.mjs';
 import { editFileEnvelope, gitDiffEnvelope, gitStatusEnvelope, globEnvelope, listFilesEnvelope, searchFilesEnvelope, statPathEnvelope } from './harness/developer-tools.mjs';
 import { executeSpawnSubagentTool } from './subagent-spawn-execution.mjs';
+import { listAgentPeers } from './agent-directory-tool.mjs';
 import { sendAgentMessage } from './agent-chat-tool.mjs';
 import { updateOwnToolsProfile } from './agent-profile-tool.mjs';
 import { createAgentScheduledJob, executeAgentScheduledJobTool } from './agent-scheduled-job-tool.mjs';
@@ -75,7 +76,9 @@ export async function executeReviewedProposalActions({ conversationStore = null,
     const result = await routeFilesystem({ target, operation: { tool: action.tool, arguments: args } }, {
       parentRunId: executionContext?.parentRunId || traceLogger?.runId,
       toolCallId: action.toolCallId,
-      traceContext: executionContext?.telemetry?.traceContextForTool?.(executionContext?.parentRunId || traceLogger?.runId, action.toolCallId) || executionContext?.traceContext || null,
+      // The remote router starts the Core tool span before resolving its carrier.
+      telemetry: executionContext?.telemetry || null,
+      traceContext: executionContext?.traceContext || null,
       abortSignal,
     });
     return withExecutionProvenance(result, target, executionContext, action.toolCallId);
@@ -119,6 +122,7 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       const traceDetails = {
         command: redactText(action.command).slice(0, 2000),
         cwd: redactText(action.cwd ? path.resolve(action.cwd) : executionRoot).slice(0, 1000),
+        reason: typeof action.reason === 'string' ? action.reason.slice(0, 500) : null,
         providerId: target.kind === 'remote' ? target.providerId : null,
       };
       const started = await traceLogger?.toolStart?.({
@@ -162,11 +166,10 @@ export async function executeReviewedProposalActions({ conversationStore = null,
         command: action.command,
         cwd: action.cwd ? path.resolve(action.cwd) : executionRoot,
         env: protectedInput.env,
-        traceLogger: traceLogger ? {
-          ...traceLogger,
-          toolStart: traceLogger.toolStart ? (payload) => traceLogger.toolStart({ ...payload, toolCallId: action.toolCallId || null }) : undefined,
-          toolEnd: traceLogger.toolEnd ? (payload) => traceLogger.toolEnd({ ...payload, toolCallId: action.toolCallId || null }) : undefined,
-        } : traceLogger,
+        traceLogger,
+        // This proposal boundary owns the one logical shell tool activity.
+        // runExec still writes its usual stdout/stderr/result artifacts.
+        emitToolEvents: !traceLogger,
         artifactPrefix: `${artifactPrefix || 'proposal'}-${action.index}-shell_exec`,
         reason: action.reason,
         abortSignal,
@@ -182,6 +185,7 @@ export async function executeReviewedProposalActions({ conversationStore = null,
           ...(target.kind === 'remote' && protectedInput.bindings.length ? { protectedValues: protectedInput.env, protectedBindingMetadata: protectedInput.bindings } : {}) }, {
           parentRunId: executionContext?.parentRunId || traceLogger?.runId,
           toolCallId: action.toolCallId,
+          telemetry: executionContext?.telemetry || null,
           traceContext: executionContext?.telemetry?.traceContextForTool?.(executionContext?.parentRunId || traceLogger?.runId, action.toolCallId) || executionContext?.traceContext || null,
           abortSignal,
         });
@@ -195,6 +199,15 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       await (traceLogger?.toolEnd || traceLogger?.tool)?.({
         ...traceDetails,
         exitCode: result.exitCode ?? null,
+        signal: result.signal || null,
+        timedOut: result.timedOut === true,
+        cancelled: result.cancelled === true,
+        durationMs: result.durationMs,
+        stdoutBytes: Buffer.byteLength(result.stdout || ''),
+        stderrBytes: Buffer.byteLength(result.stderr || ''),
+        stdoutTruncated: result.stdoutTruncated,
+        stderrTruncated: result.stderrTruncated,
+        artifacts: result.artifacts,
         operationId: result.execution?.operationId || result.operationId || null,
         tool: 'shell_exec',
         ...(started?.payload?.activityId ? { activityId: started.payload.activityId } : {}),
@@ -221,11 +234,19 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       const execute = (process) => routeProcess({ target, process }, {
         parentRunId: executionContext?.parentRunId || traceLogger?.runId,
         toolCallId: action.toolCallId,
+        telemetry: executionContext?.telemetry || null,
         traceContext: executionContext?.telemetry?.traceContextForTool?.(executionContext?.parentRunId || traceLogger?.runId, action.toolCallId) || executionContext?.traceContext || null,
         abortSignal,
       });
       const envelope = action.tool === 'git_status' ? gitStatusEnvelope : gitDiffEnvelope;
-      toolResults.push(await envelope({ dirPath: action.dirPath || executionRoot, workspaceRoot: executionRoot, traceLogger, rootDir, artifactPrefix: `${artifactPrefix || 'proposal'}-${action.index}-${action.tool}`, reason: action.reason, execute }));
+      const result = await envelope({
+        dirPath: action.dirPath || executionRoot, workspaceRoot: executionRoot, traceLogger, rootDir,
+        artifactPrefix: `${artifactPrefix || 'proposal'}-${action.index}-${action.tool}`, reason: action.reason, execute,
+        toolCallId: action.toolCallId || null, executionTarget: target.kind,
+        providerId: target.kind === 'remote' ? target.providerId : null,
+        targetId: target.kind === 'remote' ? target.targetId : null,
+      });
+      toolResults.push(withExecutionProvenance(result, target, executionContext, action.toolCallId));
       continue;
     }
     if (action.tool === 'files_edit') { toolResults.push(await executeFilesystem(action, { filePath: workspacePath(action.filePath, executionRoot, rootDir), oldText: action.oldText, newText: action.newText, workspaceRoot: executionRoot, traceLogger, rootDir, artifactPrefix: `${artifactPrefix || 'proposal'}-${action.index}-edit`, reason: action.reason })); continue; }
@@ -524,11 +545,27 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       continue;
     }
 
-    if (action.tool === 'agent_send_message') {
-      const started = await traceLogger?.toolStart?.({ tool: 'agent_send_message', recipientAgentId: action.recipientAgentId, targetSessionId: action.targetSessionId || null, messageMode: action.messageMode || 'request_reply' });
+    if (action.tool === 'agents_list') {
+      const started = await traceLogger?.toolStart?.({ tool: 'agents_list', toolCallId: action.toolCallId || null });
       let result;
       try {
-        result = await sendAgentMessage({ conversationStore: conversationStore || executionContext?.conversationStore || executionContext?.stores?.conversations, senderRuntime: agentRuntime || executionContext?.agentRuntime, resolveRecipientRuntime: resolveAgentRuntime || executionContext?.resolveAgentRuntime, runRecipientReply: runAgentReply || executionContext?.runAgentReply, recipientAgentId: action.recipientAgentId, targetSessionId: action.targetSessionId, replyTo: executionContext?.agentMessageReplyTo, content: action.content, messageMode: action.messageMode || 'request_reply', runId: traceLogger?.runId || null, sourceSessionId: sessionId || executionContext?.sessionId, abortSignal });
+        result = await listAgentPeers({ store: executionContext?.stores?.agents, query: action.query, includeDisabled: action.includeDisabled, cursor: action.cursor, limit: action.limit ?? undefined });
+      } catch (error) {
+        result = { tool: 'agents_list', ok: false, error: error?.message || String(error) };
+      }
+      toolResults.push(result);
+      await (traceLogger?.toolEnd || traceLogger?.tool)?.({ tool: 'agents_list', ...(started?.payload?.activityId ? { activityId: started.payload.activityId } : {}), ok: result.ok, resultCount: result.resultCount, error: result.error || null });
+      continue;
+    }
+
+    if (action.tool === 'agent_send_message') {
+      const started = await traceLogger?.toolStart?.({ tool: 'agent_send_message', toolCallId: action.toolCallId || null, recipientAgentId: action.recipientAgentId, targetSessionId: action.targetSessionId || null, messageMode: action.messageMode || 'request_reply' });
+      let result;
+      try {
+        // Resolve only after toolStart's observer opens the sender's tool span.
+        // This is internal transport context, never authority from action/content.
+        const parentTraceContext = executionContext?.telemetry?.traceContextForTool?.(traceLogger?.runId || executionContext?.parentRunId, started?.payload?.activityId || action.toolCallId) || executionContext?.traceContext || null;
+        result = await sendAgentMessage({ conversationStore: conversationStore || executionContext?.conversationStore || executionContext?.stores?.conversations, senderRuntime: agentRuntime || executionContext?.agentRuntime, resolveRecipientRuntime: resolveAgentRuntime || executionContext?.resolveAgentRuntime, runRecipientReply: runAgentReply || executionContext?.runAgentReply, recipientAgentId: action.recipientAgentId, targetSessionId: action.targetSessionId, replyTo: executionContext?.agentMessageReplyTo, content: action.content, messageMode: action.messageMode || 'request_reply', runId: traceLogger?.runId || null, sourceSessionId: sessionId || executionContext?.sessionId, parentTraceContext, abortSignal });
       } catch (error) {
         result = { tool: 'agent_send_message', ok: false, recipientAgentId: action.recipientAgentId || null, targetSessionId: action.targetSessionId || null, error: error?.message || String(error), autoExecuted: false };
       }

@@ -19,7 +19,7 @@ Start here when an agent needs access to files, a service, or another execution 
 3. For HTTP, enter the **Server URL** and optional API key. For stdio, enter the **Command**, one argument per line, and any required environment variables. A local stdio command runs on the Burrow host, not in your browser.
 4. Choose **Ephemeral** or **Keep alive**. Keep alive preserves a stateful MCP session between calls, useful for servers that maintain tabs or selections.
 5. Click **Add MCP server**, then **Discover tools** on the saved server.
-6. Open **Settings → Agents**, select an agent, and open **MCP tools**. Select the server, check the tools it may use, then click **Save MCP tools**.
+6. Open **Settings → Agents**, select an agent, and open **MCP tools**. Select the server and check the tools it may use. Individual grants and Select all/Clear all autosave; check saved feedback and retry failures. Each write uses accepted grants rather than silently committing other failed drafts.
 
 Saved credentials are not shown again. Existing configured secret fields can remain blank when you are not replacing them. Deleting a connection also removes its agent tool grants.
 
@@ -113,11 +113,10 @@ Both examples currently declare the mod ID `burrow-reference-mod`. Treat them as
 !!! warning "A workspace is not a sandbox"
     Agent workspaces organize files and context. Core explicitly does not create an agent-specific filesystem boundary. Run Burrow and third-party code with appropriate operating-system permissions and only give it access you intend it to have. Mods run JavaScript in a child process; a separate process is not an operating-system sandbox.
 
-To configure a hard block, open **Settings → General → Execution boundaries**, click **Add hard block**, and fill in its ID, target type, pattern, match mode, operations, and optional reason. Click **Save boundaries**. Removing or toggling a rule also needs **Save boundaries**.
+To configure a hard block, open **Settings → Agents → Global → Execution boundaries**, click **Add hard block**, and fill in its ID, target type, pattern, match mode, operations, and optional reason. Click **Save boundaries**. Removing or toggling a rule also needs **Save boundaries**.
 
 **Important coverage limits in this release:** the editor offers read, write, delete, execute, and delegate, but the native action-review implementation checks boundaries for file writes/edits/patches, delegation targets, and shell execution. The read-tool branch does not apply those boundary checks. Shell checks examine the command string and an explicitly supplied working directory; they do not inspect every file a command may touch. Do not rely on these settings as comprehensive read/delete protection, a network firewall, or protection against arbitrary third-party code.
 
 For command rules, select **execute**: command-pattern matching is only evaluated for that operation. An allowed native call is reviewed again at execution, but that does not broaden the rule coverage above.
 
 [Source: boundary editor](https://github.com/GoblinKing-Burrow/Burrow/blob/deec39818955db1711161b5310d5822e65fda39a/ui/src/features/settings/ExecutionBoundaries.tsx#L92-L115) · [Source: actual action coverage](https://github.com/GoblinKing-Burrow/Burrow/blob/deec39818955db1711161b5310d5822e65fda39a/backend/src/action-safety.mjs#L43-L243) · [Source: command matching](https://github.com/GoblinKing-Burrow/Burrow/blob/deec39818955db1711161b5310d5822e65fda39a/backend/src/execution-boundaries.mjs#L131-L140) · [Source: execution recheck](https://github.com/GoblinKing-Burrow/Burrow/blob/deec39818955db1711161b5310d5822e65fda39a/backend/src/proposal-execution.mjs#L102-L114) · [Source: workspace scope](https://github.com/GoblinKing-Burrow/Burrow/blob/deec39818955db1711161b5310d5822e65fda39a/backend/src/agent-registry.mjs#L76-L91) · [Source: mod process](https://github.com/GoblinKing-Burrow/Burrow/blob/deec39818955db1711161b5310d5822e65fda39a/backend/src/mod-host.mjs#L110-L112)
-

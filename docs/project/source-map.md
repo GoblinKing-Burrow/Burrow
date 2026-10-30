@@ -6,10 +6,10 @@ The operator guide follows inspected current development implementation, without
 
 | Component | Inspected revision |
 |---|---|
-| Assembled Burrow, build `2026.10.27.7` | `bf4c46a19a1be3de1193ef948936620db8fa2358` |
-| Core / Backend | `32ff99dfc0317635f5c7aa53b4c9ec18266d4c09` |
-| UI | `2e723f5be7573b86074c91b045ae94998038f1d8` |
-| Skills | `2d120d42020eb13bc4ff0b613ea8badc46bdef1b` |
+| Assembled Burrow, build `2026.10.30.1` | `23bf37de7a7353732005123c3c44b7f2822463bb` |
+| Core / Backend | `bea2171508d1821440ed5c554a688768848699c9` |
+| UI | `bb78b136e7ceb21858b134c1f8376726d8e18f5d` |
+| Skills | `9bb95549b00429f99ccdaf30c804134ee4418738` |
 
 The assembly's `SOURCE_VERSIONS` matches those Backend/UI pins. Private source links are intentionally not published. Older public commit links below remain historical evidence and are not silently repointed to claim current compatibility. Check your installed health/build identity before using a newer capability.
 
@@ -63,3 +63,15 @@ Compared source changes since the full 25 October baseline. This pass reconciles
 ## Ordinary update: 27 October 2026
 
 Compared changes since the 26 October source baseline: explicit busy-input queues and snapshot side questions, manual/pressure compaction feedback, per-agent Dream memory expression and no-save previews, GitHub workflow watches/receiver configuration, and Midnight appearance. OIDC setup/version guidance is maintained separately in [authentication](../security/authentication.md). Skills source is unchanged. This is bounded static delta reconciliation, not another full-page recertification or a live provider/database/webhook/login test. The Sunday full-review receipt remains dated 25 October; no runtime execution or public-release promotion is implied.
+
+## Ordinary update: 28 October 2026
+
+Compared implementation changes since the successful 27 October update. This pass reconciles Settings navigation and theme controls, provider/tool usage attribution, operational logs, targeted compaction and cooperative Stop handling, and bounded model-request recovery. Recovery resumes the failed model request with retained tool results; it does not replay completed tools. The seven separately documented components have no new source changes. The dated Sunday full review and previous delta evidence remain historical; this is not a new full audit, application test run, live installation check, or runtime release promotion.
+
+## Ordinary update: 29 October 2026
+
+Compared implementation changes since the successful 28 October update: native peer discovery and direct A2A guidance, configurable minion depth and descendant visibility, multiple telemetry destinations, bounded generic-provider recovery, and group transcript ownership. Node Goblin telemetry, Skills guidance and Goblin Secret Store access choices are reconciled separately. This is static changed-source review and basic documentation drift checking, not a new full review, application test run, live integration check or runtime release promotion.
+
+## Ordinary update: 30 October 2026
+
+Compared implementation changes since the successful 29 October baseline: independent Settings autosave with explicit coupled-form boundaries; Dream phase and workflow delivery history in Archive; agent-wide Minion discovery and source-authored delegation labels; full home-Core administrative API dispatch through a separately granted system capability; expanded operational/provider responsiveness telemetry; and preference adjudication against the current operator baseline. This is static changed-source reconciliation, not a full-page recertification, provider/application test, runtime deployment or release promotion. Historical screenshots and source qualifications remain intact.

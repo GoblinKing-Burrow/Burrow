@@ -1,15 +1,25 @@
 import { api, type ArchiveRunListResponse, type ArchiveRunResponse } from '../../app/api';
-import type { ArchiveDetail, ArchiveDream, ArchiveDreamDocument, ArchiveSession, ContinuityCard, ContinuityCardGroup, DreamEntry } from './archiveTypes';
+import type { ArchiveDetail, DreamArchiveGroup, DreamGroupSummary, ArchiveDreamDocument, ArchiveSession, ArchiveWorkflowEvent, ContinuityCard, ContinuityCardGroup, DreamEntry } from './archiveTypes';
 
 export type ArchivePage<T> = { items: T[]; nextCursor: string | null; hasMore: boolean };
 type CursorPage = { nextCursor: string | null; hasMore: boolean };
-export type ArchiveCalendarKind = 'sessions' | 'dreams';
+export type ArchiveCalendarKind = 'sessions' | 'dreams' | 'workflow-events';
 export type ArchiveCalendarAvailability = { ok: true; kind: ArchiveCalendarKind; month: string; dates: string[] };
 
 export type ArchiveRepository = ReturnType<typeof createArchiveRepository>;
 
 export function browserTimezone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+}
+
+// Construct each midnight independently: local calendar days can be 23 or 25 hours.
+export function archiveDayBounds(day: string): { from: string; to: string } {
+  const [year, month, date] = day.split('-').map(Number);
+  return {
+    from: new Date(year, month - 1, date).toISOString(),
+    // PostgreSQL retains microseconds: include the entire final millisecond.
+    to: new Date(new Date(year, month - 1, date + 1).getTime() - 1).toISOString().replace(/\.999Z$/, '.999999Z'),
+  };
 }
 
 export function createArchiveRepository(request: typeof api = api) {
@@ -28,18 +38,41 @@ export function createArchiveRepository(request: typeof api = api) {
       const response = await request<{ sessions: ArchiveSession[] } & CursorPage>(`/api/archive/sessions?${params}`, { signal });
       return { items: response.sessions, nextCursor: response.nextCursor, hasMore: response.hasMore };
     },
-    loadSession(session: ArchiveSession, signal?: AbortSignal, before?: string) {
+    async listWorkflowEvents(query: string, signal?: AbortSignal, cursor?: string | null, date?: string, agentId?: string): Promise<ArchivePage<ArchiveWorkflowEvent>> {
+      const params = new URLSearchParams({ limit: '100', timezone: browserTimezone() });
+      if (agentId) params.set('agentId', agentId);
+      if (date) params.set('date', date);
+      if (query.trim()) params.set('q', query.trim());
+      if (cursor) params.set('cursor', cursor);
+      const response = await request<{ events: ArchiveWorkflowEvent[] } & CursorPage>(`/api/archive/workflow-events?${params}`, { signal });
+      if (!Array.isArray(response.events)) throw new Error('Invalid workflow events response.');
+      return { items: response.events, nextCursor: response.nextCursor, hasMore: response.hasMore };
+    },
+    loadSession(session: ArchiveSession, signal?: AbortSignal, before?: string, date?: string) {
       const query = new URLSearchParams({ limit: '100' });
       if (before) query.set('before', before);
+      if (date) {
+        const bounds = archiveDayBounds(date);
+        query.set('from', bounds.from);
+        query.set('to', bounds.to);
+      }
       return request<ArchiveDetail>(`/api/archive/sessions/${encodeURIComponent(session.agentId ?? '')}/${encodeURIComponent(session.sessionId)}?${query}`, { signal });
     },
-    async listDreams(signal?: AbortSignal, cursor?: string | null, date?: string, agentId?: string): Promise<ArchivePage<DreamEntry>> {
+    async listDreams(signal?: AbortSignal, cursor?: string | null, date?: string, agentId?: string, search = ''): Promise<ArchivePage<DreamGroupSummary>> {
       const query = new URLSearchParams({ limit: '200', timezone: browserTimezone() });
       if (date) query.set('date', date);
       if (agentId) query.set('agentId', agentId);
+      if (search.trim()) query.set('q', search.trim());
       if (cursor) query.set('cursor', cursor);
-      const response = await request<{ entries: ArchiveDream[] } & CursorPage>(`/api/archive/dreams?${query}`, { signal });
-      return { items: response.entries.map((entry) => ({ ...entry, narrative: entry.excerpt, sourceRefs: [] })), nextCursor: response.nextCursor, hasMore: response.hasMore };
+      const response = await request<{ ok: boolean; groups: DreamGroupSummary[] } & CursorPage>(`/api/archive/dreams/groups?${query}`, { signal });
+      if (response.ok !== true || !Array.isArray(response.groups)) throw new Error('Invalid dream groups response.');
+      return { items: response.groups, nextCursor: response.nextCursor, hasMore: response.hasMore };
+    },
+    async loadDreamGroup(group: Pick<DreamGroupSummary, 'agentId' | 'day' | 'timezone'>, signal?: AbortSignal): Promise<DreamArchiveGroup> {
+      const query = new URLSearchParams({ timezone: group.timezone });
+      const response = await request<{ ok: boolean; group: DreamArchiveGroup }>(`/api/archive/dreams/groups/${encodeURIComponent(group.agentId)}/${encodeURIComponent(group.day)}?${query}`, { signal });
+      if (response.ok !== true || !response.group || response.group.agentId !== group.agentId || response.group.day !== group.day || response.group.timezone !== group.timezone) throw new Error('Invalid dream group response.');
+      return response.group;
     },
     async loadDream(entry: DreamEntry, signal?: AbortSignal) {
       const response = await request<ArchiveDreamDocument>(`/api/archive/dreams/${encodeURIComponent(entry.agentId)}/${encodeURIComponent(entry.id)}`, { signal });
