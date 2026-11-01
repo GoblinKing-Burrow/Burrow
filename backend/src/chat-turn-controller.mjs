@@ -85,6 +85,7 @@ export function chatTurnInputFromBody({ body = {}, rootDir, dataRoot, agentDataR
     args: {
       ...(body.noCallModel === true ? { no_call_model: true } : {}),
       ...(agentRuntime ? {} : (agentDataRoot ? { agent_data_root: agentDataRoot } : { data_root: dataRoot })),
+      ...(body.thinkingMode !== undefined ? { model_thinking_mode: body.thinkingMode } : {}),
       ...(body.reasoningEffort ? { model_reasoning_effort: String(body.reasoningEffort) } : {}),
       ...(body.temperature !== undefined ? { model_temperature: body.temperature } : {}),
       ...(body.model ? { model: String(body.model) } : {}),
@@ -98,11 +99,11 @@ export function chatTurnInputFromBody({ body = {}, rootDir, dataRoot, agentDataR
   };
 }
 
-export async function runChatTurnFromBody({ contextBoundary = null, attachmentInput = null, body = {}, rootDir, dataRoot, agentDataRoot, agentRuntime = null, resolveAgentRuntime = null, stores = null, groupChannelContext = null, turnSource = null, externalTurnMetadata = null, completionEvent = null, chatInput = null, latencyTiming = null, telemetry = null, parentTraceContext = null, runSource = null, onTraceRecord = null, onModelTextDelta = null, onModelThoughtDelta = null, onModelContextUsage = null, onSteeringReady = null, registerNestedAgentRun = null, cancellationGraceMs = null, onCancellationDeadline = null } = {}) {
+export async function runChatTurnFromBody({ contextBoundary = null, attachmentInput = null, body = {}, rootDir, dataRoot, agentDataRoot, agentRuntime = null, resolveAgentRuntime = null, stores = null, groupChannelContext = null, turnSource = null, recoveryPolicy = null, externalTurnMetadata = null, completionEvent = null, chatInput = null, latencyTiming = null, telemetry = null, parentTraceContext = null, runSource = null, onTraceRecord = null, onModelTextDelta = null, onModelThoughtDelta = null, onModelContextUsage = null, onSteeringReady = null, registerNestedAgentRun = null, cancellationGraceMs = null, onCancellationDeadline = null } = {}) {
   // Internal group producer supplies validated byte-bearing attachments, not client references.
   const input = chatTurnInputFromBody({ body: attachmentInput ? { ...body, attachments: attachmentInput } : body, rootDir, dataRoot, agentDataRoot, agentRuntime });
   if (attachmentInput) input.args.attachments = attachmentInput;
-  return runChatTurn({ ...input, contextBoundary, agentRuntime, resolveAgentRuntime, stores, groupChannelContext, turnSource, externalTurnMetadata, completionEvent, chatInput, latencyTiming, telemetry, parentTraceContext, runSource, onTraceRecord, onModelTextDelta, onModelThoughtDelta, onModelContextUsage, onSteeringReady, registerNestedAgentRun, cancellationGraceMs, onCancellationDeadline });
+  return runChatTurn({ ...input, contextBoundary, agentRuntime, resolveAgentRuntime, stores, groupChannelContext, turnSource, recoveryPolicy, externalTurnMetadata, completionEvent, chatInput, latencyTiming, telemetry, parentTraceContext, runSource, onTraceRecord, onModelTextDelta, onModelThoughtDelta, onModelContextUsage, onSteeringReady, registerNestedAgentRun, cancellationGraceMs, onCancellationDeadline });
 }
 
 
@@ -124,6 +125,7 @@ export function chatTurnInputFromWorkbenchContinuation({ item, body = {}, rootDi
       ...(body.noCallModel === true ? { no_call_model: true } : {}),
       ...(agentRuntime ? {} : (agentDataRoot ? { agent_data_root: agentDataRoot } : { data_root: dataRoot })),
       ...(body.target && typeof body.target === 'object' ? { target: body.target } : {}),
+      ...(body.thinkingMode !== undefined ? { model_thinking_mode: body.thinkingMode } : {}),
       ...(body.reasoningEffort ? { model_reasoning_effort: String(body.reasoningEffort) } : {}),
       ...(body.temperature !== undefined ? { model_temperature: body.temperature } : {}),
       ...(body.model ? { model: String(body.model) } : {}),

@@ -4,10 +4,12 @@ import { randomUUID } from 'node:crypto';
 import { closePostgresPool, withPostgresTransaction } from './postgres-foundation.mjs';
 import {
   assertConnection, canonicalizeOauthConnection, decrypt, encrypt, normalizeAuth, mergeOpenAiOAuthTokens,
-  publicConnection, secretPreview, normalizeModels, normalizeReasoningEffort, normalizeTemperature, assertIdentity,
+  publicConnection, secretPreview, normalizeModels, mergeModelMetadata, normalizeReasoningEffort, normalizeTemperature, assertIdentity,
   refreshAnthropicOauth, discoverModels, isProviderPool, assertProviderPoolMembers, providerPoolModels, modelSettingsFailureDiagnostic,
 } from './model-settings-store.mjs';
 import { refreshOpenAiOAuth } from './openai-oauth-login.mjs';
+import { operationalEvent } from './operational-log.mjs';
+import { isAnthropicMessagesConnection, normalizeAnthropicThinkingMode, validateAnthropicThinkingSelection } from './anthropic-model-capabilities.mjs';
 
 export const POSTGRES_MODEL_SETTINGS_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS chat_identities (
@@ -67,6 +69,20 @@ const API_KEY = 'apiKey';
 const CONNECTION_WRITE_LOCK = 'burrow-model-settings-connection-write';
 const IDENTITY_WRITE_LOCK = 'burrow-model-settings-identity-write';
 const OAUTH_REFRESH_LOCK = 'burrow-model-settings-oauth-refresh';
+const OAUTH_REFRESH_TIMEOUT_MS = 15_000;
+
+// Cancel the caller's wait, never a refresh which may already have consumed a
+// single-use token upstream. Both promise outcomes remain observed after abort.
+function waitForAuth(pending, signal) {
+  if (!signal) return pending;
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(signal.reason);
+    signal.addEventListener('abort', aborted, { once: true });
+    pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted));
+  });
+}
+
 const json = (value, fallback = {}) => { try { return JSON.parse(value); } catch { return fallback; } };
 
 export class PostgresModelSettingsStore {
@@ -75,10 +91,16 @@ export class PostgresModelSettingsStore {
     if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('settings_encryption_key_invalid');
     this.pool = normalizePostgresPool(pool); this.key = key; this.ownsPool = ownsPool; this.clock = clock;
     this.logger = logger;
+    this.oauthRefreshes = new Map();
     this.providerPoolMetrics = new PostgresProviderPoolMetrics(this.pool);
     this.bootstrapSampleIdentities = ["1", "true", "yes", "on"].includes(String(bootstrapSampleIdentities ?? "0").trim().toLowerCase());
   }
-  async close() { if (this.ownsPool) await closePostgresPool(this.pool); }
+  async close() {
+    // A canceled caller may have left a rotation queued for checkout or still
+    // committing. Keep the pool available until that owned work finishes.
+    while (this.oauthRefreshes.size) await Promise.allSettled([...this.oauthRefreshes.values()]);
+    if (this.ownsPool) await closePostgresPool(this.pool);
+  }
   defaultIdentityName(kind) { return this.bootstrapSampleIdentities ? (kind === 'operator' ? 'Rob' : 'Hatchet') : ''; }
   async identitySnapshot(client = this.pool) {
     const [agents, operator] = await Promise.all([
@@ -181,7 +203,14 @@ export class PostgresModelSettingsStore {
       const existingModels = normalizeModels(json(priorRow?.rows[0]?.models_json, []), { provider: connection.provider, apiType: connection.apiType });
       const submittedModels = normalizeModels(input.models, { provider: connection.provider, apiType: connection.apiType });
       const priorById = new Map(existingModels.map((model) => [model.id, model]));
-      let models = submittedModels.map((model) => { const prior = priorById.get(model.id); return (!prior || model.manual || prior.manual) ? model : normalizeModels([{ ...prior, ...model }], { provider: connection.provider, apiType: connection.apiType })[0]; });
+      const submittedById = new Map((Array.isArray(input.models) ? input.models : []).filter(model => model && typeof model === 'object').map(model => [String(model.id ?? '').trim(), model]));
+      let models = submittedModels.map(model => {
+        const prior = priorById.get(model.id);
+        if (!prior || ((model.manual || prior.manual) && connection.apiType !== 'anthropic-messages')) return model;
+        const patch = connection.apiType === 'anthropic-messages' && !Object.hasOwn(submittedById.get(model.id) || {}, 'manual')
+          ? { ...model, manual: prior.manual } : model;
+        return mergeModelMetadata(prior, patch, connection);
+      });
       // Saves patch catalog entries; omitted/empty lists never erase discovery or
       // models added by a concurrent refresh. Explicit selected:false disables.
       models.push(...existingModels.filter(model => !models.some(item => item.id === model.id)));
@@ -210,16 +239,16 @@ export class PostgresModelSettingsStore {
     const agent = String(agentId ?? '').trim();
     if (!agent) throw new Error('agent_id_invalid');
     const table = minion ? 'agent_minion_model_selections' : 'agent_model_selections';
-    const result = await this.pool.query(`SELECT agent_id,connection_id,model_id,reasoning_effort,temperature,updated_at FROM ${table} WHERE agent_id=$1`, [agent]);
+    const result = await this.pool.query(`SELECT agent_id,connection_id,model_id,reasoning_effort,thinking_mode,temperature,updated_at FROM ${table} WHERE agent_id=$1`, [agent]);
     const row = result.rows[0];
-    return row ? { agentId: row.agent_id, connectionId: row.connection_id, model: row.model_id, reasoningEffort: row.reasoning_effort, temperature: Number(row.temperature), updatedAt: row.updated_at } : null;
+    return row ? { agentId: row.agent_id, connectionId: row.connection_id, model: row.model_id, reasoningEffort: row.reasoning_effort, thinkingMode: row.thinking_mode, temperature: Number(row.temperature), updatedAt: row.updated_at } : null;
   }
   async clearModelSelection(agentId, { minion = false } = {}) {
     const agent = String(agentId ?? '').trim();
     if (!agent) throw new Error('agent_id_invalid');
     await this.pool.query(`DELETE FROM ${minion ? 'agent_minion_model_selections' : 'agent_model_selections'} WHERE agent_id=$1`, [agent]);
   }
-  async saveModelSelection({ agentId, connectionId, model, reasoningEffort = 'off', temperature = undefined, minion = false } = {}) {
+  async saveModelSelection({ agentId, connectionId, model, reasoningEffort = 'off', thinkingMode = undefined, temperature = undefined, minion = false } = {}) {
     const agent = String(agentId ?? '').trim();
     if (!agent) throw new Error('agent_id_invalid');
     const id = String(connectionId ?? '').trim();
@@ -240,27 +269,59 @@ export class PostgresModelSettingsStore {
         if (!connection.pool?.enabled) throw new Error('provider_pool_disabled');
       } else if (!await this.authWithClient(client, id, connection.provider)) throw new Error('model_connection_auth_required');
       const effort = normalizeReasoningEffort(reasoningEffort);
-      if (enabled.reasoningEfforts?.length && effort !== 'off' && !enabled.reasoningEfforts.includes(effort)) throw new Error('model_reasoning_effort_not_supported');
       const table = minion ? 'agent_minion_model_selections' : 'agent_model_selections';
-      let priorResult = await client.query(`SELECT agent_id,connection_id,model_id,reasoning_effort,temperature,updated_at FROM ${table} WHERE agent_id=$1 FOR UPDATE`, [agent]);
+      let priorResult = await client.query(`SELECT agent_id,connection_id,model_id,reasoning_effort,thinking_mode,temperature,updated_at FROM ${table} WHERE agent_id=$1 FOR UPDATE`, [agent]);
       let prior = priorResult.rows[0];
       if (!prior) {
         await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`agent-model-selection:${agent}`]);
-        priorResult = await client.query(`SELECT agent_id,connection_id,model_id,reasoning_effort,temperature,updated_at FROM ${table} WHERE agent_id=$1 FOR UPDATE`, [agent]);
+        priorResult = await client.query(`SELECT agent_id,connection_id,model_id,reasoning_effort,thinking_mode,temperature,updated_at FROM ${table} WHERE agent_id=$1 FOR UPDATE`, [agent]);
         prior = priorResult.rows[0];
+      }
+      // Omission is a patch only for the same connection/model; an explicit
+      // null intentionally restores legacy behavior, and 'default' is a real
+      // provider-default selection, not an alias for null.
+      const sameModel = prior?.connection_id === connection.id && prior?.model_id === modelId;
+      const selectedMode = normalizeAnthropicThinkingMode(thinkingMode === undefined
+        ? (sameModel ? prior.thinking_mode : null) : thinkingMode);
+      if (selectedMode !== null) {
+        if (!isAnthropicMessagesConnection(connection)) throw new Error('model_thinking_mode_not_supported');
+        validateAnthropicThinkingSelection({ model: modelId, anthropicMetadata: enabled.anthropicMetadata,
+          reasoningEfforts: enabled.reasoningEfforts, thinkingMode: selectedMode, reasoningEffort: effort });
+      } else if (enabled.reasoningEfforts?.length && effort !== 'off' && !enabled.reasoningEfforts.includes(effort)) {
+        // Preserve the pre-existing validation contract for migrated/null rows.
+        throw new Error('model_reasoning_effort_not_supported');
       }
       const selectedTemperature = normalizeTemperature(temperature, prior ? Number(prior.temperature) : 0.2);
       const stamp = this.clock();
-      const result = await client.query(`INSERT INTO ${table} (agent_id,connection_id,model_id,reasoning_effort,temperature,updated_at) VALUES ($1,$2,$3,$4,$5,$6)
-        ON CONFLICT(agent_id) DO UPDATE SET connection_id=EXCLUDED.connection_id,model_id=EXCLUDED.model_id,reasoning_effort=EXCLUDED.reasoning_effort,temperature=EXCLUDED.temperature,updated_at=EXCLUDED.updated_at
-        RETURNING agent_id,connection_id,model_id,reasoning_effort,temperature,updated_at`, [agent, connection.id, modelId, effort, selectedTemperature, stamp]);
+      const result = await client.query(`INSERT INTO ${table} (agent_id,connection_id,model_id,reasoning_effort,thinking_mode,temperature,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7)
+        ON CONFLICT(agent_id) DO UPDATE SET connection_id=EXCLUDED.connection_id,model_id=EXCLUDED.model_id,reasoning_effort=EXCLUDED.reasoning_effort,thinking_mode=EXCLUDED.thinking_mode,temperature=EXCLUDED.temperature,updated_at=EXCLUDED.updated_at
+        RETURNING agent_id,connection_id,model_id,reasoning_effort,thinking_mode,temperature,updated_at`, [agent, connection.id, modelId, effort, selectedMode, selectedTemperature, stamp]);
       const row = result.rows[0];
-      return { agentId: row.agent_id, connectionId: row.connection_id, model: row.model_id, reasoningEffort: row.reasoning_effort, temperature: Number(row.temperature), updatedAt: row.updated_at };
+      return { agentId: row.agent_id, connectionId: row.connection_id, model: row.model_id, reasoningEffort: row.reasoning_effort, thinkingMode: row.thinking_mode, temperature: Number(row.temperature), updatedAt: row.updated_at };
     });
   }
 
   async resolveAuth(id, { fetchImpl = fetch, nowMs = Date.now(), signal = null } = {}) {
     signal?.throwIfAborted();
+    let pending = this.oauthRefreshes.get(id);
+    if (!pending) {
+      // Register before the first lookup can yield. Concurrent calls share the
+      // entire lifecycle, including failure and work queued on a max=1 pool.
+      pending = this.resolveAuthUncancelled(id, { fetchImpl, nowMs });
+      this.oauthRefreshes.set(id, pending);
+      pending.then(() => this.oauthRefreshes.delete(id), error => {
+        this.oauthRefreshes.delete(id);
+        // The last caller may already have stopped. Retain a safe diagnostic,
+        // not an unhandled rejection or raw upstream response/credentials.
+        if (this.logger) operationalEvent(this.logger, 'model_auth_refresh_failed', {
+          connectionId: id, ...modelSettingsFailureDiagnostic(error),
+        }, { component: 'models' });
+      });
+    }
+    return waitForAuth(pending, signal);
+  }
+
+  async resolveAuthUncancelled(id, { fetchImpl, nowMs }) {
     const connection = await this.get(id);
     if (!connection) throw new Error('model_connection_not_found');
     let auth = await this.auth(id);
@@ -269,14 +330,11 @@ export class PostgresModelSettingsStore {
       // The lock is session-scoped and held on the same pinned client used for
       // the re-read/write. This avoids a max=1 pool deadlock and lets ordinary
       // operator writes proceed until the short persistence transaction.
-      signal?.throwIfAborted();
       const client = await this.pool.connect();
       let locked = false;
       try {
-        signal?.throwIfAborted();
         await client.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [`${OAUTH_REFRESH_LOCK}:${id}`]);
         locked = true;
-        signal?.throwIfAborted();
         const current = await client.query(`${this.selectSql('WHERE c.id=$1')}`, [id]);
         if (!current.rows[0]) throw new Error('model_connection_not_found');
         const currentConnection = publicConnection(current.rows[0]);
@@ -284,18 +342,35 @@ export class PostgresModelSettingsStore {
         if (!auth) throw new Error('model_connection_auth_required');
         if (auth.type === 'oauth' && Number(auth.expiresAt) <= nowMs + 60_000) {
           const provider = auth.provider || currentConnection.provider;
-          const refreshed = /openai/i.test(provider)
-            ? await refreshOpenAiOAuth(auth, { fetchImpl, nowMs, signal })
-            : /anthropic|claude/i.test(provider)
-              ? await refreshAnthropicOauth(auth, { fetchImpl, nowMs, signal })
-              : (() => { throw new Error('model_auth_refresh_provider_unsupported'); })();
-          await client.query('BEGIN');
+          let refreshed;
           try {
-            auth = await this.persistAuthOnClient(client, id, refreshed, this.clock(), auth.refreshToken || null, auth);
-            await client.query('COMMIT');
+            // Only this exchange owns the network deadline. Neither a stopped
+            // run nor background catalog deadline may cancel its token body.
+            const signal = AbortSignal.timeout(OAUTH_REFRESH_TIMEOUT_MS);
+            refreshed = /openai/i.test(provider)
+              ? await refreshOpenAiOAuth(auth, { fetchImpl, nowMs, signal })
+              : /anthropic|claude/i.test(provider)
+                ? await refreshAnthropicOauth(auth, { fetchImpl, nowMs, signal })
+                : (() => { throw new Error('model_auth_refresh_provider_unsupported'); })();
           } catch (error) {
-            await client.query('ROLLBACK').catch(() => {});
-            throw error;
+            // An operator may have reauthorized while the provider was failing.
+            // A stale failure must not conceal a genuinely newer usable login.
+            const saved = await this.authWithClient(client, id, currentConnection.provider);
+            const usable = saved?.type === 'oauth'
+              ? saved.accessToken && Number(saved.expiresAt) > nowMs + 60_000
+              : saved?.type === 'api_key' ? saved.apiKey : saved?.token;
+            if (!usable || JSON.stringify(saved) === JSON.stringify(auth)) throw error;
+            auth = saved;
+          }
+          if (refreshed) {
+            await client.query('BEGIN');
+            try {
+              auth = await this.persistAuthOnClient(client, id, refreshed, this.clock(), auth.refreshToken || null, auth);
+              await client.query('COMMIT');
+            } catch (error) {
+              await client.query('ROLLBACK').catch(() => {});
+              throw error;
+            }
           }
         }
       } finally {
@@ -336,7 +411,7 @@ export class PostgresModelSettingsStore {
       // Keep explicit choices even while an upstream ID is temporarily absent.
       const choices = { ...state.choices, ...Object.fromEntries(member.models.map(model => [model.id, model.selected])) };
       const prior = new Map(member.models.map(model => [model.id, model]));
-      const models = normalizeModels(discovered.map(model => ({ ...prior.get(model.id), ...model, ...(prior.get(model.id)?.manual ? { manual: true } : {}), selected: choices[model.id] ?? true })), { provider: member.provider, apiType: member.apiType });
+      const models = discovered.map(model => mergeModelMetadata(prior.get(model.id), { ...model, ...(prior.get(model.id)?.manual ? { manual: true } : {}), selected: choices[model.id] ?? true }, { ...member, refresh: true }));
       for (const model of member.models) if (model.manual && !models.some(item => item.id === model.id)) models.push(model);
       const stamp = this.clock();
       await client.query(`INSERT INTO model_settings_cache(cache_key,value_json,updated_at) VALUES($1,$2,$3)
@@ -407,7 +482,27 @@ export class PostgresModelSettingsStore {
     if (!current) throw new Error('model_connection_not_found');
     if (expectedRefreshToken !== undefined) {
       const stored = await this.authWithClient(client, id, current.provider);
-      if (stored?.refreshToken !== expectedRefreshToken || (expectedAuth && JSON.stringify(stored) !== JSON.stringify(expectedAuth))) return stored || auth;
+      if (stored?.refreshToken !== expectedRefreshToken) return stored || auth;
+      if (expectedAuth && JSON.stringify(stored) !== JSON.stringify(expectedAuth)) {
+        if (stored?.type !== 'oauth' || !/openai/i.test(stored.provider || '') || expectedAuth.type !== 'oauth') return stored || auth;
+        // A token-only edit can retain the very refresh token this exchange
+        // just consumed. Do not discard its replacement: preserve edited
+        // fields, but advance that same token lineage to the provider's rotation.
+        auth = { ...auth };
+        for (const key of new Set([...Object.keys(expectedAuth), ...Object.keys(stored)])) {
+          if (key === 'refreshToken' || JSON.stringify(stored[key]) === JSON.stringify(expectedAuth[key])) continue;
+          if (Object.hasOwn(stored, key)) auth[key] = stored[key];
+          else delete auth[key];
+        }
+        if (stored.accessToken !== expectedAuth.accessToken) {
+          // Identity belongs to the selected access token, including when only
+          // the in-flight provider reply introduced those claims.
+          for (const key of ['accountId', 'planType', 'email']) {
+            if (Object.hasOwn(stored, key)) auth[key] = stored[key];
+            else delete auth[key];
+          }
+        }
+      }
     }
     const canonical = canonicalizeOauthConnection({ provider: current.provider, apiType: current.api_type, baseUrl: current.base_url }, auth);
     if (canonical.apiType !== current.api_type) await client.query('UPDATE model_connections SET api_type=$1, updated_at=$2 WHERE id=$3', [canonical.apiType, timestamp, id]);

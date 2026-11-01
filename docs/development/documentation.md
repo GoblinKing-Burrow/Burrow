@@ -40,9 +40,9 @@ Edit the hand-written documentation in `docs/` and its build configuration in `m
 
 ## Publishing the documentation
 
-The canonical URL is `https://burrow-docs.blissful-psychosis.com/`, without a `/Burrow/` path. GitHub Pages owns the custom-domain binding; the DNS CNAME points `burrow-docs` to `GoblinKing-Burrow.github.io`. This source configuration does not itself change DNS or Pages settings. Build output is in `site/`.
+The consolidated documentation at `https://docs.goblin-kingdom.com/` is published from **GoblinKing-Burrow/Docs-Website**, not this repository. Its Docusaurus deployment owns the canonical root and component routes. This repository retains a separate MkDocs build with output in `site/`. Hosting, DNS and custom-domain settings are managed separately; changing a source URL does not change them.
 
-The Documentation workflow builds and checks the site. In **GoblinKing-Burrow/Burrow**, after successful checks on `main`, it uploads the static `site/` directory and deploys to that repository’s configured GitHub Pages site. Pull requests run checks only. This workflow does not build or publish Burrow application images.
+The retained Documentation workflow builds and checks this repository’s MkDocs site. In **GoblinKing-Burrow/Burrow**, after successful checks on `main`, it uploads the static `site/` directory and deploys to that repository’s configured GitHub Pages site. Pull requests run checks only. This workflow does not build or publish Burrow application images.
 
 The deploy job has narrowly scoped `pages: write` and `id-token: write` permissions and uses the `github-pages` environment. Hosting and custom-domain settings are managed separately. The workflow reads existing Pages settings with automatic enablement disabled; an unconfigured Pages site must be configured by its owner before deployment can succeed. Do not assume that a successful build or an uploaded artifact updates the website: verify the deployment job and live URL.
 
@@ -58,3 +58,9 @@ No credentials, real operator data, private transcripts, or secret-bearing scree
 ## Updating the guide
 
 Use concrete UI labels, small safe examples, and links to immutable public source. Distinguish installed, enabled, connected, accepted, running, and completed states. Record verification limits in [Source and coverage](../project/source-map.md). Retained historical pages must stay visibly marked until their claims have been checked against a new public baseline.
+
+## Validate upstream copies as well as this site
+
+When synchronizing a guide into an owning repository, copy or verify every referenced local image, download and linked page at that repository's final paths. A successful consolidated build does not prove the upstream documentation is self-contained. Compare asset hashes where the same illustration is shared, and preserve that repository's Markdown/admonition conventions instead of copying Docusaurus syntax into MkDocs.
+
+For Burrow's upstream MkDocs tree, run its documented docs-only dependency setup and `mkdocs build --strict` from the repository root. Also check rendered internal links/fragments and referenced assets. Do not run application/provider tests to validate documentation. Upstream `[skip ci]` avoids runtime/release workflows; it does not excuse skipping safe local documentation checks. Keep the upstream commit, asset check, build result, consolidated deployment and live-page verification in the maintenance receipt.

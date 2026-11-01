@@ -26,6 +26,7 @@ const runtimeAgents = [
 ] satisfies RuntimeAgent[];
 const descendants: Record<string, AgentStatus[]> = {
   hatchet: [
+    { sessionId: 'default-child', subagentId: 'default-worker', label: 'Default child', status: 'complete', depth: 1, parentSessionId: 'default', rootSessionId: 'default' },
     { sessionId: 'named-child', subagentId: 'worker', label: 'Named child', status: 'complete', depth: 1, parentSessionId: 'named-root', rootSessionId: 'named-root' },
     { sessionId: 'nested-child', subagentId: 'nested-worker', label: 'Nested child', status: 'complete', depth: 2, parentSessionId: 'named-child', rootSessionId: 'named-root' },
     { sessionId: 'shared-child', subagentId: 'hatchet-shared-worker', label: 'Hatchet shared child', status: 'complete', depth: 1, parentSessionId: 'named-root', rootSessionId: 'named-root' },
@@ -122,12 +123,18 @@ describe('App minion navigation integration', () => {
   ])('returns from %s to its named root via the parent row', async (name, childSessionId) => {
     await renderApp();
     await click('Expand Hatchet');
+    const minions = screen.getAllByRole('list', { name: 'Minions' });
+    expect(minions).toHaveLength(1);
+    expect(within(minions[0]).getByRole('button', { name: 'Select Default child' })).toBeTruthy();
+    expect(within(minions[0]).getByRole('button', { name: 'Select Named child' })).toBeTruthy();
+    expect(screen.queryByText(/^Session:/)).toBeNull();
     if (name === 'Nested child') {
       const parent = screen.getByRole('button', { name: 'Select Named child' }).closest('li')!;
       expect(within(parent).getByRole('button', { name: 'Select Nested child' })).toBeTruthy();
     }
     await click(`Select ${name}`);
     expectTranscript('hatchet', childSessionId);
+    expect(screen.getByText('Workspace remains attached to Hatchet · named-root')).toBeTruthy();
     expectSelected(name, true);
     expectSelected('Hatchet', false);
     expect(vi.mocked(api)).toHaveBeenCalledWith(`/api/sessions/${childSessionId}?agentId=hatchet`);
@@ -138,8 +145,18 @@ describe('App minion navigation integration', () => {
     await click('Select Hatchet');
     expectTranscript('hatchet', 'named-root');
     expectSelected('Hatchet', true);
+    expect(screen.queryByText(/Workspace remains attached to/)).toBeNull();
     expectSelected(name, false);
     expect(screen.queryByText(`hatchet/${childSessionId} transcript`)).toBeNull();
+  });
+
+  it('shows the default owning session at the end of its minion banner', async () => {
+    await renderApp();
+    await click('Expand Hatchet');
+    await click('Select Default child');
+    expectTranscript('hatchet', 'default-child');
+    expect(screen.getByText('Workspace remains attached to Hatchet · default')).toBeTruthy();
+    expect(screen.queryByText(/^Session:/)).toBeNull();
   });
 
   it('opens a child under another agent and returns to that agent’s root without inheriting the previous session', async () => {
@@ -147,6 +164,7 @@ describe('App minion navigation integration', () => {
     await click('Expand Other agent');
     await click('Select Other child');
     expectTranscript('other', 'other-child');
+    expect(screen.getByText('Workspace remains attached to Other agent · other-root')).toBeTruthy();
     expectSelected('Other child', true);
     expectSelected('Hatchet', false);
     expect(vi.mocked(api)).toHaveBeenCalledWith('/api/sessions/other-child?agentId=other');
