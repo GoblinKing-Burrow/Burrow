@@ -1,10 +1,12 @@
 # Interface guide
 
 
-!!! warning "Earlier technical reference"
-    This page is retained from earlier documentation and has not been fully revalidated for the public 2026.10.19 release. Its revision-specific links and examples may describe older or development behavior. Start with the [current operator guide](../guide/installation.md); do not use this page alone to select installation commands, image tags, or security settings.
+!!! note "Source review and historical material"
+    This technical reference was reconciled statically with current implementation on **1 November 2026**. Explicit historical examples, screenshots and pinned public links remain historical; they are not evidence of current runtime acceptance. Start with the [current operator guide](../guide/installation.md) for installation and check your installed build before using newer capabilities.
 
-The BURROW interface brings conversations, agent configuration, project tasks, retained evidence, and media generation into one operator console. This retained guide includes targeted source corrections against public **2026.10.19**; its older screenshots are not a complete inventory of current controls. Start by checking the agent and session: these determine which conversation and records you are viewing.
+For task-oriented instructions, start with [Everyday use](../guide/everyday-use.md). This page is the detailed screen, control, and browser-state reference.
+
+The BURROW interface brings conversations, agent configuration, project tasks, retained evidence, and media generation into one operator console. This guide was statically reconciled with current implementation on **1 November 2026**; its older screenshots are not a complete inventory of current controls. Start by checking the agent and session: these determine which conversation and records you are viewing.
 
 The runtime owns durable state. The browser presents API responses and live activity, and keeps some local preferences and conversation caches. A visible answer, an accepted job, and a verified result are different states; inspect the relevant run or evidence before treating work as complete.
 
@@ -29,15 +31,8 @@ Enabled mods can add control pages beside the built-in navigation, settings sect
 
 The interface discovers the authentication mode through `/api/auth/discovery` on startup and opens its sign-in form when Basic authentication is required. Basic credentials entered here are held in browser memory. See [Authentication](../security/authentication.md) for server modes, proxy requirements, and exposure precautions.
 
-A fresh or incomplete response from `GET /api/setup/status` opens **Settings → Agents** and the five-step setup wizard:
+A fresh or incomplete response from `GET /api/setup/status` opens **Settings → Agents** and the first-run wizard. Follow [Your first agent and model](../guide/first-agent.md) for the illustrated procedure, import precautions, completion rules, and recovery. An intentionally empty, already configured agent registry does not itself force the wizard.
 
-1. Import an existing export, or start fresh.
-2. Set the operator profile.
-3. Name the first agent and optionally choose an avatar.
-4. Write its initial `SOUL.md` personality.
-5. Choose a model connection, or finish and configure one later.
-
-Successful completion marks setup complete and returns to Chat. An intentionally empty, already configured agent registry does not itself force the wizard. Follow [Initial setup](../getting-started/initial-setup.md) for the full procedure and import precautions.
 ## Runtime and resource ownership
 
 The built-in console uses the local runtime serving the page. There is no built-in remote target selector. Node Goblin integrations, when installed, use explicit mod-owned APIs; a mod page is not a global runtime switch. Confirm any mod-specific destination before using its controls.
@@ -60,11 +55,11 @@ The registry distinguishes loading, empty, and unavailable states. A failed refr
 
 1. Select an agent in the **Agents** panel.
 2. Select a session, or choose **New session** and supply its name.
-3. Check **Provider**, **Model**, **Effort**, and **Temp**. Model controls are locked while the displayed run is active.
+3. Check **Provider**, **Model**, supported **Thinking** mode, **Effort**, and **Temp**. Model controls are locked while the displayed run is active.
 4. Enter a message. **Enter** sends; **Shift+Enter** inserts a line break.
 5. Follow the live activity, then read the persisted answer and any verification evidence.
 
-Model selection is saved through `PUT /api/agents/{agentId}/model-selection`. Available models and effort choices come from configured connections; `off` is also offered for effort. See [Models and providers](models.md) for connection setup and resolution behavior.
+Model selection is saved through `PUT /api/agents/{agentId}/model-selection`. Available models and compatible thinking/effort choices come from configured connections. Anthropic effort Default is distinct from Thinking Disabled; retained legacy Off selections can require an explicit supported mode. See [Models and providers](models.md) for connection setup and resolution behavior.
 <figure markdown="span">
 [![Chat with synthetic agent list, session and model controls, conversation, composer, and workspace rail.](../assets/screenshots/03-chat.webp){ loading=lazy }](../assets/screenshots/03-chat.webp)
 <figcaption>Chat: check the agent and session before sending. This conversation is synthetic fixture data.</figcaption>
@@ -105,7 +100,7 @@ On viewports at or below 600 pixels wide, controls reflow into a stacked layout,
 
 ## Settings map
 
-This settings map reflects the development UI reviewed **29 October 2026**, rather than the older screenshots below. Settings separates category navigation, subsection navigation, the main editor, and supporting inventory or details. The agent selected inside Settings can differ from the agent selected in Chat; check the agent selector before saving.
+This settings map reflects the development UI reviewed **1 November 2026**, rather than the older screenshots below. Settings separates category navigation, subsection navigation, the main editor, and supporting inventory or details. The agent selected inside Settings can differ from the agent selected in Chat; check the agent selector before saving.
 
 | Category | Built-in sections |
 | --- | --- |
@@ -119,7 +114,7 @@ This settings map reflects the development UI reviewed **29 October 2026**, rath
 - **Models:** configure connections, discover or enter models, and select the models exposed to agents. See [Models and providers](models.md).
 - **MCP servers and MCP tools:** configure a connection under Connections, then review the selected agent's grants under Agents. Mod-managed connections and mod-authorized tools have different editing rules. See [MCP](mcp.md).
 - **Profile documents:** edit `SOUL.md`, `RULES.md`, `ORIENTATION.md`, `PREFERENCES.md`, `TOOLS.md`, and `DreamMemory.md`. See [Agents and Minions](agents-minions.md).
-- **Cron jobs and Dreams:** manage their separate schedules and model selections. An accepted manual job trigger is not a completed run. See [Workers and tasks](workers-tasks.md) and [Dreams](dreams.md).
+- **Cron jobs and Dreams:** manage their separate schedules and model selections. Cron jobs can run a prompt or a saved board task, either Recurring or Once. An accepted manual job trigger is not a completed run. See [Workers and tasks](workers-tasks.md) and [Dreams](dreams.md).
 - **Continuity:** configure embeddings and global Dream promotion in the main column; configure Tiddle Signal curation in the additional-settings column, separately from task execution. See [Memory](memory.md).
 - **Authentication, API tokens, and Execution boundaries:** review the relevant [authentication](../security/authentication.md) and [trust-boundary](../security/trust-boundaries.md) guidance before changing access or execution policy.
 - **Export and Trace retention:** use [Backup and recovery](../operations/backup-recovery.md) and [Operator procedures](../operations/procedures.md). Trace retention uses **Apply policy**. Applying an enabled policy can start scheduled deletion without Preview or Run now. For a manual cleanup, apply the intended policy, inspect **Preview cleanup**, then choose **Run now** with unchanged inputs. Any policy edit requires applying and previewing again.
@@ -227,10 +222,10 @@ To run a task:
 
 1. Create or open a task, select its project and **Assignee**, then save it.
 2. Reopen its details if necessary and choose **Execute**. Unsaved changes must be saved first; unassigned, Done, and cancelled tasks cannot execute.
-3. Follow the dispatched run in the assigned agent's chat. The current board does not poll task execution continuously; reopen the task or use **Refresh history** to inspect newer persisted activity.
+3. Follow the dispatched run in the assigned agent's chat. The board refreshes tasks every 60 seconds; use **Refresh history** or reopen task details for newer persisted history.
 4. Inspect the assigned agent's **default** conversation and **Archive → Proof** for the final answer, blockers, and verification evidence.
 
-Dispatch awaits the stored task and project; the previous unawaited-lookup limitation no longer applies. A successful dispatch records a running execution with a run ID, then records its terminal result asynchronously. Execution receipt status is separate from the board column: dispatch and completion do not automatically move the card to In Progress or Done. Check the result and update task status deliberately. If progress remains visible after a connection failure, check the active run before clicking Execute again. Deleting a project also deletes its tasks. See [Workers and tasks](workers-tasks.md).
+Dispatch awaits the stored task and project; the previous unawaited-lookup limitation no longer applies. A successful dispatch records a running execution with a run ID, then records its terminal result asynchronously. Execution receipt status is separate from the board column: the executor instructs the agent to move the card to In Progress and then Review using task tools, rather than the dispatcher changing its status automatically. The operator owns the final move to Done. Check the actual result and card status. If progress remains visible after a connection failure, check the active run before clicking Execute again. Deleting a project also deletes its tasks. Saved To Do tasks can also be selected by scheduled jobs; one-time and cron task runs use the same executor and saved task contents. See [Workers and tasks](workers-tasks.md#scheduled-board-tasks-and-one-time-jobs).
 
 Current UI adds **Archive → Tasks** for Done tasks aged 48 hours, and **Archive → Forge** for retained creation evidence. See [tasks](../guide/tasks.md#completed-tasks-move-to-archive) and [Forge deletion](../guide/everyday-use.md#delete-a-forge-creation-retain-its-execution-record). The retired external Codex-LB rail/polling is removed; native OpenAI LB statistics live in the footer and account usage/reset controls live in **Accounts**.
 
@@ -327,7 +322,7 @@ For endpoint schemas and error behavior, use the [API reference](../reference/ap
 
 ## Targeted source review
 
-Corrections on this page were checked against public **2026.10.19**; any newer development behavior is labeled separately. This was static source inspection, not a live deployment test. Other retained details remain subject to the earlier-reference warning.
+The immutable links below record earlier public evidence. Current contracts were reconciled against the [1 November implementation baseline](../project/source-map.md); static inspection is not a live deployment test.
 
 - [ui/src/features/settings/OpenTelemetrySettings.tsx](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/ui/src/features/settings/OpenTelemetrySettings.tsx)
 - [ui/src/features/settings/SkillSourceSettings.tsx](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/ui/src/features/settings/SkillSourceSettings.tsx)

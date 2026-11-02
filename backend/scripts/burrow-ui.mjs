@@ -1,5 +1,8 @@
 #!/usr/bin/env node
+import { createAgentReferenceImageRoutes, createModReferenceImageContentRoute } from './ui/agent-reference-image-routes.mjs';
 import { createBoardTaskExecutor } from '../src/task-execution.mjs';
+import { isDisplayChatMessage } from '../src/session-entry.mjs';
+import { chatResultMetadata } from '../src/chat-result-metadata.mjs';
 import { compactChatTurn } from '../src/compact-chat-turn.mjs';
 import { createArchiveReadProcess } from './ui/archive-read-process.mjs';
 import { createArchiveAgentContext } from './ui/archive-agent-context.mjs';
@@ -31,7 +34,7 @@ import { createGroupChannelMessageStarter } from '../src/group-channel-message.m
 import { buildIdentity } from './build-identity.mjs';
 import { releaseProvenance } from './release-provenance.mjs';
 import { httpAuthorityConfig, hostAuthorityPolicy } from '../src/http-authority.mjs';
-import { browserOriginConfig, browserOriginSettings, saveBrowserOriginSettings, browserRequestPolicy } from '../src/browser-origin-policy.mjs';
+import { browserOriginConfig, browserRequestPolicy } from '../src/browser-origin-policy.mjs';
 import { browserTabSettings, saveBrowserTabSettings } from '../src/browser-tab-settings.mjs';
 import { otelSettings, readOtelRuntimeConfig, saveOtelSettings } from '../src/otel-settings.mjs';
 import { createReconfigurableOtelRuntime } from '../src/otel-runtime.mjs';
@@ -77,7 +80,7 @@ import { loadWorkingContinuityAsync, normalizeContinuityScope, projectHandoffsIn
 import { workingContextFromSession } from '../src/working-context.mjs';
 import { appendGroupChannelTurn, createGroupChannel, listGroupChannels, readGroupChannel, readGroupChannelTurns } from '../src/group-channel-store.mjs';
 import { resolveGroupMentionTargets } from '../src/group-channel-routing.mjs';
-import { planRetentionCleanup, runRetentionCleanup } from '../src/retention.mjs';
+import { runRetentionCleanup } from '../src/retention.mjs';
 import { normalizeRetentionPolicy, readRetentionPolicy, readRetentionPolicyState, retentionPolicyFailureState, retentionPolicySuccessState, saveRetentionPolicy, writeRetentionPolicyState } from '../src/retention-settings.mjs';
 import { createRetentionScheduler } from '../src/retention-scheduler.mjs';
 import { createInstallStagingCleanupScheduler } from '../src/install-staging-cleanup.mjs';
@@ -1105,10 +1108,7 @@ async function createAgent(body = {}) {
 async function updateAgent(id, body = {}) {
   try {
     const agent = await agentsStore().update(id, body);
-    // Materialize the visible inbox before acknowledging Off, even when empty.
-    if (agent.contextConfig?.a2aInDefault === false) {
-      await postgresApplication.stores.conversations.updateMetadata({ agentId: agent.id, sessionId: 'a2a', update: (metadata) => metadata });
-    }
+    // Dedicated peer inboxes are created by actual A2A ingress, not the toggle.
     return { ok: true, agent };
   }
   catch (error) { return { ok: false, status: String(error?.message || error) === 'agent_not_found' ? 404 : 400, error: String(error?.message || error) }; }
@@ -1444,8 +1444,7 @@ function sendJson(res, status, body) {
 
 async function applyApiCors(req, res, url) {
   if (!url.pathname.startsWith('/api/') && !url.pathname.startsWith('/auth/')) return false;
-  const { effective } = await browserOriginSettings({ metadata: metadataStore() });
-  const policy = browserRequestPolicy(req, url, effective);
+  const policy = browserRequestPolicy(req, url, browserOriginConfig());
   if (policy.error) { sendJson(res, policy.status, { ok: false, error: policy.error }); return true; }
   if (policy.origin) {
     res.setHeader('access-control-allow-origin', policy.origin);
@@ -1573,11 +1572,7 @@ async function applyImport(decoded, { conflictPolicy = 'error' } = {}) {
       await write('settings:working-memory-retention', () => postgresApplication.stores.workingMemoryRetention.save(categories.settings.workingMemoryRetention));
       imported.push('settings:working-memory-retention');
     }
-    if (categories.settings.browserOrigin !== undefined) {
-      const result = await write('settings:browser-origin', () => saveBrowserOriginSettings(categories.settings.browserOrigin, { metadata: metadataStore() }));
-      if (!result.ok) return failure(result);
-      imported.push('settings:browser-origin');
-    }
+    // Legacy browserOrigin exports are ignored; only deployment environment controls it.
     if (categories.settings.executionBoundaries) {
       const result = await write('settings:execution-boundaries', () => saveExecutionBoundaries(categories.settings.executionBoundaries, { metadataStore: postgresApplication.stores.metadata, }));
       if (!result.ok) return failure(result);
@@ -1742,7 +1737,6 @@ async function exportSnapshot(categories = []) {
       workingMemoryRetention: await postgresApplication.stores.workingMemoryRetention.read(),
       brainMemory: await readDreamPromotion(metadataStore()),
       brainEmbeddings: await postgresApplication.stores.brainEmbeddings.settings().then(s => ({ enabled: s.enabled, connectionId: s.connection_id, model: s.model })),
-      browserOrigin: (await browserOriginSettings({ metadata: metadataStore() })).settings,
       executionBoundaries: await readExecutionBoundaries({ metadataStore: postgresApplication.stores.metadata, }),
       curatorSelection: await readCuratorSelection({ stores: postgresApplication.stores, root: curatorRoot() }),
       ownership: [{ id: 'core-persistence', authority: 'postgres', storage: 'PostgreSQL' }],
@@ -2013,7 +2007,7 @@ async function sessionDetail(id, { rootDir, agentId = null } = {}) {
     postgresApplication.stores.conversations.projection({ agentId, sessionId: id, visibility: 'activity', limit: 20 }),
   ]);
   const chatTurns = chatEntries.filter(isChatMessage);
-  const visibleTurns = chatEntries.filter(entry => isChatMessage(entry) || Boolean(entry.metadata?.chatInput && entry.role));
+  const visibleTurns = chatEntries.filter(entry => isDisplayChatMessage(entry) || Boolean(entry.metadata?.chatInput && entry.role));
   const turns = [...visibleTurns, ...activityTurns].sort((a,b) => String(a.ts || '').localeCompare(String(b.ts || ''))).map(compactChatTurn);
   return { id, turnCount: metadata.turnCount ?? turns.length, metadata, summary: metadata.summary || summarizeSessionTurns(chatTurns, { maxChars: 2000 }), turns, activities: activityTurns.filter((turn) => turn.metadata?.toolActivity).map((turn) => ({ ...turn.metadata.toolActivity, runId: turn.runId || null })) };
 }
@@ -2274,16 +2268,16 @@ async function updateBrainPromotionCandidate(body = {}) {
 }
 
 async function retentionPolicySettings() {
-  const runtime = await runtimeConfig();
-  const policy = await readRetentionPolicy({ store: postgresApplication.stores.retentionSettings });
-  const state = await readRetentionPolicyState({ store: postgresApplication.stores.retentionSettings });
-  const plan = await planRetentionCleanup({ taskStore: postgresApplication.stores.tasks, conversationStore: postgresApplication.stores.conversations, agentId: runtime.runtimeState.agentId, dataRoot: runtime.runtimeState.agentDataRoot, traceRoot: path.join(runtime.runtimeState.cacheRoot, 'traces'), retention: policy });
-  return { ok: true, policy, state, plan };
+  // Loading a form must not resolve execution context or scan trace storage.
+  const store = postgresApplication.stores.retentionSettings;
+  const [policy, state] = await Promise.all([
+    readRetentionPolicy({ store }), readRetentionPolicyState({ store }),
+  ]);
+  return { ok: true, policy, state };
 }
 
 async function saveRetentionPolicySettings(body = {}) {
   try {
-    const runtime = await runtimeConfig();
     const policy = await saveRetentionPolicy(body.policy || body, { store: postgresApplication.stores.retentionSettings });
     const state = await readRetentionPolicyState({ store: postgresApplication.stores.retentionSettings });
     return { ok: true, policy, state };
@@ -2840,7 +2834,7 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
       return sendJson(res, result.status, result.response);
     } catch (error) {
       if (owner?.signal.aborted) {
-        const response = { ok: false, error: String(owner.record.reason || error?.message || 'agent_stopped'), runId };
+        const response = { ...chatResultMetadata({ ok: false, decision: 'cancelled' }), ok: false, error: String(owner.record.reason || error?.message || 'agent_stopped'), runId };
         if (streaming) { writeNdjson(res, { type: 'run.cancelled', runId, sessionId, ts: new Date().toISOString(), data: { response } }); return res.end(); }
         return sendJson(res, 499, response);
       }
@@ -2929,7 +2923,7 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
       },
     });
     if (sessionContinuityHeads.get(headKey) !== record) {
-      const response = { ok: false, decision: 'superseded', runId, sessionId, blockers: ['superseded_by_newer_session_run'] };
+      const response = { ...chatResultMetadata({ ok: false, decision: 'superseded' }), ok: false, decision: 'superseded', runId, sessionId, blockers: ['superseded_by_newer_session_run'] };
       if (streaming) { writeNdjson(res, { type: 'run.superseded', runId, sessionId, ts: new Date().toISOString(), data: { response } }); return res.end(); }
       return sendJson(res, 409, response);
     }
@@ -2946,21 +2940,21 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
     observeHttpResult(res, 200, { ok: result.ok, result }, { event: 'run_failed' });
     const response = chatTurnResponse(result, { ok: result.ok });
     const streamResponse = chatTurnProgressResponse(result, { ok: result.ok });
-    if (streaming) { writeNdjson(res, { type: 'run.completed', runId, sessionId, ts: new Date().toISOString(), data: { response: streamResponse } }); return res.end(); }
+    if (streaming) { writeNdjson(res, { type: `run.${streamResponse.result.terminalStatus}`, runId, sessionId, ts: new Date().toISOString(), data: { response: streamResponse } }); return res.end(); }
     return sendJson(res, 200, response);
   } catch (error) {
     if (controller.signal.aborted) {
-      const response = { ok: false, error: String(record.reason || error?.message || 'agent_stopped'), runId };
+      const response = { ...chatResultMetadata({ ok: false, decision: 'cancelled' }), ok: false, error: String(record.reason || error?.message || 'agent_stopped'), runId };
       if (streaming) { writeNdjson(res, { type: 'run.cancelled', runId, sessionId, ts: new Date().toISOString(), data: { response } }); return res.end(); }
       return sendJson(res, 499, response);
     }
     const errorResponse = chatTurnErrorResponse(error);
     if (errorResponse) {
-      if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: errorResponse.body } }, { status: errorResponse.status }); return res.end(); }
-      return sendJson(res, errorResponse.status, errorResponse.body);
+      if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: { ...errorResponse.body, ...chatResultMetadata({ ok: false, decision: 'failed' }) } } }, { status: errorResponse.status }); return res.end(); }
+      return sendJson(res, errorResponse.status, { ...errorResponse.body, ...chatResultMetadata({ ok: false, decision: 'failed' }) });
     }
     recordHttpFailure(res, { error, status: 500, event: 'run_failed', errorCode: 'chat_run_failed' });
-    if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: { ok: false, error: String(error?.message || error), runId } } }); return res.end(); }
+    if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: { ...chatResultMetadata({ ok: false, decision: 'failed' }), ok: false, error: String(error?.message || error), runId } } }); return res.end(); }
     throw error;
   } finally {
     if (activeChatRuns.get(activeChatRunKey(agentRuntime.agentId, runId)) === record) activeChatRuns.delete(activeChatRunKey(agentRuntime.agentId, runId));
@@ -3125,6 +3119,8 @@ const skillApi = {
   saveAgentSkills: async (id, body) => { const runtime = await resolveAgentContext(id); await skillStoreCall(store => store.replaceAssignments(runtime.agentId, body.skillIds)); return skillApi.agentSkills(runtime.agentId); },
 };
 const settingsRoute = createSettingsRoutes({ globalProfileDocuments, timezoneSettings: async () => ({ ok: true, timezone: await operatorTimezone(postgresApplication.stores.metadata) }), saveTimezoneSettings: (body) => saveOperatorTimezone(postgresApplication.stores.metadata, body), ...skillApi, readJsonBody, sendJson, modelConnections, claudeCliCredentialStatus, importClaudeCliCredential, startOpenAiOAuthLoginApi, openAiOAuthLoginStatus, submitOpenAiOAuthLoginApi, cancelOpenAiOAuthLoginApi, startClaudeCodeLoginApi, claudeCodeLoginStatus, submitClaudeCodeLoginApi, cancelClaudeCodeLoginApi, importClaudeCodeLoginApi, mcpConnections, discoverMcpConnection, diagnoseMcpConnection, saveMcpConnection, removeMcpConnection, agentMcpTools, saveAgentMcpTools, agentModelSelection, saveAgentModelSelection, agentMinionModelSelection, saveAgentMinionModelSelection, agentMinionSettings, saveAgentMinionSettings, archiveSummaryModelSelection: async (agentId) => ({ ok: true, selection: await archiveSummarySelection((await resolveAgentRuntime(agentId)).agentId) }), saveArchiveSummaryModelSelection, discoverModelConnection, saveModelConnection, removeModelConnection: async (id) => await modelsStore().remove(id), completeSetupOperation: async body => { try { return await completeSetupOperation({ pool: postgresApplication.pool, encryptionKey: modelsStore().key, body }); } catch (error) { return { ok: false, status: error.message === 'setup_operation_conflict' || error.message === 'agent_id_exists' ? 409 : 400, error: error.message }; } }, setupStatus: async () => postgresApplication.stores.setupState.readStatus(), completeSetup: async () => postgresApplication.stores.setupState.completeSetup() });
+const modReferenceImageRoute = createModReferenceImageContentRoute({ store: () => postgresApplication.stores.referenceImages, sendJson });
+const agentReferenceImageRoute = createAgentReferenceImageRoutes({ store: () => postgresApplication.stores.referenceImages, readJsonBody, sendJson });
 const agentRoute = createAgentRoutes({ readJsonBody, sendJson, validateBoundaryBody, agentsStore, createAgent, updateAgent, deleteAgent, agentProfileDocuments, selectedAgentRuntime, agentStatusForSession, agentOverview });
 const archiveAgentContext = createArchiveAgentContext({ agentsStore, rootDir: projectRoot });
 const { archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveDreamGroups, archiveDreamGroupDetail, archiveWorkflowEvents, archiveContinuityCards, archiveContinuityCardDetail } = createArchiveService({
@@ -3139,7 +3135,7 @@ const archiveReadProcess = createArchiveReadProcess({ poolConfig: runtimePostgre
 });
 const sessionRoute = createSessionRoutes({ resolveArchiveAgentRuntime: archiveAgentContext.resolveAgentRuntime, rootDir: projectRoot, readJsonBody, sendJson, resolveAgentRuntime, runtimeAgentWorkspaceRoot, runtimeDataRoot, runtimeSessionRoot, runtimeConfig, activeConversationLimits, inspectSessionContext, inspectSessionContextStatus, activeChatRuns, searchSessionEvidence, searchBurrowSessionEvidence, agentsStore, agentRuntimeContext, archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveDreamGroups, archiveDreamGroupDetail, archiveWorkflowEvents, archiveContinuityCards, archiveContinuityCardDetail, listSessions, sessionDetail, sessionWriteHandoff, sessionContinuityScope, setSessionContinuityScope, clearSessionContinuityScope, sessionReadHandoff, sessionWriteHandoffCandidate, archiveSummaryForReset, archiveSummaryForSession, supersedeSessionRuns, beginSessionAdmissionsReset, finishSessionAdmissionsReset, latestAuthorityExplanationForSession, listAuthorityExplanationsForSession, conversationStore: postgresApplication.stores.conversations });
 const brainRoute = createBrainRoutes({ store: postgresApplication.stores.brains, metadata: metadataStore(), embeddings: postgresApplication.stores.brainEmbeddings, readJsonBody, sendJson });
-const generalSettingsRoute = createGeneralSettingsRoutes({ readJsonBody, sendJson, chatIdentities, saveChatIdentity, curatorSettings, saveCuratorSettings, tiddleSettings: async (agentId) => tiddleStatus({ agentId, stores: postgresApplication.stores, }), tiddleCards: async (query) => listTiddleCards({ ...query, stores: postgresApplication.stores, }), tiddleHistory: async (query) => tiddleHistory({ ...query, stores: postgresApplication.stores, }), uiAuthSettings, saveUiAuthSettings, browserOriginSettings: () => browserOriginSettings({ metadata: metadataStore() }), saveBrowserOriginSettings: body => saveBrowserOriginSettings(body, { metadata: metadataStore() }), browserTabSettings: () => browserTabSettings({ metadata: metadataStore() }), saveBrowserTabSettings: body => saveBrowserTabSettings(body, { metadata: metadataStore() }), otelSettings: () => otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }), saveOtelSettings: async body => { let result = await saveOtelSettings(body, { store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); if (result.ok) { try { await otelRuntime.apply(await readOtelRuntimeConfig({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore() })); await applyOtelConfigurationToNodeGoblins(); } catch (error) { serverLogger.event('otel_configuration_apply_failed', { error }); return { ok: false, status: 500, error: 'opentelemetry_configuration_apply_failed' }; } result = await otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); } return result; }, executionBoundarySettings, saveExecutionBoundarySettings, retentionPolicySettings, saveRetentionPolicySettings, retentionCleanup });
+const generalSettingsRoute = createGeneralSettingsRoutes({ readJsonBody, sendJson, chatIdentities, saveChatIdentity, curatorSettings, saveCuratorSettings, tiddleSettings: async (agentId) => tiddleStatus({ agentId, stores: postgresApplication.stores, }), tiddleCards: async (query) => listTiddleCards({ ...query, stores: postgresApplication.stores, }), tiddleHistory: async (query) => tiddleHistory({ ...query, stores: postgresApplication.stores, }), uiAuthSettings, saveUiAuthSettings, browserTabSettings: () => browserTabSettings({ metadata: metadataStore() }), saveBrowserTabSettings: body => saveBrowserTabSettings(body, { metadata: metadataStore() }), otelSettings: () => otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }), saveOtelSettings: async body => { let result = await saveOtelSettings(body, { store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); if (result.ok) { try { await otelRuntime.apply(await readOtelRuntimeConfig({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore() })); await applyOtelConfigurationToNodeGoblins(); } catch (error) { serverLogger.event('otel_configuration_apply_failed', { error }); return { ok: false, status: 500, error: 'opentelemetry_configuration_apply_failed' }; } result = await otelSettings({ store: postgresApplication.stores.opentelemetry, metadata: metadataStore(), runtimeStatus: otelRuntime.status }); } return result; }, executionBoundarySettings, saveExecutionBoundarySettings, retentionPolicySettings, saveRetentionPolicySettings, retentionCleanup });
 const observabilityRoute = createObservabilityRoutes({ providerPoolMetrics: () => postgresApplication.stores.models.providerPoolMetrics.summary(), readJsonBody, sendJson, validateBoundaryBody, runtimeStatus, runtimeMetrics, anthropicOauthUsage, openaiOauthUsage, openaiResetCredits, consumeOpenaiResetCredit, currentActiveChatRunSummaries, selectedAgentRuntime, resolveAgentRuntime, listWorkspaceFiles, readWorkspaceFile, writeWorkspaceFile, listTraces, runtimeConfig, traceRootForRun, conversationStore: postgresApplication.stores.conversations, summarizeTrace, authorityExplanationFromTraceSummary, projectRoot });
 const scheduledChannelRoute = createScheduledChannelRoutes({ readJsonBody, sendJson, validateBoundaryBody, withScheduledJobs, scheduler, listGroupChannels, createGroupChannel, readGroupChannelTurns, groupChannelRuns, startGroupChannelMessage, cancelGroupChannelRun, runtimeDataRoot, conversationStore: postgresApplication.stores.conversations });
 const authRoute = createAuthRoutes({ serverLogger, runtimeConfig, oidcLoginUrl, setOidcStateCookie, completeOidcCallback, sendOidcSessionCookie, clearOidcCookies, oidcCookieClearHeader, oidcSessionFromRequest, sendJson });
@@ -3502,6 +3498,8 @@ async function handleRequest(req, res) {
       if (req.method === 'DELETE') return sendJson(res, 200, await deleteAttachmentArtifact({ agentWorkspaceRoot: agentRuntime.agentWorkspaceRoot, artifactPath }));
     }
     if (await observabilityRoute({ req, res, url })) return;
+    if (await modReferenceImageRoute({ req, res, url })) return;
+    if (await agentReferenceImageRoute({ req, res, url })) return;
     if (await agentRoute({ req, res, url })) return;
     if (await archiveReadProcess.route({ req, res, url })) return;
     if (await sessionRoute({ req, res, url })) return;

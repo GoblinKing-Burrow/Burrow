@@ -1243,10 +1243,10 @@
           "200": {
             "$ref": "#/components/responses/ScheduledJobResponse"
           },
-          "404": {
+          "400": {
             "$ref": "#/components/responses/ErrorResponse"
           },
-          "400": {
+          "404": {
             "$ref": "#/components/responses/ErrorResponse"
           }
         },
@@ -3968,7 +3968,7 @@
         "tags": [
           "Settings"
         ],
-        "summary": "Read operator-managed retention policy and cleanup preview",
+        "summary": "Read retention policy and scheduler state without scanning trace storage",
         "operationId": "getRetentionPolicy",
         "responses": {
           "200": {
@@ -7195,65 +7195,6 @@
         }
       }
     },
-    "/api/settings/browser-origin": {
-      "get": {
-        "tags": [
-          "Settings"
-        ],
-        "summary": "Read saved and effective browser Origin checking",
-        "operationId": "getBrowserOriginSettings",
-        "parameters": [],
-        "responses": {
-          "200": {
-            "$ref": "#/components/responses/SettingsResponse"
-          },
-          "400": {
-            "$ref": "#/components/responses/ErrorResponse"
-          },
-          "404": {
-            "$ref": "#/components/responses/ErrorResponse"
-          }
-        }
-      },
-      "put": {
-        "tags": [
-          "Settings"
-        ],
-        "summary": "Save browser Origin checking and apply immediately",
-        "operationId": "updateBrowserOriginSettings",
-        "parameters": [],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                  "checkOrigin"
-                ],
-                "properties": {
-                  "checkOrigin": {
-                    "type": "boolean"
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "$ref": "#/components/responses/SettingsResponse"
-          },
-          "400": {
-            "$ref": "#/components/responses/ErrorResponse"
-          },
-          "404": {
-            "$ref": "#/components/responses/ErrorResponse"
-          }
-        }
-      }
-    },
     "/api/settings/skills/{id}/source": {
       "get": {
         "tags": [
@@ -8590,6 +8531,231 @@
           }
         }
       }
+    },
+    "/api/agents/{agentId}/reference-image": {
+      "get": {
+        "operationId": "getAgentReferenceImage",
+        "summary": "Read the selected agent canonical reference photo metadata",
+        "tags": [
+          "Settings"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PathAgentId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current reference photo metadata, or null when absent. Actions autosave independently of the agent name/avatar.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentReferenceImageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "413": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      },
+      "put": {
+        "operationId": "putAgentReferenceImage",
+        "summary": "Upload or replace the selected agent canonical reference photo",
+        "tags": [
+          "Settings"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PathAgentId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current reference photo metadata, or null when absent. Actions autosave independently of the agent name/avatar.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentReferenceImageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "413": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentReferenceImageUpload"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteAgentReferenceImage",
+        "summary": "Remove the selected agent canonical reference photo",
+        "tags": [
+          "Settings"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PathAgentId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current reference photo metadata, or null when absent. Actions autosave independently of the agent name/avatar.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentReferenceImageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "413": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/agents/{agentId}/reference-image/content": {
+      "get": {
+        "operationId": "getAgentReferenceImageContent",
+        "summary": "Read the original current canonical photo bytes",
+        "description": "Private no-store inline image response. Optional id pins the current revision; stale/other-agent IDs return 404.",
+        "tags": [
+          "Settings"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PathAgentId"
+          },
+          {
+            "in": "query",
+            "name": "id",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Original image bytes",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/webp": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/mod-reference-images/{modId}/{key}/content": {
+      "get": {
+        "operationId": "getModReferenceImageContent",
+        "summary": "Read original canonical character photo bytes",
+        "description": "Ordinary operator-authenticated, private no-store image response. Optional id pins the current revision. Missing or stale keys return 404.",
+        "tags": [
+          "Attachments"
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "modId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "id",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Original PNG/JPEG/WebP bytes",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/webp": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -9678,7 +9844,7 @@
         }
       },
       "RetentionPolicyResponse": {
-        "description": "Persisted retention policy, scheduler state, and dry-run cleanup plan.",
+        "description": "Persisted retention policy and scheduler state; no filesystem scan. Request cleanup plans explicitly through POST /api/settings/retention/preview.",
         "content": {
           "application/json": {
             "schema": {
@@ -10347,6 +10513,21 @@
           },
           "modelRecovery": {
             "$ref": "#/components/schemas/ModelRecovery"
+          },
+          "chatResultVersion": {
+            "type": "integer",
+            "const": 2,
+            "description": "Structured chat result contract. Assistant content is real output, never an encoded model-error marker."
+          },
+          "terminalStatus": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "failed",
+              "cancelled",
+              "superseded"
+            ],
+            "description": "Runtime-owned terminal state; independent of HTTP success and answer spelling."
           }
         },
         "additionalProperties": true
@@ -10419,6 +10600,21 @@
           },
           "modelRecovery": {
             "$ref": "#/components/schemas/ModelRecovery"
+          },
+          "chatResultVersion": {
+            "type": "integer",
+            "const": 2,
+            "description": "Structured chat result contract. Assistant content is real output, never an encoded model-error marker."
+          },
+          "terminalStatus": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "failed",
+              "cancelled",
+              "superseded"
+            ],
+            "description": "Runtime-owned terminal state; independent of HTTP success and answer spelling."
           }
         },
         "additionalProperties": true
@@ -13129,8 +13325,7 @@
         "required": [
           "ok",
           "policy",
-          "state",
-          "plan"
+          "state"
         ],
         "properties": {
           "ok": {
@@ -13141,9 +13336,6 @@
           },
           "state": {
             "$ref": "#/components/schemas/RetentionPolicyState"
-          },
-          "plan": {
-            "$ref": "#/components/schemas/RetentionPlan"
           }
         },
         "additionalProperties": false
@@ -13251,7 +13443,8 @@
           },
           "metadata": {
             "type": "object",
-            "additionalProperties": true
+            "additionalProperties": true,
+            "description": "Extensible transcript metadata. Version-2 assistant results include chatResultVersion, terminalStatus, and optional modelFailure/modelRecovery as defined by ChatSummary; other existing metadata fields remain supported."
           }
         },
         "additionalProperties": false
@@ -14063,6 +14256,14 @@
             "type": "object",
             "additionalProperties": true
           },
+          "label": {
+            "type": "string",
+            "description": "Optional stored display label, e.g. A2A - Cipher. Routing always uses sessionId."
+          },
+          "a2aPeerAgentId": {
+            "type": "string",
+            "description": "Canonical sending peer ID for an automatically created dedicated A2A inbox."
+          },
           "summary": {
             "type": "string"
           }
@@ -14479,6 +14680,9 @@
             "items": {
               "$ref": "#/components/schemas/ForgeArtifact"
             }
+          },
+          "useAgentReferenceImage": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -14514,15 +14718,50 @@
           "idempotencyKey": {
             "type": "string",
             "minLength": 1
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "image",
+              "music",
+              "speech",
+              "video",
+              null
+            ],
+            "description": "Required when using the saved mode selection; explicit IDs may omit mode."
+          },
+          "useAgentReferenceImage": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "True includes the current agent canonical portrait (trusted native agent context only). False/null/omission does not select self unless explicitly listed in referenceAgentIds."
+          },
+          "referenceAgentIds": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Ordered IDs of registered agents with saved portraits; duplicates (including self) are ignored. Native and operator API can explicitly select IDs; no image bytes or paths are accepted. Null/empty array selects no additional references. Supported image models only."
           }
         },
         "required": [
-          "connectionId",
-          "modelId",
           "prompt",
           "idempotencyKey"
         ],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "description": "Supply both connectionId and modelId for explicit selection, or mode for a saved default. No automatic fallback."
       },
       "ForgeAttach": {
         "type": "object",
@@ -14579,6 +14818,9 @@
             "items": {
               "type": "object"
             }
+          },
+          "agentReferenceImage": {
+            "$ref": "#/components/schemas/AgentReferenceImageCapability"
           }
         },
         "required": [
@@ -14654,6 +14896,43 @@
                 "type": "string",
                 "const": "music_model_not_configured"
               }
+            }
+          },
+          "agentReferenceImage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentReferenceImage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only present for trusted native agent context; never an arbitrary agent selected in model arguments."
+          },
+          "agentReferenceImages": {
+            "type": "array",
+            "description": "All registered agents with saved portraits, with agent name and portrait metadata only; attachmentId may be reopened with attachment_view.",
+            "items": {
+              "$ref": "#/components/schemas/ForgeAgentReferenceImage"
+            }
+          },
+          "defaults": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "connectionId": {
+                  "type": "string"
+                },
+                "modelId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "connectionId",
+                "modelId"
+              ],
+              "additionalProperties": false
             }
           }
         },
@@ -18549,6 +18828,169 @@
           }
         },
         "additionalProperties": true
+      },
+      "AgentReferenceImage": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "attachmentId": {
+            "type": "string",
+            "description": "Own-agent attachment_view identifier; not a host filesystem path."
+          },
+          "contentUrl": {
+            "type": "string"
+          },
+          "mimeType": {
+            "type": "string",
+            "enum": [
+              "image/png",
+              "image/jpeg",
+              "image/webp"
+            ]
+          },
+          "fileName": {
+            "type": "string"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20971520
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "attachmentId",
+          "contentUrl",
+          "mimeType",
+          "fileName",
+          "sizeBytes",
+          "updatedAt"
+        ],
+        "additionalProperties": false
+      },
+      "AgentReferenceImageResponse": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "referenceImage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentReferenceImage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "agentId",
+          "referenceImage"
+        ],
+        "additionalProperties": false
+      },
+      "AgentReferenceImageUpload": {
+        "type": "object",
+        "properties": {
+          "fileName": {
+            "type": "string",
+            "minLength": 1
+          },
+          "content": {
+            "type": "string",
+            "description": "Original PNG, JPEG or WebP as a base64 data URL; decoded limit 20 MiB. No downsampling."
+          }
+        },
+        "required": [
+          "fileName",
+          "content"
+        ],
+        "additionalProperties": false
+      },
+      "AgentReferenceImageCapability": {
+        "type": "object",
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "available",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "ForgeAgentReferenceImage": {
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string"
+          },
+          "agentName": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "attachmentId": {
+            "type": "string",
+            "description": "Saved portrait attachment_view identifier for any registered agent; not a host filesystem path."
+          },
+          "contentUrl": {
+            "type": "string"
+          },
+          "mimeType": {
+            "type": "string",
+            "enum": [
+              "image/png",
+              "image/jpeg",
+              "image/webp"
+            ]
+          },
+          "fileName": {
+            "type": "string"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20971520
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "agentId",
+          "agentName",
+          "id",
+          "attachmentId",
+          "contentUrl",
+          "mimeType",
+          "fileName",
+          "sizeBytes",
+          "updatedAt"
+        ],
+        "additionalProperties": false
       }
     },
     "securitySchemes": {
