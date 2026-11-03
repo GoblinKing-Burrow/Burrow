@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { createAgentReferenceImageRoutes, createModReferenceImageContentRoute } from './ui/agent-reference-image-routes.mjs';
+import { assertModAgentAvailable } from '../src/mod-agent-runtime.mjs';
+import { createAgentReferenceImageRoutes, createModReferenceImageContentRoute, createOperatorReferenceImageRoutes } from './ui/agent-reference-image-routes.mjs';
 import { createBoardTaskExecutor } from '../src/task-execution.mjs';
 import { isDisplayChatMessage } from '../src/session-entry.mjs';
 import { chatResultMetadata } from '../src/chat-result-metadata.mjs';
@@ -387,20 +388,9 @@ async function executeBoardTask(taskId, options = {}) {
     activeChatRuns, sessionContinuityHeads, activeChatRunKey, sessionContinuityHeadKey,
     RUN_CANCELLATION_GRACE_MS, retireCancelledRun, registerRuntimeActiveRun,
     publicChatProgress, observeModelRecovery, serverLogger, applyModelRecoveryProgress,
-    updateContextUsageHighWater,
   })(taskId, options);
 }
 
-function updateContextUsageHighWater(previous, usage) {
-  const previousEstimated = Number.isFinite(Number(previous?.estimatedTokens)) ? Number(previous.estimatedTokens) : null;
-  const currentEstimated = Number.isFinite(Number(usage?.estimatedTokens)) ? Number(usage.estimatedTokens) : null;
-  const previousProvider = Number.isFinite(Number(previous?.providerInputTokens)) ? Number(previous.providerInputTokens) : null;
-  const currentProvider = Number.isFinite(Number(usage?.providerInputTokens)) ? Number(usage.providerInputTokens) : null;
-  const candidates = [previousEstimated, currentEstimated, previousProvider, currentProvider].filter((value) => value !== null);
-  if (!candidates.length) return { ...usage };
-  const highWater = Math.max(...candidates);
-  return { ...usage, estimatedTokens: highWater, highWaterEstimatedTokens: highWater, highWaterProviderInputTokens: Math.max(...[previousProvider, currentProvider].filter((value) => value !== null), 0) || null, provenance: usage.continuation ? 'run-high-water-continuation' : 'run-high-water-initial' };
-}
 
 function registerRuntimeActiveRun(options) {
   const lifecycle = registerActiveAgentRun(activeChatRuns, { ...options, logger: typeof serverLogger === 'undefined' ? null : serverLogger });
@@ -1077,6 +1067,7 @@ async function resolveAgentRuntime(agentId = null) {
     error.statusCode = 409;
     throw error;
   }
+  assertModAgentAvailable(agent);
   const executionEnvironment = Object.freeze(agent.executionEnvironment
     ? { ...agent.executionEnvironment }
     : { kind: 'local', workspaceRoot: resolved.agentWorkspaceRoot });
@@ -1120,6 +1111,8 @@ async function deleteAgent(id) {
 }
 
 async function agentProfileDocuments(agentId, body = null) {
+  const managed = await agentsStore().get(agentId);
+  if (managed?.modAgent && body !== null) return { ok:false, status:409, error:'agent_profile_managed_by_mod' };
   const store = profilesStore();
   try {
     if (body === null) return { ok: true, documents: await store.list(agentId), globalProfile: await store.globalProfile(agentId) };
@@ -1139,6 +1132,8 @@ async function globalProfileDocuments(body = null) {
 }
 
 async function agentDreamSettings(agentId, body = null) {
+  const managed = await agentsStore().get(agentId);
+  if (managed?.modAgent) return { ok:false, status:409, error:'agent_dream_managed_by_mod' };
   const store = dreamSettingsStore();
   try {
     const settings = body === null ? await store.get(agentId) : await store.save(agentId, body);
@@ -1195,6 +1190,7 @@ async function agentDreamCycle(agentId, body = null, query = {}) {
   try {
     if (body === null) return { ok: true, receipts: await postgresApplication.stores.dreamCycles.latest({ agentId, limit: query.limit || 20 }) };
     const context = await resolveAgentRuntime(agentId);
+    if (context.agent?.modAgent) return { ok:false, status:409, error:'agent_dream_managed_by_mod' };
     return { ok: true, result: await runDreamCycle({ agentId, rootDir: context?.agentWorkspaceRoot || null, limit: body.limit, generatedAt: body.generatedAt, stores: postgresApplication.stores || undefined }) };
   } catch (error) {
     const message = String(error?.message || error);
@@ -1604,16 +1600,21 @@ async function applyImport(decoded, { conflictPolicy = 'error' } = {}) {
     const profiles = categories.agents.profiles && typeof categories.agents.profiles === 'object' ? categories.agents.profiles : {};
     for (const agent of agentRecords) {
       if (conflictPolicy === 'skip' && conflicts.some((c) => c.category === 'agents' && c.id === agent.id)) continue;
-      const existingAgent = await agentsStore().get(agent.id);
-      const importedAgent = await write(`agents:${agent.id}:record`, () => existingAgent ? agentsStore().update(agent.id, agent) : agentsStore().create(agent));
-      await write(`agents:${agent.id}:runtime`, () => materializeAgentRuntime(importedAgent));
+      // Portable restoration checks ownership and writes the complete registry
+      // identity under a row lock. The normal create/update APIs ignore modAgent
+      // and cannot distinguish an old regular payload from a mod-owned ID.
+      const importedAgent = await write(`agents:${agent.id}:record`, () => agentsStore().restorePortable(agent, { conflictPolicy }));
+      const modOwned = Boolean(importedAgent.modAgent);
+      if (!modOwned) await write(`agents:${agent.id}:runtime`, () => materializeAgentRuntime(importedAgent));
       if (agent.avatar !== undefined || agent.identityName !== undefined) await write(`agents:${agent.id}:identity`, () => modelsStore().saveIdentity({ kind: 'agent', id: agent.id, name: agent.identityName ?? agent.name, avatar: agent.avatar ?? '' }));
       const profileDocuments = Array.isArray(profiles[agent.id]) ? profiles[agent.id] : [];
-      if (profileDocuments.length) {
+      // Mod profiles are provided by the owner, not imported core profiles.
+      // Existing legacy data stays untouched.
+      if (!modOwned && profileDocuments.length) {
         const profileStore = profilesStore();
         try { await write(`agents:${agent.id}:profiles`, () => profileStore.replace(agent.id, profileDocuments.filter((item) => AGENT_PROFILE_KINDS.includes(String(item?.kind || '').toUpperCase())).map((item) => ({ ...item, kind: String(item.kind).toUpperCase() })))); } finally { await profileStore.close(); }
       }
-      if (agent.dreamSettings && typeof agent.dreamSettings === 'object') {
+      if (!modOwned && agent.dreamSettings && typeof agent.dreamSettings === 'object') {
         const dreamStore = dreamSettingsStore();
         try {
           try {
@@ -1629,12 +1630,12 @@ async function applyImport(decoded, { conflictPolicy = 'error' } = {}) {
         } finally { await dreamStore.close(); }
       }
       for (const [field, minion] of [['modelSelection', false], ['minionModelSelection', true]]) {
-        if (!Object.hasOwn(agent, field)) continue; // Older v2 bundles remain valid.
+        if ((modOwned && minion) || !Object.hasOwn(agent, field)) continue; // Older v2 bundles remain valid.
         const selection = agent[field];
         if (selection) await write(`agents:${agent.id}:${field}`, () => modelsStore().saveModelSelection({ ...selection, agentId: agent.id, minion }));
         else await write(`agents:${agent.id}:${field}`, () => modelsStore().clearModelSelection(agent.id, { minion }));
       }
-      if (Object.hasOwn(agent, 'archiveSummaryModelSelection')) await write(`agents:${agent.id}:archive-summary-model`, () => saveArchiveSummaryModelSelection(agent.id, agent.archiveSummaryModelSelection || {}));
+      if (!modOwned && Object.hasOwn(agent, 'archiveSummaryModelSelection')) await write(`agents:${agent.id}:archive-summary-model`, () => saveArchiveSummaryModelSelection(agent.id, agent.archiveSummaryModelSelection || {}));
       imported.push(`agents:${agent.id}`);
     }
     if (categories.agents.operator?.name && typeof categories.agents.operator === 'object') {
@@ -1717,12 +1718,14 @@ async function exportSnapshot(categories = []) {
     const modelSelections = Object.fromEntries(await Promise.all(agentRecords.map(async agent => [agent.id, { modelSelection: await modelsStore().modelSelection(agent.id), minionModelSelection: await modelsStore().modelSelection(agent.id, { minion: true }), archiveSummaryModelSelection: await archiveSummarySelection(agent.id) }])));
     try {
       profiles = Object.fromEntries(await Promise.all(agentRecords.map(async (agent) => [agent.id, await profileStore.list(agent.id)])));
-      dreamSettings = Object.fromEntries(await Promise.all(agentRecords.map(async (agent) => [agent.id, await dreamStore.get(agent.id)])));
+      // Dream get() persists default settings, which a mod-owned identity must
+      // never acquire just by being included in a portable export.
+      dreamSettings = Object.fromEntries(await Promise.all(agentRecords.map(async (agent) => [agent.id, agent.modAgent ? null : await dreamStore.get(agent.id)])));
     } finally { await profileStore.close(); await dreamStore.close(); }
     data.agents = {
       schema: 'burrow.agents-and-profiles/v2',
       operator: identities.operator,
-      records: (await agentsStore().list({ includeDisabled: true })).map((agent) => {
+      records: agentRecords.map((agent) => {
         const identity = identitiesById.get(agent.id);
         return { ...agent, ...modelSelections[agent.id], ...(identity ? { identityName: identity.name, avatar: identity.avatar || '' } : {}), dreamSettings: dreamSettings[agent.id] };
       }),
@@ -2624,8 +2627,11 @@ function contextFullText({ request, agentRuntime, sessionId, status }) {
 
 function contextMeterLines(context = {}, compaction = {}, memory = {}) {
   return [
-    ['Usage', context.percent === null || context.percent === undefined ? 'unknown' : `${context.percent}% (${context.pressure || 'unknown'})`],
-    ['Estimated tokens', context.estimatedTokens ?? 'unknown'],
+    ['Context scope', context.scope || 'historical'],
+    ['Usage', context.percent === null || context.percent === undefined ? 'unknown' : `${context.percent}%`],
+    ['Budget pressure (classification, not execution status)', context.pressure || 'unknown'],
+    [context.source === 'provider-input-tokens' ? 'Reported input tokens' : 'Estimated tokens', context.estimatedTokens ?? 'unknown'],
+    ...(context.requestId ? [['Request ID', context.requestId], ['Requested model', context.model || 'unknown'], ['Reported model', context.responseModel || 'unknown'], ['Serving provider', context.providerName || context.provider || 'unknown']] : []),
     ...(context.provenance ? [['Context basis', context.provenance]] : []),
     ['Capacity tokens', context.capacityTokens ?? 'unknown'],
     ['Compaction', compaction.active ? 'active' : 'idle'],
@@ -2899,9 +2905,9 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
       onSteeringReady: () => { record.steeringReady = !controller.signal.aborted && record.phase !== 'cancelling'; },
       onModelContextUsage: async (usage) => {
         if (!usage || typeof usage !== 'object') return;
-        // Keep every raw measurement in telemetry, while the active card uses
-        // a monotonic per-run high-water mark across initial and continuation requests.
-        record.contextUsage = updateContextUsageHighWater(record.contextUsage, usage);
+        // Each update is scoped to one physical request; never carry a previous
+        // response or run maximum into the next request estimate.
+        record.contextUsage = { ...usage, runId };
         try {
           await postgresApplication.stores.conversations.append({
             agentId: agentRuntime.agentId,
@@ -2910,7 +2916,7 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
             sessionId,
             type: 'event',
             role: null,
-            content: 'Provider canonical context measurement updated.',
+            content: 'Latest provider request context measurement updated.',
             runId,
             metadata: { contextMeter: record.contextUsage },
             visibility: 'debug',
@@ -3121,6 +3127,7 @@ const skillApi = {
 const settingsRoute = createSettingsRoutes({ globalProfileDocuments, timezoneSettings: async () => ({ ok: true, timezone: await operatorTimezone(postgresApplication.stores.metadata) }), saveTimezoneSettings: (body) => saveOperatorTimezone(postgresApplication.stores.metadata, body), ...skillApi, readJsonBody, sendJson, modelConnections, claudeCliCredentialStatus, importClaudeCliCredential, startOpenAiOAuthLoginApi, openAiOAuthLoginStatus, submitOpenAiOAuthLoginApi, cancelOpenAiOAuthLoginApi, startClaudeCodeLoginApi, claudeCodeLoginStatus, submitClaudeCodeLoginApi, cancelClaudeCodeLoginApi, importClaudeCodeLoginApi, mcpConnections, discoverMcpConnection, diagnoseMcpConnection, saveMcpConnection, removeMcpConnection, agentMcpTools, saveAgentMcpTools, agentModelSelection, saveAgentModelSelection, agentMinionModelSelection, saveAgentMinionModelSelection, agentMinionSettings, saveAgentMinionSettings, archiveSummaryModelSelection: async (agentId) => ({ ok: true, selection: await archiveSummarySelection((await resolveAgentRuntime(agentId)).agentId) }), saveArchiveSummaryModelSelection, discoverModelConnection, saveModelConnection, removeModelConnection: async (id) => await modelsStore().remove(id), completeSetupOperation: async body => { try { return await completeSetupOperation({ pool: postgresApplication.pool, encryptionKey: modelsStore().key, body }); } catch (error) { return { ok: false, status: error.message === 'setup_operation_conflict' || error.message === 'agent_id_exists' ? 409 : 400, error: error.message }; } }, setupStatus: async () => postgresApplication.stores.setupState.readStatus(), completeSetup: async () => postgresApplication.stores.setupState.completeSetup() });
 const modReferenceImageRoute = createModReferenceImageContentRoute({ store: () => postgresApplication.stores.referenceImages, sendJson });
 const agentReferenceImageRoute = createAgentReferenceImageRoutes({ store: () => postgresApplication.stores.referenceImages, readJsonBody, sendJson });
+const operatorReferenceImageRoute = createOperatorReferenceImageRoutes({ store: () => postgresApplication.stores.referenceImages, readJsonBody, sendJson });
 const agentRoute = createAgentRoutes({ readJsonBody, sendJson, validateBoundaryBody, agentsStore, createAgent, updateAgent, deleteAgent, agentProfileDocuments, selectedAgentRuntime, agentStatusForSession, agentOverview });
 const archiveAgentContext = createArchiveAgentContext({ agentsStore, rootDir: projectRoot });
 const { archiveSessions, archiveCalendar, archiveSessionDetail, archiveRuns, archiveRunDetail, archiveDreams, archiveDreamDetail, archiveDreamGroups, archiveDreamGroupDetail, archiveWorkflowEvents, archiveContinuityCards, archiveContinuityCardDetail } = createArchiveService({
@@ -3499,6 +3506,7 @@ async function handleRequest(req, res) {
     }
     if (await observabilityRoute({ req, res, url })) return;
     if (await modReferenceImageRoute({ req, res, url })) return;
+    if (await operatorReferenceImageRoute({ req, res, url })) return;
     if (await agentReferenceImageRoute({ req, res, url })) return;
     if (await agentRoute({ req, res, url })) return;
     if (await archiveReadProcess.route({ req, res, url })) return;
@@ -3644,7 +3652,7 @@ server.listen(port, host, () => {
   if (shuttingDown) return;
   recoveryContinuationScheduler = createRecoveryContinuationScheduler({ resolveOptions: async () => ({
     stores:postgresApplication.stores,
-    agentRuntimes: await Promise.all((await agentsStore().list({ includeDisabled: false })).map((agent) => resolveAgentRuntime(agent.id))),
+    agentRuntimes: (await Promise.allSettled((await agentsStore().list({ includeDisabled: false })).map((agent) => resolveAgentRuntime(agent.id)))).filter(result => result.status === 'fulfilled').map(result => result.value),
     createRunId: createChatTurnRunId,
     cancellationGraceMs: Math.min(RUN_CANCELLATION_GRACE_MS, Math.max(0, SHUTDOWN_DRAIN_MS - 1_000)),
     runContinuation: async ({ runtime, sessionId, runId, manifest, continuation, signal }) => {

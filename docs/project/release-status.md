@@ -73,3 +73,13 @@ Compared changes since the successful 30 October baseline: retained Chat occurre
 ## Sunday full reconciliation: 1 November 2026
 
 Existing guides were compared with the current implementation across setup, configuration, routing, APIs, operations, troubleshooting and skills. Corrections include saved board-task scheduling and one-time consumption, independent Anthropic thinking modes and paginated native catalogues, current Settings/task-board behavior, and migration inventory through 85. Historical screenshots and immutable public-source receipts remain explicitly historical. This is static documentation reconciliation, not a runtime installation, provider call, application test run or release promotion.
+
+## 2 November implementation delta
+
+Current inspected assembly **2026.11.02.4**, commit `d25beccce60830cf4159d91cae9a97dec38eefd2`, records Backend `69f644aaf9f0060fac7003c22e77f7a3da7c0471` and UI `1c396911c2f47137f5ea0ba3759a960de31770c4`. It includes canonical agent/operator reference photos for supported Forge image models, separate per-peer A2A inboxes, structured terminal error persistence, explicit opt-in for newly discovered API models, cheaper retention policy reads, and environment-only Origin checking. The database ledger reaches 89. This ordinary delta supplements, rather than repeats, Sunday's full reconciliation. Public mirror and installed-version availability remain separate checks.
+
+## 3 November implementation delta
+
+Current inspected assembly **2026.11.03.8**, commit `400ec8f2d0b24478ca2185bf8c38aee2ede4c445`, records Core `32dde3266a231777ddfec6dba141d6b9972a21fd` and UI `4a17a8c73c588a7582835ca6ff50dcabe409c33c`. This ordinary pass follows the merged Settings layout contract, horizontal agent-button overflow, latest-request context measurement and correlated provider usage, generic mod-owned native agent isolation, and preserved executable permissions in the release artifact handoff. The application schema reaches migration 90 for mod-owned agent metadata. The separately documented mod and skill repositories have no newer source commits than the previous documentation baseline; their cross-component compatibility is still checked.
+
+The full review remains dated **1 November**. This is static source reconciliation and safe documentation validation, not application/provider testing, a runtime deployment or proof that public releases and installed versions already include these changes.

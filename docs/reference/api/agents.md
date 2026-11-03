@@ -4,7 +4,6 @@
 !!! note "Source-reviewed API reference"
     This reference was reconciled against current development source on **2026-11-01**. Historical public-source links below remain pinned to their stated revision; they are not proof that a public mirror or your installation has caught up. Start with the [current operator guide](../../guide/installation.md) for installation. This is static source review, not a live API compatibility test.
 
-
 The agent registry is PostgreSQL-backed. An empty registry is valid; a fallback agent label in code does not establish that a real agent exists. Start with `GET /api/setup/status` and `GET /api/agents`.
 
 ## Initial setup
@@ -21,7 +20,7 @@ Create requires `name`; an optional `id` must be a string and pass registry vali
 `GET /api/agents` includes disabled agents unless `includeDisabled=false`. `POST /api/agents/overview` is a bulk UI projection with normalized request selection; it does not launch agents. `GET /api/agent-status` is listed under [diagnostics](diagnostics.md).
 ## Native peer discovery
 
-The agent-facing `agents_list` tool is separate from this operator registry API: it lists enabled peers by default, with optional substring query, disabled inclusion and pages of up to 20 exact identity cards. Known peers can be addressed directly by `agent_send_message` using canonical ID or unique full display name; discovery does not require Backdoor or MCP. See [peer messaging](../../concepts/agents-minions.md#peer-agent-messages). Registry listing is not a runtime health or peer-data permission check.
+The agent-facing `agents_list` tool is separate from this operator registry API: it lists enabled peers by default, with optional substring query, disabled inclusion and pages of up to 20 exact identity cards. Known peers can be addressed directly by `agent_send_message` using canonical ID or unique full display name; discovery does not require Backdoor or MCP. See [peer messaging](../../concepts/agents-minions.md#peer-agent-messages). Registry listing is not a runtime health or peer-data permission check. For a mod-owned peer, native discovery additionally requires the `a2a` capability and a live owning context provider. Direct native sends recheck caller and target eligibility; a known identity or earlier discovery result does not bypass those checks. See [mod-owned native agents](../../development/extensions.md#mod-owned-native-agents).
 
 Overview/status now retain root, immediate-parent and depth ancestry. Context hydration is bounded separately from the descendant tree; see [status projections](diagnostics.md#descendant-status).
 
@@ -65,3 +64,11 @@ Changed contracts above were checked statically against Backend `4057b50a5d5a9b1
 ## Agent-wide Minion overview
 
 `POST /api/agents/overview` additionally accepts `minionScope: "session" | "agent"`; default is `session`, invalid values return `400 minion_scope_invalid`. With `agent`, each successful status includes the requested session anchor plus visible Minions across that agent's originating sessions and declares `status.minionScope: "agent"`. It does not include unrelated ordinary chats or other agents. Anchor IDs stay unchanged, including when the anchor itself is a child. Context hydration remains independently capped at the anchor plus 12 distinct children. `/api/agent-status`, recovery and cancellation retain their existing session scopes.
+
+## Reference-photo routes
+
+`GET|PUT|DELETE /api/agents/{agentId}/reference-image` manage an agent photo independently of its avatar; success returns `{ok:true,agentId,referenceImage}`. The operator equivalent `/api/operator/reference-image` returns `{ok:true,referenceImage}` without `agentId`. GET yields metadata or null, PUT uploads/replaces, and DELETE returns null. PUT requires `{fileName,content}`, where `content` is a PNG/JPEG/WebP base64 data URL with at most 20 MiB decoded bytes.
+
+Metadata contains `id`, `attachmentId`, `contentUrl`, `mimeType`, `fileName`, `sizeBytes` and `updatedAt`. The `/content?id=<revision>` child route streams the current original with private/no-store headers; missing, stale or wrong-agent revisions return 404. Ordinary settings authentication/scopes apply. The operator attachment identity is `operator-reference-image:<uuid>`; agent photos use `agent-reference-image:<uuid>`.
+
+PostgreSQL owns links in `agent_reference_images` and singleton `operator_reference_images`; files live in Core's runtime-managed artifacts. Replacement/removal cleans the previous owned file, and agent deletion cleans its photo. These are not chat-retention attachments or selective-export payloads. See [generation selectors](artifacts.md#canonical-reference-image-generation).

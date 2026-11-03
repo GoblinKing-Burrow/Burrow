@@ -1,4 +1,9 @@
-import { enabledAgents } from './app/agentCatalog';
+import {
+  loadModSettingsContributions,
+  modContributionsChangedEvent,
+  type ModContribution,
+} from './app/apiTargets';
+import { chatAgents, capabilityAgents } from './app/agentCatalog';
 import { UnsavedChangesProvider, useUnsavedNavigation } from './app/UnsavedChanges';
 import { useBrowserTabTitle } from './app/browserTab';
 import { readAttachment } from './app/readAttachment';
@@ -18,6 +23,7 @@ import {
   usePersistedTheme,
   usePersistedLayout,
 } from './app/usePersistedLayout';
+import { ownerPanelModId, ownerPanelsForAgents } from './app/panelRegistry';
 import { useAgentRailPreferences } from './app/useAgentRailPreferences';
 import { useAppTabs } from './app/useAppTabs';
 import { useRuntimeDashboard } from './app/useRuntimeDashboard';
@@ -64,6 +70,23 @@ import { Forge } from './features/forge/ForgePage';
 function AppContent() {
   useBrowserTabTitle();
   const navigate = useUnsavedNavigation();
+  const [ownerContributions, setOwnerContributions] = useState<ModContribution[]>([]);
+  useEffect(() => {
+    let live = true;
+    const refresh = () => {
+      void loadModSettingsContributions()
+        .then((items) => {
+          if (live) setOwnerContributions(items);
+        })
+        .catch(() => {});
+    };
+    refresh();
+    window.addEventListener(modContributionsChangedEvent, refresh);
+    return () => {
+      live = false;
+      window.removeEventListener(modContributionsChangedEvent, refresh);
+    };
+  }, []);
   const [runtimeVersion, setRuntimeVersion] = useState<string | null>(null);
   useEffect(() => {
     let live = true;
@@ -265,7 +288,7 @@ function AppContent() {
     };
   }, [theme]);
   const [agentRailPreferences, setAgentRailPreferences] = useAgentRailPreferences();
-  const availableAgents = enabledAgents(agents);
+  const availableAgents = chatAgents(agents);
   const loadedSelected =
     availableAgents.find((agent) => agent.id === selectedAgentId) ?? availableAgents[0];
   // Settings must remain reachable when the first agent has not been created yet.
@@ -557,11 +580,14 @@ function AppContent() {
       </main>
     );
   }
+  const ownerPanels = ownerPanelsForAgents(railAgents, ownerContributions);
   const renderRailPanel = (panel: PanelId) => {
-    if (panel === 'agents')
+    const ownerModId = ownerPanelModId(panel);
+    if (panel === 'agents' || ownerModId)
       return (
         <AgentsPanel
           agents={railAgents}
+          ownerModId={ownerModId ?? undefined}
           view={agentRailPreferences.view}
           order={agentRailPreferences.order}
           selectedStreamId={selectedStreamId}
@@ -665,6 +691,7 @@ function AppContent() {
       </div>
       {page === 'chat' && !activeMod && (
         <WorkspaceRail
+          panels={ownerPanels}
           collapsed={leftCollapsed}
           topPanel={leftTopPanel}
           bottomPanel={leftBottomPanel}
@@ -712,14 +739,24 @@ function AppContent() {
               }}
             />
           ) : page === 'brains' ? (
-            <Brains agents={availableAgents} />
+            <Brains agents={agents} />
           ) : page === 'archive' ? (
             <Archive agents={agents} operatorName={operatorProfile.name} />
           ) : page === 'forge' ? (
-            <Forge agents={agents} selectedAgentId={selectedAgentId} sessionId={sessionId} />
+            <Forge
+              agents={capabilityAgents(agents, 'forge')}
+              selectedAgentId={
+                capabilityAgents(agents, 'forge').find((agent) => agent.id === selectedAgentId)
+                  ?.id ??
+                capabilityAgents(agents, 'forge')[0]?.id ??
+                ''
+              }
+              sessionId={sessionId}
+            />
           ) : page === 'settings' ? (
             <Settings
               key="local"
+              selectedAgentId={selected.resourceId ?? selected.id}
               onOpenChat={openScheduledChat}
               navigationTarget={settingsNavigationVisible ? settingsNavigationTarget : null}
               tab={settingsTab}
@@ -731,6 +768,7 @@ function AppContent() {
               savedProviders={savedProviders}
               onModelConnectionsChanged={refreshModelConnections}
               onAgentsChanged={refreshAgents}
+              availablePanels={ownerPanels}
               leftTopPanel={leftTopPanel}
               setLeftTopPanel={setLeftTopPanel}
               leftBottomPanel={leftBottomPanel}
@@ -762,6 +800,23 @@ function AppContent() {
                 onClose={closeTab}
               />
               <ChatModelSelector
+                ownerEditor={(() => {
+                  const owner = ownerContributions.find(
+                    (item) => item.modId === selected.modAgent?.ownerModId,
+                  );
+                  const setting = owner?.settings?.[0];
+                  return owner?.settingsUrl && setting
+                    ? {
+                        label: `Edit in ${owner.name}`,
+                        onOpen: () =>
+                          navigate(() => {
+                            setActiveModId(null);
+                            setSettingsTab(`mod-settings:${owner.modId}:${setting.id}`);
+                            setPage('settings');
+                          }),
+                      }
+                    : undefined;
+                })()}
                 savingSelection={pendingModelOwners.has(selected.id)}
                 onSelectionBlockedChange={setModelSelectionBlocked}
                 selected={selected}
@@ -847,6 +902,7 @@ function AppContent() {
       </section>
       {page === 'chat' && !activeMod && (
         <RightRail
+          panels={ownerPanels}
           collapsed={rightCollapsed}
           topPanel={rightTopPanel}
           bottomPanel={rightBottomPanel}

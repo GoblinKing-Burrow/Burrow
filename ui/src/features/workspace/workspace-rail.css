@@ -10,7 +10,7 @@
   overflow: hidden;
   border-bottom: 1px solid var(--line-soft);
 }
-.agent-group.active {
+.agent-card.active {
   background: transparent;
   box-shadow: inset 2px 0 var(--accent);
 }
@@ -223,6 +223,13 @@
   margin-top: -3px;
   color: var(--muted);
   font-size: 10px;
+}
+/* Healthy Grove meters share the account green; pressure states stay amber/red. */
+[data-theme='violet-grove']
+  .context-usage:not(.pressure-watch, .pressure-compress, .pressure-blocked)
+  i
+  b {
+  background: var(--ok);
 }
 .context-usage.pressure-watch i b {
   background: var(--warn);
@@ -718,4 +725,17 @@
   padding: 6px 9px 4px 22px;
   color: var(--muted);
   font-size: 10px;
+}
+
+.subagent-line {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.subagent-line .subagent-row {
+  flex: 1;
+  width: auto;
+}
+.subagent-line .agent-toggle {
+  flex: 0 0 24px;
 }

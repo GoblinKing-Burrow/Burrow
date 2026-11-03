@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { panelIds } from './panelRegistry';
+import { ownerPanelModId, panelIds } from './panelRegistry';
 import {
   readStorage,
   removeStorage,
@@ -31,6 +31,7 @@ function migrateRightPanelDefaults() {
 export const themes = [
   'smatchet',
   'midnight',
+  'violet-grove',
   'halloween',
   'blue-hour',
   'nexus',
@@ -45,6 +46,10 @@ export const themeDetails = {
     description: 'Dense dark workspace with a magenta focus color.',
   },
   midnight: { label: 'Midnight', description: 'Black, blue outlines and a touch of magenta.' },
+  'violet-grove': {
+    label: 'Violet Grove',
+    description: 'Midnight with violet and bright green highlights.',
+  },
   halloween: {
     label: 'Halloween',
     description: 'Midnight with orange, green and purple highlights.',
@@ -70,7 +75,8 @@ const isBoolean: StoredValueValidator<boolean> = (value): value is boolean =>
 const isTheme: StoredValueValidator<Theme> = (value): value is Theme =>
   typeof value === 'string' && themes.includes(value as Theme);
 const isPanel: StoredValueValidator<PanelId> = (value): value is PanelId =>
-  typeof value === 'string' && panelIds.includes(value as PanelId);
+  typeof value === 'string' &&
+  (panelIds.includes(value as PanelId) || ownerPanelModId(value as PanelId) !== null);
 export const railLayouts = ['divided', 'single', 'top', 'bottom'] as const;
 export type RailLayout = (typeof railLayouts)[number];
 const isRailLayout: StoredValueValidator<RailLayout> = (value): value is RailLayout =>

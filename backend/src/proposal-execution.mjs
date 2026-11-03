@@ -1,4 +1,4 @@
-import { REFERENCE_IMAGE_ATTACHMENT_PREFIX } from './postgres-agent-reference-image-store.mjs';
+import { REFERENCE_IMAGE_ATTACHMENT_PREFIX, OPERATOR_REFERENCE_IMAGE_ATTACHMENT_PREFIX } from './postgres-agent-reference-image-store.mjs';
 import { searchAgentRunEvidence } from './run-evidence.mjs';
 import { executeBrainTool } from './brain-tool-executor.mjs';
 import { redactText } from './redaction.mjs';
@@ -24,6 +24,7 @@ import { reviewProposalActions } from './action-safety.mjs';
 import { invokeMcpTool, publicMcpError, publicMcpFailureDetail } from './mcporter-adapter.mjs';
 import { grantedMcpTool, mcpCapabilitiesReceipt, mcpProvidersReceipt } from './mcp-menu.mjs';
 import { activeModToolConnection } from './mod-agent-tools.mjs';
+import { activeModAgentProvider, executeModAgentTool } from './mod-agent-runtime.mjs';
 import { executeForgeTool, forgeFailure } from './forge-agent-tools.mjs';
 import { credentialProducer, protectMcpOutput, protectToolOutput, resolveManagedProtectedBindings } from './protected-values.mjs';
 import { executeSkillTool } from './skill-tool-executor.mjs';
@@ -48,7 +49,20 @@ function withExecutionProvenance(result, target, executionContext, toolCallId) {
 
 export async function executeReviewedProposalActions({ conversationStore = null, actions = [], reviews = [], workspaceRoot = null, rootDir = null, dataRoot = null, sessionId = null, conversationId = null, agentId = null, agentRuntime = null, resolveAgentRuntime = null, runAgentReply = null, workingMemoryStore = null, executionPolicy = null, modelConfig = null, traceLogger = null, artifactPrefix = null, observedToolResults = [], executionContext = null, abortSignal = null, invokeMcp = invokeMcpTool, childRunner = null } = {}) {
   abortSignal = abortSignal || executionContext?.abortSignal || null;
-  agentId = agentId || executionContext?.agentId || null;
+  // The execution context is authoritative; model arguments or a separately
+  // supplied runtime must never replace a mod identity for the safety recheck.
+  const modRuntime = executionContext?.agentRuntime?.agent?.modAgent
+    ? executionContext.agentRuntime : agentRuntime?.agent?.modAgent ? agentRuntime : null;
+  if (modRuntime) {
+    if (!executionContext?.agentRuntime?.agent?.modAgent ||
+        (agentRuntime && (agentRuntime.agentId !== modRuntime.agentId || agentRuntime.agent?.modAgent?.ownerModId !== modRuntime.agent.modAgent.ownerModId)) ||
+        (agentId && agentId !== executionContext.agentId) ||
+        (sessionId && sessionId !== executionContext.sessionId) ||
+        (conversationId && conversationId !== executionContext.conversationId)) throw new Error('mod_agent_identity_mismatch');
+    agentId = executionContext.agentId;
+    sessionId = executionContext.sessionId;
+    conversationId = executionContext.conversationId;
+  } else agentId = agentId || executionContext?.agentId || null;
   const resolvedConversationId = conversationId || executionContext?.conversationId || null;
   // Agent home is the normal-chat default. Explicit internal/delegated
   // structural targets remain valid one-turn execution contexts; a model may
@@ -118,6 +132,80 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       skipped.push({ index: action.index, tool: action.tool, status: executionReview?.status || 'blocked', ...((executionReview?.blockers || []).length ? { blockers: executionReview.blockers } : {}) });
       continue;
     }
+    if (modRuntime) {
+      // An owner may disable an identity/capability while this turn is running.
+      // Refresh if the trusted runtime supplies a resolver, never upgrading the
+      // original turn's privileges. Missing/changed owners fail closed.
+      let current = modRuntime;
+      const resolveRuntime = executionContext?.resolveAgentRuntime;
+      if (resolveRuntime) {
+        try { current = await resolveRuntime(modRuntime.agentId); } catch { current = null; }
+      }
+      if (abortSignal?.aborted) {
+        skipped.push({ index: action.index, tool: action.tool, toolCallId: action.toolCallId || null, status: 'cancelled' });
+        continue;
+      }
+      const currentAgent = current?.agent;
+      if (!currentAgent?.modAgent || current.agentId !== modRuntime.agentId || currentAgent.id !== modRuntime.agentId ||
+          currentAgent.enabled === false || currentAgent.modAgent.ownerModId !== modRuntime.agent.modAgent.ownerModId ||
+          !activeModAgentProvider(currentAgent)) {
+        skipped.push({ index: action.index, tool: action.tool, status: 'blocked', blockers: ['mod_agent_unavailable'] });
+        continue;
+      }
+      const currentReview = reviewProposalActions({ actions: [action], workspaceRoot: executionRoot,
+        executionContext: { ...executionContext, agentId: current.agentId, agentRuntime: current } }).reviews[0];
+      if (currentReview?.status !== 'allowed') {
+        skipped.push({ index: action.index, tool: action.tool, status: 'blocked', blockers: currentReview?.blockers || ['mod_agent_tool_not_allowed'] });
+        continue;
+      }
+    }
+    if (action.tool === 'mod_agent_tool') {
+      const started = await traceLogger?.toolStart?.({ tool: action.tool, toolCallId: action.toolCallId || null, modToolName: action.modToolName });
+      let result;
+      try {
+        // Pass only trusted context and parsed fields: 'name' and 'arguments'
+        // must never accidentally override the normalized mod fields.
+        const mod = activeModAgentProvider(modRuntime?.agent);
+        const output = await executeModAgentTool({ modToolName: action.modToolName, modToolArguments: action.modToolArguments }, {
+          agentRuntime: modRuntime, agentId, sessionId, conversationId: resolvedConversationId,
+          parentRunId: executionContext?.parentRunId || null, abortSignal,
+        });
+        const protectedOutput = protectToolOutput(output, { registry: executionContext?.protectedValues,
+          managedIssuer: declaration => {
+            if (!agentId || !(executionContext?.protectedValues instanceof Map) || !mod || typeof mod.host?.resolveProtectedReference !== 'function') return null;
+            return { managed: true, reference: declaration.reference, version: declaration.version,
+              providerId: `mod.${mod.id}`, toolName: action.modToolName, mod,
+              caller: { agentId, sessionId, conversationId: resolvedConversationId },
+              resolve: (reference, caller) => mod.host.resolveProtectedReference(action.modToolName, reference, caller) };
+          },
+        });
+        const withheld = protectedOutput.protection.status === 'withheld';
+        const isError = protectedOutput.safeOutput?.isError === true || protectedOutput.safeOutput?.ok === false;
+        const imageResult = await persistMcpImages(protectedOutput.safeOutput, {
+          agentWorkspaceRoot: executionContext?.agentWorkspaceRoot || workspaceRoot || rootDir,
+          retentionDays: executionContext?.stores?.albdruck ? (await executionContext.stores.albdruck.readRetention()).attachmentDays : 30,
+        });
+        result = { tool: action.tool, modToolName: action.modToolName, ok: !withheld && !isError,
+          // The native adapter currently forwards generic 'output' only when it
+          // is text (MCP is separately specialized). Serialize the protected
+          // object so notebook/inventory results reach the next model turn.
+          output: imageResult.output == null ? null : typeof imageResult.output === 'string' ? imageResult.output : JSON.stringify(imageResult.output), protection: protectedOutput.protection,
+          ...(imageResult.attachments.length ? { attachments: imageResult.attachments } : {}),
+          ...(withheld ? { error: 'mod_sensitive_response_withheld' } : isError ? { error: 'mod_agent_tool_failed' } : {}),
+          ...(protectedOutput.protectedValues.length ? { protectedValues: protectedOutput.protectedValues } : {}),
+        };
+      } catch (error) {
+        // Mod error text may contain secrets, including schema validation errors.
+        result = { tool: action.tool, modToolName: action.modToolName, ok: false,
+          error: error?.code === 'mod_agent_unavailable' ? 'mod_agent_unavailable' : 'mod_agent_tool_failed' };
+      }
+      toolResults.push(result);
+      await (traceLogger?.toolEnd || traceLogger?.tool)?.({ tool: action.tool, toolCallId: action.toolCallId || null,
+        ...(started?.payload?.activityId ? { activityId: started.payload.activityId } : {}),
+        modToolName: action.modToolName, ok: result.ok, error: result.error || null });
+      continue;
+    }
+
     if (action.tool === 'shell_exec') {
       const target = resolveProcessExecutionTarget(executionContext || {});
       const traceDetails = {
@@ -273,7 +361,9 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       const started = await traceLogger?.toolStart?.({ tool: 'attachment_view', attachmentId, toolCallId: action.toolCallId || null });
       let result;
       try {
-        const attachment = attachmentId?.startsWith(REFERENCE_IMAGE_ATTACHMENT_PREFIX)
+        const attachment = attachmentId?.startsWith(OPERATOR_REFERENCE_IMAGE_ATTACHMENT_PREFIX)
+          ? await executionContext?.stores?.referenceImages?.viewOperator(attachmentId)
+          : attachmentId?.startsWith(REFERENCE_IMAGE_ATTACHMENT_PREFIX)
           ? await (executionContext?.stores?.referenceImages?.viewShared
             ? executionContext.stores.referenceImages.viewShared(attachmentId)
             : executionContext?.stores?.referenceImages?.view(agentId || executionContext?.agentId, attachmentId))
@@ -282,7 +372,9 @@ export async function executeReviewedProposalActions({ conversationStore = null,
           ? { tool: 'attachment_view', ok: true, attachmentId, attachment }
           : { tool: 'attachment_view', ok: false, attachmentId, error: 'attachment_not_found' };
       } catch (error) {
-        result = { tool: 'attachment_view', ok: false, attachmentId, error: attachmentId?.startsWith(REFERENCE_IMAGE_ATTACHMENT_PREFIX)
+        result = { tool: 'attachment_view', ok: false, attachmentId, error: attachmentId?.startsWith(OPERATOR_REFERENCE_IMAGE_ATTACHMENT_PREFIX)
+          ? error?.statusCode === 404 ? 'operator_reference_image_not_found' : 'operator_reference_image_unavailable'
+          : attachmentId?.startsWith(REFERENCE_IMAGE_ATTACHMENT_PREFIX)
           ? error?.statusCode === 404 ? 'agent_reference_image_not_found' : 'agent_reference_image_unavailable'
           : String(error?.message || error) };
       }
@@ -318,7 +410,7 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       let result;
       try {
         const args = action.tool === 'forge_create_job'
-          ? { mode: action.forgeMode, connectionId: action.forgeConnectionId || action.connectionId, modelId: action.forgeModelId || action.modelId, prompt: action.forgePrompt || action.prompt, idempotencyKey: action.forgeIdempotencyKey || action.idempotencyKey, useAgentReferenceImage: action.useAgentReferenceImage, referenceAgentIds: action.referenceAgentIds }
+          ? { mode: action.forgeMode, connectionId: action.forgeConnectionId || action.connectionId, modelId: action.forgeModelId || action.modelId, prompt: action.forgePrompt || action.prompt, idempotencyKey: action.forgeIdempotencyKey || action.idempotencyKey, useAgentReferenceImage: action.useAgentReferenceImage, useOperatorReferenceImage: action.useOperatorReferenceImage, referenceAgentIds: action.referenceAgentIds }
           : action.tool === 'forge_inspect_job' ? { jobId: action.jobId }
           : action.tool === 'forge_attach_artifact' ? { jobId: action.jobId, artifactId: action.artifactId } : {};
         result = await executeForgeTool(action.tool, args, { agentId, sessionId: sessionId || executionContext?.sessionId, conversationId: resolvedConversationId });

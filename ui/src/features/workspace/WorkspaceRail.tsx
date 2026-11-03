@@ -1,10 +1,11 @@
-import { enabledAgents } from '../../app/agentCatalog';
+import { contextUsageLabel } from './contextUsageLabel';
+import { chatAgents } from '../../app/agentCatalog';
 import { useEffect, useState, type PointerEvent, type ReactNode } from 'react';
 import type { Agent, FileNode, PanelId } from '../../app/types';
 import type { RailLayout } from '../../app/usePersistedLayout';
 import { api, type RuntimeHealth, type RuntimeMetrics } from '../../app/api';
 import type { ProviderConnectionStatus } from '../../app/useRuntimeDashboard';
-import { getPanelTitle } from '../../app/panelRegistry';
+import { getPanelTitle, type PanelDefinition } from '../../app/panelRegistry';
 import { orderAgents, type AgentRailView } from '../../app/useAgentRailPreferences';
 import { minionTree, type MinionNode } from './minionTree';
 import { childStreamId } from '../../app/useRuntimeSelection';
@@ -47,6 +48,7 @@ export type WorkspacePanelContext = {
 
 export function WorkspaceRail({
   collapsed,
+  panels,
   topPanel,
   bottomPanel,
   singlePanel,
@@ -59,6 +61,7 @@ export function WorkspaceRail({
   onSplitChange,
 }: {
   collapsed: boolean;
+  panels?: readonly PanelDefinition[];
   topPanel: PanelId;
   bottomPanel: PanelId;
   singlePanel?: PanelId;
@@ -82,7 +85,7 @@ export function WorkspaceRail({
       ) : (
         <>
           <div className="rail-head">
-            <span>{getPanelTitle(fullPanel)}</span>
+            <span>{getPanelTitle(fullPanel, panels)}</span>
             <button onClick={onCollapse} aria-label="Collapse left rail">
               <Chevron direction="left" />
             </button>
@@ -121,7 +124,7 @@ export function WorkspaceRail({
                 />
                 <section className="rail-panel bottom">
                   <div className="rail-head">
-                    <span>{getPanelTitle(bottomPanel)}</span>
+                    <span>{getPanelTitle(bottomPanel, panels)}</span>
                   </div>
                   {renderPanel(bottomPanel)}
                 </section>
@@ -135,6 +138,7 @@ export function WorkspaceRail({
 }
 
 export function AgentsPanel({
+  ownerModId,
   agents,
   view = 'regular',
   order = [],
@@ -151,11 +155,16 @@ export function AgentsPanel({
   | 'onToggleAgent'
   | 'onSelectAgent'
   | 'onSelectSubagent'
-> & { view?: AgentRailView; order?: string[] }) {
-  const orderedAgents = orderAgents(enabledAgents(agents), order);
+> & { ownerModId?: string; view?: AgentRailView; order?: string[] }) {
+  const orderedAgents = orderAgents(chatAgents(agents), order);
+  const members = orderedAgents.filter((agent) =>
+    ownerModId
+      ? agent.modAgent?.ownerModId === ownerModId && agent.modAgent.visibility.agents === false
+      : agent.modAgent?.visibility.agents !== false,
+  );
   return (
     <section className={`agent-pane ${view === 'compact' ? 'compact' : ''}`}>
-      {orderedAgents.map((agent) => (
+      {members.map((agent) => (
         <AgentCard
           key={agent.id}
           agent={agent}
@@ -322,12 +331,9 @@ function AgentCard({
   onSelectSubagent: (id: string) => void;
 }) {
   const selected = selectedStreamId === agent.id;
-  const childSelected = agent.subagents.some(
-    (child) => selectedStreamId === childStreamId(agent.id, child.resourceId ?? child.id),
-  );
   return (
-    <div className={`agent-group ${selected || childSelected ? 'active' : ''}`}>
-      <div className="agent-card">
+    <div className="agent-group">
+      <div className={`agent-card ${selected ? 'active' : ''}`}>
         <button
           type="button"
           className="agent-select"
@@ -387,6 +393,14 @@ function AgentMinions({
   selectedStreamId: string;
   onSelect: (id: string) => void;
 }) {
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const toggle = (id: string) =>
+    setCollapsed((previous) => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   const coverageNotice =
     agent.minionCoverage === 'stale'
       ? 'Minion status unavailable · showing last seen'
@@ -399,6 +413,8 @@ function AgentMinions({
     <>
       {coverageNotice && <div className="minion-scope-notice">{coverageNotice}</div>}
       <MinionList
+        collapsed={collapsed}
+        onToggle={toggle}
         nodes={minionTree(agent.subagents)}
         agentId={agent.id}
         selectedStreamId={selectedStreamId}
@@ -409,12 +425,16 @@ function AgentMinions({
 }
 
 function MinionList({
+  collapsed,
+  onToggle,
   nodes,
   agentId,
   selectedStreamId,
   onSelect,
   level = 1,
 }: {
+  collapsed: Set<string>;
+  onToggle: (id: string) => void;
   nodes: MinionNode[];
   agentId: string;
   selectedStreamId: string;
@@ -429,28 +449,45 @@ function MinionList({
         const selected = selectedStreamId === selectionId;
         return (
           <li key={minion.id}>
-            <button
-              type="button"
-              className={`subagent-row ${selected ? 'active' : ''}`}
-              onClick={() => onSelect(minion.id)}
-              aria-label={`Select ${minion.name}`}
-              aria-pressed={selected}
-            >
-              <span className="subagent-copy">
-                <b title={minion.name}>{minion.name}</b>
-                <small>
-                  {minion.retained ? 'Last seen · ' : ''}
-                  {minion.activity}
-                </small>
-              </span>
-            </button>
-            <MinionList
-              nodes={children}
-              agentId={agentId}
-              selectedStreamId={selectedStreamId}
-              onSelect={onSelect}
-              level={level + 1}
-            />
+            <div className="subagent-line">
+              <button
+                type="button"
+                className={`subagent-row ${selected ? 'active' : ''}`}
+                onClick={() => onSelect(minion.id)}
+                aria-label={`Select ${minion.name}`}
+                aria-pressed={selected}
+              >
+                <span className="subagent-copy">
+                  <b title={minion.name}>{minion.name}</b>
+                  <small>
+                    {minion.retained ? 'Last seen · ' : ''}
+                    {minion.activity}
+                  </small>
+                </span>
+              </button>
+              {children.length > 0 && (
+                <button
+                  type="button"
+                  className="agent-toggle"
+                  onClick={() => onToggle(minion.id)}
+                  aria-label={`${collapsed.has(minion.id) ? 'Expand' : 'Collapse'} ${minion.name}`}
+                  aria-expanded={!collapsed.has(minion.id)}
+                >
+                  <Chevron direction="right" />
+                </button>
+              )}
+            </div>
+            {!collapsed.has(minion.id) && (
+              <MinionList
+                collapsed={collapsed}
+                onToggle={onToggle}
+                nodes={children}
+                agentId={agentId}
+                selectedStreamId={selectedStreamId}
+                onSelect={onSelect}
+                level={level + 1}
+              />
+            )}
           </li>
         );
       })}
@@ -467,23 +504,7 @@ function ContextUsage({
   details?: Agent['contextDetails'];
   compact?: boolean;
 }) {
-  const capacity = details?.capacityTokens
-    ? ` of ${details.capacityTokens.toLocaleString()} tokens`
-    : '';
-  const estimate =
-    details?.estimatedTokens === null
-      ? 'Estimate unavailable'
-      : details?.estimatedTokens !== undefined
-        ? `${details.estimatedTokens.toLocaleString()} tokens`
-        : '';
-  const pressure = details?.pressure ? `Pressure: ${details.pressure}.` : '';
-  const compaction = details?.compactionActive
-    ? `Compaction enabled${details.rawRecentTurnCount !== null && details.rawRecentTurnCount !== undefined ? `; ${details.rawRecentTurnCount} recent turns kept raw` : ''}.`
-    : '';
-  const label =
-    value === null
-      ? 'Context capacity unavailable.'
-      : `${value}% context used${capacity}. ${estimate}. ${pressure} ${compaction}`.trim();
+  const label = contextUsageLabel(value, details);
   return (
     <span
       className={`context-usage ${compact ? 'compact' : ''} ${details?.pressure ? `pressure-${details.pressure}` : ''}`}

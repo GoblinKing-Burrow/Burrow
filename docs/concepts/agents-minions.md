@@ -4,7 +4,6 @@
 !!! note "Source review and historical material"
     This technical reference was reconciled statically with current implementation on **1 November 2026**. Explicit historical examples, screenshots and pinned public links remain historical; they are not evidence of current runtime acceptance. Start with the [current operator guide](../guide/installation.md) for installation and check your installed build before using newer capabilities.
 
-
 Use a registered agent for a persistent identity and configuration. Use a minion for an explicit child task. Use peer messaging when one registered agent needs another agent's response in that recipient's own context.
 
 ## Registered agents
@@ -74,7 +73,6 @@ Local minions use a separate Node process. A remote-assigned minion uses the chi
 !!! warning "Isolation is about session/process context"
     A minion target is not a filesystem cage. An instruction such as “do not modify files” communicates task scope, but the target directory does not remove mutation tools. Configured execution boundaries are forwarded into child review and execution; they retain the limited enforcement scope described in [Permissions](../security/permissions.md#minion-boundary-propagation).
 
-
 ### Completion and evidence
 
 ```mermaid
@@ -114,7 +112,7 @@ The directory returns only exact `{id, name, enabled}` cards, with enabled agent
 | `request_reply` | Execute one recipient response and mirror the response back; the sender may deliberately message again |
 | `request_reply_complete` | Execute one recipient response, mirror it back, and remove peer messaging from the sender's continuation tool surface |
 
-The default mode is `request_reply`. Current Core routes new implicit deliveries to `default` when the recipient's **A2A in default** preference is on (the default), or to `a2a` when off. Explicit target sessions and runtime-attested reply routes take precedence; changing the preference does not redirect an exchange already in flight. Self-send is rejected. Concurrent reply requests to the same recipient session are serialized, and wait-graph cycles are rejected before new transcript ingress. Reply-mode deliveries use durable claims to reuse terminal results on exact retries rather than wake the recipient twice; cancellation is checked before queued ingress and execution.
+The default mode is `request_reply`. Current Core routes new implicit deliveries to `default` when the recipient's **A2A in default** preference is on (the default), or to the recipient's reusable `a2a-<canonical-sender-id>` inbox when off. Explicit target sessions and runtime-attested reply routes take precedence; changing the preference does not redirect an exchange already in flight. Self-send is rejected. Concurrent reply requests to the same recipient session are serialized, and wait-graph cycles are rejected before new transcript ingress. Reply-mode deliveries use durable claims to reuse terminal results on exact retries rather than wake the recipient twice; cancellation is checked before queued ingress and execution.
 
 ```json
 {
@@ -161,3 +159,11 @@ Changed contracts above were checked statically against Backend `4057b50a5d5a9b1
 `POST /api/agents/overview` accepts `minionScope: "agent"` to return the requested anchor and visible Minions across that agent's sessions; omitted scope remains `session`. A successful `status.minionScope: "agent"` confirms that broader coverage. An older response without that marker proves only session-scoped coverage. Context hydration is separately bounded to the anchor plus 12 distinct child sessions; omitted contexts do not hide status rows. This does not broaden cancellation, recovery, or `/api/agent-status`.
 
 Live and Archive child turns retain compact source-authored delegation metadata. A `role: user` child task with `kind: subagent-delegated-task` is delegated work, not a fresh operator instruction. Missing legacy markers do not prove operator authorship; arbitrary raw metadata is not passed through. The UI uses retained source information for truthful sender labels.
+
+## Reusable peer inboxes
+
+Dedicated peer inboxes are created on first implicit contact, not when toggling the preference. Each peer has its own reply lane, continuity family and rotation lifecycle; requests from that same peer stay ordered across source sessions. Labels refresh on later contact after a rename, but the canonical session ID does not change. Existing shared `a2a` history is retained and remains explicitly addressable; new implicit traffic does not migrate, rename or rotate it. `/api/sessions` exposes `label` and `a2aPeerAgentId`; session detail retains them in `metadata`.
+
+## Mod-owned native peers
+
+Current Core can expose a mod-owned agent through native A2A only when its `a2a` capability is enabled and its owning context provider is live. `agents_list` filters these peers accordingly; `agent_send_message` rechecks both participants before dispatch. A display name or retained directory result is not proof that a provider is still available. This remains native same-Core routing, independent of Backdoor discovery. See [the host contract](../development/extensions.md#mod-owned-native-agents). Statically reviewed against Core `32dde3266a231777ddfec6dba141d6b9972a21fd` on **3 November 2026**.

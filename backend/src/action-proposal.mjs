@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { forgeToolSchemas } from './forge-agent-tools.mjs';
 
-export const ALLOWED_TOOLS = new Set(['run_evidence_search','brain_search','brain_read','brain_save','brain_update','brain_remove', 'shell_exec', 'files_read', 'files_list', 'files_find', 'files_inspect', 'files_search', 'files_edit', 'git_status', 'git_diff', 'session_search', 'session_read_handoff', 'attachment_view', 'memory_working_search', 'memory_rolling_search', 'memory_working_write', 'session_write_handoff', 'tasks_list', 'tasks_create', 'tasks_update', 'tasks_assign', 'tasks_delete', 'agent_update_tools_profile', 'scheduled_jobs_list', 'scheduled_jobs_read', 'scheduled_jobs_create', 'scheduled_jobs_update', 'scheduled_jobs_delete', 'scheduled_job_runs', 'scheduled_jobs_run_now', 'files_write', 'files_patch', 'spawn_subagent', 'agents_list', 'agent_send_message', 'mcp_providers', 'mcp_capabilities', 'mcp_call', 'forge_catalog', 'forge_create_job', 'forge_list_jobs', 'forge_inspect_job', 'forge_attach_artifact', 'list_skills', 'load_skill']);
+export const ALLOWED_TOOLS = new Set(['mod_agent_tool', 'run_evidence_search','brain_search','brain_read','brain_save','brain_update','brain_remove', 'shell_exec', 'files_read', 'files_list', 'files_find', 'files_inspect', 'files_search', 'files_edit', 'git_status', 'git_diff', 'session_search', 'session_read_handoff', 'attachment_view', 'memory_working_search', 'memory_rolling_search', 'memory_working_write', 'session_write_handoff', 'tasks_list', 'tasks_create', 'tasks_update', 'tasks_assign', 'tasks_delete', 'agent_update_tools_profile', 'scheduled_jobs_list', 'scheduled_jobs_read', 'scheduled_jobs_create', 'scheduled_jobs_update', 'scheduled_jobs_delete', 'scheduled_job_runs', 'scheduled_jobs_run_now', 'files_write', 'files_patch', 'spawn_subagent', 'agents_list', 'agent_send_message', 'mcp_providers', 'mcp_capabilities', 'mcp_call', 'forge_catalog', 'forge_create_job', 'forge_list_jobs', 'forge_inspect_job', 'forge_attach_artifact', 'list_skills', 'load_skill']);
 
 const TARGET_KIND_ALIASES = new Map([
   ['filesystem', 'filesystem'],
@@ -124,9 +124,16 @@ function normalizeAction(action, index) {
     mcpProvider: action?.provider ? String(action.provider).trim() : null,
     mcpToolName: action?.mcpToolName ? String(action.mcpToolName).trim() : null,
     mcpArguments: action?.mcpArguments && typeof action.mcpArguments === 'object' && !Array.isArray(action.mcpArguments) ? action.mcpArguments : {},
+    // Preserve the owner's complete nested input, including arbitrary keys and
+    // value types. It is validated by the owning host against its live schema.
+    ...(tool === 'mod_agent_tool' ? {
+      modToolName: action?.modToolName === undefined ? action?.name : action.modToolName,
+      modToolArguments: action?.modToolArguments === undefined ? action?.arguments : action.modToolArguments,
+    } : {}),
     jobId: action?.jobId ? String(action.jobId).trim() : null,
     artifactId: action?.artifactId ? String(action.artifactId).trim() : null,
     useAgentReferenceImage: action?.useAgentReferenceImage,
+    useOperatorReferenceImage: action?.useOperatorReferenceImage,
     referenceAgentIds: action?.referenceAgentIds,
     forgeMode: action?.mode ? String(action.mode).trim() : null,
     forgeConnectionId: action?.connectionId ? String(action.connectionId).trim() : null,
@@ -197,6 +204,10 @@ function normalizeAction(action, index) {
   if (tool === 'mcp_capabilities' && !normalized.mcpProvider) errors.push('mcp_provider_required');
   if (tool === 'mcp_call' && !normalized.mcpProvider) errors.push('mcp_provider_required');
   if (tool === 'mcp_call' && !normalized.mcpToolName) errors.push('mcp_tool_name_required');
+  if (tool === 'mod_agent_tool') {
+    if (typeof normalized.modToolName !== 'string' || !normalized.modToolName.trim()) errors.push('mod_tool_name_required');
+    if (!normalized.modToolArguments || typeof normalized.modToolArguments !== 'object' || Array.isArray(normalized.modToolArguments)) errors.push('mod_tool_arguments_object_required');
+  }
   if (tool === 'agents_list') {
     if (action?.query != null && (typeof action.query !== 'string' || action.query.length > 96)) errors.push('query_must_be_string_max_96');
     if (action?.cursor != null && (typeof action.cursor !== 'string' || action.cursor.length > 512)) errors.push('cursor_invalid');
@@ -490,6 +501,11 @@ export function actionFromNativeToolCall(call = {}, index = 0) {
   // Preserve provider call identity for every native tool. Remote execution
   // derives its stable operation identity from this runtime metadata.
   const normalizeNative = (action) => normalizeAction({ ...action, toolCallId: call.id }, index);
+  if (tool === 'mod_agent_tool') {
+    const action = normalizeNative({ tool, modToolName: args.name, modToolArguments: args.arguments });
+    if (!call.arguments || typeof call.arguments !== 'object' || Array.isArray(call.arguments) || Object.keys(args).some(key => !['name', 'arguments'].includes(key))) action.errors.push('mod_tool_envelope_invalid');
+    return action;
+  }
   if (tool?.startsWith('brain_')) return normalizeNative({tool,...args});
   if (tool === 'shell_exec') return normalizeNative({ tool, reason: args.reason, command: args.command, cwd: args.cwd, protectedBindings: args.protectedBindings });
   if (tool === 'files_read') return normalizeNative({ tool, reason: args.reason, filePath: args.filePath, offsetBytes: args.offsetBytes, maxBytes: args.maxBytes });
@@ -521,7 +537,7 @@ export function actionFromNativeToolCall(call = {}, index = 0) {
   if (tool === 'agents_list') return normalizeNative({ tool, reason: args.reason, query: args.query, includeDisabled: args.includeDisabled, cursor: args.cursor, limit: args.limit });
   if (tool === 'agent_send_message') return normalizeNative({ tool, reason: args.reason, recipientAgentId: args.recipientAgentId, targetSessionId: args.targetSessionId, messageMode: args.messageMode, content: args.content });
   if (tool === 'forge_catalog' || tool === 'forge_list_jobs') return normalizeNative({ tool, reason: args.reason });
-  if (tool === 'forge_create_job') return normalizeNative({ tool, reason: args.reason, mode: args.mode, connectionId: args.connectionId, modelId: args.modelId, prompt: args.prompt, idempotencyKey: args.idempotencyKey, useAgentReferenceImage: args.useAgentReferenceImage, referenceAgentIds: args.referenceAgentIds });
+  if (tool === 'forge_create_job') return normalizeNative({ tool, reason: args.reason, mode: args.mode, connectionId: args.connectionId, modelId: args.modelId, prompt: args.prompt, idempotencyKey: args.idempotencyKey, useAgentReferenceImage: args.useAgentReferenceImage, useOperatorReferenceImage: args.useOperatorReferenceImage, referenceAgentIds: args.referenceAgentIds });
   if (tool === 'forge_inspect_job') return normalizeNative({ tool, reason: args.reason, jobId: args.jobId });
   if (tool === 'forge_attach_artifact') return normalizeNative({ tool, reason: args.reason, jobId: args.jobId, artifactId: args.artifactId });
   if (tool === 'mcp_providers') return normalizeNative({ tool, reason: args.reason });

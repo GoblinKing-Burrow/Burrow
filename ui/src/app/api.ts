@@ -58,6 +58,7 @@ export type RuntimeMetrics = {
 };
 
 export type RuntimeAgent = {
+  modAgent?: import('./types').ModAgentMetadata | null;
   id: string;
   name: string;
   enabled: boolean;
@@ -100,7 +101,7 @@ export type ContextStatus = {
     sourceCount?: number;
     searchedSessionCount?: number;
   };
-  context?: {
+  context?: import('./types').ContextEvidence & {
     estimatedTokens?: number | null;
     capacityTokens?: number | null;
     usageRatio?: number | null;

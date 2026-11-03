@@ -18,7 +18,11 @@ import {
 } from './SettingsContribution';
 import { Field, SettingSection } from './SettingsPrimitives';
 
-export type ModSettingsSection = { id: string; label: string };
+export type ModSettingsSection = {
+  id: string;
+  label: string;
+  layout?: SettingsContribution['sections'][number]['layout'];
+};
 type MountResult =
   | void
   | (() => void)
@@ -29,6 +33,7 @@ export type SettingsSurface = {
   clear: () => void;
 };
 type ModSettingsContext = {
+  selectedAgentId?: string;
   modId: string;
   runtimeScope: 'local';
   section: string;
@@ -530,7 +535,13 @@ function validSections(value: unknown): ModSettingsSection[] {
     )
       return [];
     seen.add(item.id);
-    return [{ id: item.id, label: item.label.trim() }];
+    return [
+      {
+        id: item.id,
+        label: item.label.trim(),
+        ...(item.layout === 'form-inventory' ? { layout: 'form-inventory' as const } : {}),
+      },
+    ];
   });
 }
 
@@ -562,6 +573,7 @@ function settingsFactoryContext(modId: string, agents: readonly Agent[]) {
 }
 
 export function ModSettingsHost({
+  selectedAgentId,
   modId,
   settingsUrl,
   agents,
@@ -571,6 +583,7 @@ export function ModSettingsHost({
   selectedSectionId,
   onSectionChange,
 }: {
+  selectedAgentId?: string;
   modId: string;
   settingsUrl: string;
   agents: Agent[];
@@ -681,6 +694,7 @@ export function ModSettingsHost({
     const navigationCancellations = new Set<() => void>();
     const context: ModSettingsContext = {
       modId,
+      selectedAgentId,
       runtimeScope: 'local',
       section,
       agents: agentsRef.current,
@@ -755,8 +769,34 @@ export function ModSettingsHost({
       node.replaceChildren();
       overflowNode?.replaceChildren();
     };
-  }, [module, contribution, section, modId, overflowTarget, confirm, navigate, createDraft]);
+  }, [
+    module,
+    contribution,
+    section,
+    selectedAgentId,
+    modId,
+    overflowTarget,
+    confirm,
+    navigate,
+    createDraft,
+  ]);
 
+  // Semantic layout metadata, not a new surface: imperative portal targets must
+  // keep their identity when sections change or a contribution refreshes.
+  const activeDefinition = contribution?.sections.find((item) => item.id === section);
+  const hasDeclarativeContent = Boolean(
+    activeDefinition &&
+      (activeDefinition.layout === 'form'
+        ? activeDefinition.fields?.length || activeDefinition.actions?.length
+        : activeDefinition.items?.length),
+  );
+  const surfaceLayout =
+    activeDefinition && (hasDeclarativeContent || !module?.mountSettings)
+      ? activeDefinition.layout
+      : 'imperative';
+  const imperativeLayout = !hasDeclarativeContent
+    ? validSections(module?.settingsSections).find((item) => item.id === section)?.layout
+    : undefined;
   return (
     <>
       {navigationTarget &&
@@ -787,8 +827,13 @@ export function ModSettingsHost({
           </p>
         </section>
       )}
-      <div ref={primaryRef} className="mod-settings-mount" data-mod-id={modId}>
-        {contribution && (
+      <div
+        ref={primaryRef}
+        className="mod-settings-mount"
+        data-mod-id={modId}
+        data-settings-layout={imperativeLayout ?? surfaceLayout}
+      >
+        {contribution && surfaceLayout !== 'imperative' && (
           <DeclarativeSection
             key={section}
             contribution={contribution}
