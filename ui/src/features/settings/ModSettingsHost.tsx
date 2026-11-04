@@ -1,3 +1,5 @@
+import { SettingsEntitySelector, type SettingsEntityItem } from './SettingsEntitySelector';
+import { optimizeAvatar } from './OperatorProfile';
 import { enabledAgents } from '../../app/agentCatalog';
 import { useConfirm } from '../../app/ConfirmDialog';
 import {
@@ -21,7 +23,7 @@ import { Field, SettingSection } from './SettingsPrimitives';
 export type ModSettingsSection = {
   id: string;
   label: string;
-  layout?: SettingsContribution['sections'][number]['layout'];
+  layout?: SettingsContribution['sections'][number]['layout'] | 'form-wide' | 'document';
 };
 type MountResult =
   | void
@@ -32,7 +34,16 @@ export type SettingsSurface = {
   replaceChildren: (...content: Node[]) => void;
   clear: () => void;
 };
+export type ModEntitySelector = {
+  label: string;
+  items: readonly SettingsEntityItem[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+  addLabel?: string;
+  onAdd?: () => void;
+};
 type ModSettingsContext = {
+  setEntitySelector: (selector: ModEntitySelector | null) => void;
   selectedAgentId?: string;
   modId: string;
   runtimeScope: 'local';
@@ -42,11 +53,13 @@ type ModSettingsContext = {
   overflow: SettingsSurface | null;
   confirm: ReturnType<typeof useConfirm>;
   navigate: (proceed: () => void) => void;
+  navigateSection: (sectionId: string, beforeNavigate?: () => void) => void;
   setDraft: (draft: UnsavedDraft | null) => void;
   api: <T = unknown>(path: string, init?: RequestInit) => Promise<T>;
   fetchContent: (path: string, init?: RequestInit) => Promise<Response>;
   accessApi: <T = unknown>(init?: RequestInit) => Promise<T>;
   refreshAgents: () => Promise<void>;
+  optimizeAvatar: typeof optimizeAvatar;
   saveAgentExecutionEnvironment: (
     agentId: string,
     executionEnvironment: Agent['executionEnvironment'],
@@ -539,7 +552,14 @@ function validSections(value: unknown): ModSettingsSection[] {
       {
         id: item.id,
         label: item.label.trim(),
-        ...(item.layout === 'form-inventory' ? { layout: 'form-inventory' as const } : {}),
+        ...(item.layout === 'form' ||
+        item.layout === 'form-wide' ||
+        item.layout === 'document' ||
+        item.layout === 'form-inventory'
+          ? {
+              layout: item.layout as 'form' | 'form-wide' | 'form-inventory' | 'document',
+            }
+          : {}),
       },
     ];
   });
@@ -580,6 +600,8 @@ export function ModSettingsHost({
   onAgentsChanged,
   navigationTarget,
   overflowTarget,
+  selectorTarget,
+  onSelectorVisibilityChange,
   selectedSectionId,
   onSectionChange,
 }: {
@@ -590,6 +612,8 @@ export function ModSettingsHost({
   onAgentsChanged: () => Promise<void>;
   navigationTarget: HTMLElement | null;
   overflowTarget: HTMLElement | null;
+  selectorTarget?: HTMLElement | null;
+  onSelectorVisibilityChange?: (visible: boolean) => void;
   selectedSectionId?: string;
   onSectionChange?: (sectionId: string) => void;
 }) {
@@ -602,8 +626,20 @@ export function ModSettingsHost({
   const [sections, setSections] = useState<ModSettingsSection[]>([]);
   const [section, setSection] = useState('');
   const [error, setError] = useState('');
+  const [entitySelector, setEntitySelector] = useState<ModEntitySelector | null>(null);
+  // The header belongs to the loaded settings owner, not an individual section.
+  // Keep its DOM/scroll position while the next section publishes fresh callbacks.
+  useEffect(() => {
+    setEntitySelector(null);
+  }, [settingsUrl, modId, selectedAgentId]);
+  useEffect(() => {
+    onSelectorVisibilityChange?.(Boolean(entitySelector));
+    return () => onSelectorVisibilityChange?.(false);
+  }, [Boolean(entitySelector), onSelectorVisibilityChange]);
   const agentsRef = useRef(agents);
   const onAgentsChangedRef = useRef(onAgentsChanged);
+  const onSectionChangeRef = useRef(onSectionChange);
+  onSectionChangeRef.current = onSectionChange;
   agentsRef.current = agents;
   onAgentsChangedRef.current = onAgentsChanged;
 
@@ -670,7 +706,11 @@ export function ModSettingsHost({
           ? definition.fields?.length || definition.actions?.length
           : definition.items?.length),
     );
-    if (hasDeclarativeContent || !module?.mountSettings || !primary || !section) return;
+    if (hasDeclarativeContent || !module?.mountSettings) {
+      setEntitySelector(null);
+      return;
+    }
+    if (!primary || !section) return;
     const node = document.createElement('div');
     node.className = 'mod-settings-surface';
     primary.replaceChildren(node);
@@ -693,6 +733,26 @@ export function ModSettingsHost({
     const draft = createDraft();
     const navigationCancellations = new Set<() => void>();
     const context: ModSettingsContext = {
+      setEntitySelector: (selector) => {
+        if (disposed) return;
+        // Wrap callbacks in this mount's lifetime; a retired async mount must
+        // never replace the next resident's selector or run its callbacks.
+        setEntitySelector(
+          selector
+            ? {
+                ...selector,
+                onSelect: (id) => {
+                  if (!disposed) selector.onSelect(id);
+                },
+                onAdd: selector.onAdd
+                  ? () => {
+                      if (!disposed) selector.onAdd!();
+                    }
+                  : undefined,
+              }
+            : null,
+        );
+      },
       modId,
       selectedAgentId,
       runtimeScope: 'local',
@@ -716,6 +776,14 @@ export function ModSettingsHost({
         });
         if (!completed) navigationCancellations.add(cancel);
       },
+      navigateSection: (sectionId, beforeNavigate) => {
+        if (disposed || !sections.some((item) => item.id === sectionId)) return;
+        context.navigate(() => {
+          beforeNavigate?.();
+          setSection(sectionId);
+          onSectionChangeRef.current?.(sectionId);
+        });
+      },
       setDraft: draft.setDraft,
       api: modApi(modId),
       fetchContent: (path, init = {}) => {
@@ -738,6 +806,7 @@ export function ModSettingsHost({
       },
       accessApi: modAccessApi(modId),
       refreshAgents: () => onAgentsChangedRef.current(),
+      optimizeAvatar,
       saveAgentExecutionEnvironment: async (agentId, executionEnvironment) => {
         await apiLocal(`/api/agents/${encodeURIComponent(agentId)}`, {
           method: 'PATCH',
@@ -756,11 +825,15 @@ export function ModSettingsHost({
         else cleanup = candidate;
       })
       .catch((cause) => {
-        if (!disposed)
+        if (!disposed) {
+          setEntitySelector(null);
           setError(cause instanceof Error ? cause.message : 'Could not mount mod settings.');
+        }
       });
     return () => {
       disposed = true;
+      // Retired callbacks are already guarded by `disposed`. Do not remove the
+      // header between same-owner sections while their data loads.
       navigationCancellations.forEach((cancel) => cancel());
       draft.dispose();
       node.remove();
@@ -799,6 +872,41 @@ export function ModSettingsHost({
     : undefined;
   return (
     <>
+      {entitySelector &&
+        (selectorTarget ? (
+          createPortal(
+            <SettingsEntitySelector
+              label={entitySelector.label}
+              noun={entitySelector.label.toLowerCase()}
+              items={entitySelector.items}
+              selectedId={entitySelector.selectedId}
+              onSelect={entitySelector.onSelect}
+              action={
+                entitySelector.onAdd && entitySelector.addLabel ? (
+                  <button type="button" className="primary" onClick={entitySelector.onAdd}>
+                    {entitySelector.addLabel}
+                  </button>
+                ) : undefined
+              }
+            />,
+            selectorTarget,
+          )
+        ) : (
+          <SettingsEntitySelector
+            label={entitySelector.label}
+            noun={entitySelector.label.toLowerCase()}
+            items={entitySelector.items}
+            selectedId={entitySelector.selectedId}
+            onSelect={entitySelector.onSelect}
+            action={
+              entitySelector.onAdd && entitySelector.addLabel ? (
+                <button type="button" className="primary" onClick={entitySelector.onAdd}>
+                  {entitySelector.addLabel}
+                </button>
+              ) : undefined
+            }
+          />
+        ))}
       {navigationTarget &&
         createPortal(
           <nav
@@ -845,9 +953,9 @@ export function ModSettingsHost({
                 await module.handleSettingsAction(actionId, values);
                 if (module?.createSettingsContribution) {
                   try {
-                    const { agents: currentAgents } = await apiLocal<{ agents: Agent[] }>(
-                      '/api/agents',
-                    );
+                    const { agents: currentAgents } = await apiLocal<{
+                      agents: Agent[];
+                    }>('/api/agents');
                     const refreshed = validateSettingsContribution(
                       await module.createSettingsContribution(
                         settingsFactoryContext(modId, enabledAgents(currentAgents)),

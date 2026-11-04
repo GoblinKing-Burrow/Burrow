@@ -22,7 +22,8 @@
   .settings-content-workspace.settings-content-normalized:has(
     .mod-settings-mount:is(
       [data-settings-layout='form-inventory'],
-      [data-settings-layout='list-detail']
+      [data-settings-layout='list-detail'],
+      [data-settings-layout='document']
     )
   ) {
   grid-template-columns: clamp(240px, 24%, 320px) minmax(0, 1fr);
@@ -112,19 +113,28 @@
 /* File selectors remain horizontal in narrow workspaces, vertical beside the
    editor when there is room. This replaces viewport-only statistics rules. */
 .settings-blank-slate.settings-fidgit
-  .settings-content-normalized.settings-family-documents
+  .settings-content-normalized:is(
+    .settings-family-documents,
+    :has(.mod-settings-mount[data-settings-layout='document'])
+  )
   .profile-document-selector {
   display: flex;
   overflow-x: auto;
 }
 .settings-blank-slate.settings-fidgit
-  .settings-content-normalized.settings-family-documents
+  .settings-content-normalized:is(
+    .settings-family-documents,
+    :has(.mod-settings-mount[data-settings-layout='document'])
+  )
   .profile-document-selector
   button {
   flex: 0 0 auto;
 }
 .settings-blank-slate.settings-fidgit
-  .settings-content-normalized.settings-family-documents
+  .settings-content-normalized:is(
+    .settings-family-documents,
+    :has(.mod-settings-mount[data-settings-layout='document'])
+  )
   > .settings-prototype-overflow {
   align-content: stretch;
 }
@@ -133,14 +143,22 @@
    does not use the supporting target. No target ref is replaced. */
 .settings-blank-slate.settings-fidgit
   .settings-content-normalized:has(
-    .mod-settings-mount:is([data-settings-layout='form'], [data-settings-layout='activity'])
+    .mod-settings-mount:is(
+      [data-settings-layout='form'],
+      [data-settings-layout='form-wide'],
+      [data-settings-layout='activity']
+    )
   )
   > .settings-prototype-overflow {
   display: none;
 }
 .settings-blank-slate.settings-fidgit
   .settings-content-normalized:has(
-    .mod-settings-mount:is([data-settings-layout='form'], [data-settings-layout='activity'])
+    .mod-settings-mount:is(
+      [data-settings-layout='form'],
+      [data-settings-layout='form-wide'],
+      [data-settings-layout='activity']
+    )
   )
   > .settings-prototype-configuration {
   border: 0;
@@ -188,7 +206,10 @@
     padding-right: var(--settings-pane-inset, 16px);
   }
   .settings-blank-slate.settings-fidgit
-    .settings-content-normalized.settings-family-documents
+    .settings-content-normalized:is(
+      .settings-family-documents,
+      :has(.mod-settings-mount[data-settings-layout='document'])
+    )
     .profile-document-selector {
     display: grid;
     overflow: visible;
@@ -220,7 +241,8 @@
     .settings-content-workspace.settings-content-normalized:has(
       .mod-settings-mount:is(
         [data-settings-layout='form-inventory'],
-        [data-settings-layout='list-detail']
+        [data-settings-layout='list-detail'],
+        [data-settings-layout='document']
       )
     )
     > .settings-blank-column {
@@ -292,4 +314,68 @@
   .setting-actions
   button {
   width: auto;
+}
+
+/* Paired sections share one draft and Save; do not constrain them to half a workspace. */
+.settings-blank-slate.settings-fidgit
+  .settings-content-normalized:has(.mod-settings-mount[data-settings-layout='form-wide'])
+  > .settings-prototype-configuration {
+  grid-column: 1 / -1;
+  border: 0;
+}
+.settings-section-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--settings-pane-gap, 20px);
+  min-width: 0;
+}
+@container settings-form (min-width: 640px) {
+  .settings-section-pair {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+}
+
+/* Imperative document contributions use the native selector/editor grammar.
+   Metadata changes pane semantics only; primary/overflow mount nodes survive. */
+.settings-blank-slate.settings-fidgit
+  .settings-content-normalized:has(.mod-settings-mount[data-settings-layout='document'])
+  .profile-document-selector {
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--settings-control-gap, 8px);
+}
+.settings-blank-slate.settings-fidgit
+  .settings-content-normalized:has(.mod-settings-mount[data-settings-layout='document'])
+  .profile-document-selector
+  button {
+  text-align: left;
+  min-width: 0;
+  white-space: normal;
+}
+.settings-blank-slate.settings-fidgit
+  .settings-content-normalized:has(.mod-settings-mount[data-settings-layout='document'])
+  :is(.profile-document-overflow, .profile-document-overflow > .setting-section) {
+  height: 100%;
+  min-height: 0;
+}
+.settings-blank-slate.settings-fidgit
+  .settings-content-normalized:has(.mod-settings-mount[data-settings-layout='document'])
+  .profile-document-overflow
+  .field {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.settings-blank-slate.settings-fidgit
+  .settings-content-normalized:has(.mod-settings-mount[data-settings-layout='document'])
+  .profile-document-overflow
+  textarea {
+  height: 100%;
+  min-height: 0;
+}
+/* The imperative host adds one ownership wrapper around the native editor. */
+.settings-blank-slate.settings-fidgit
+  .settings-content-normalized:has(.mod-settings-mount[data-settings-layout='document'])
+  > .settings-prototype-overflow
+  > .mod-settings-surface {
+  height: 100%;
+  min-height: 0;
 }
