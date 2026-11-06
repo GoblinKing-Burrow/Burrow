@@ -1,3 +1,4 @@
+import { POSTGRES_SESSION_RECALL_NONBLOCKING_SQL } from './postgres-session-recall-nonblocking.mjs';
 import { POSTGRES_SESSION_RETRIEVAL_SQL, searchRecallCandidates, recallNeighbors } from './postgres-session-retrieval.mjs';
 import { POSTGRES_SESSION_RECALL_REPAIRS_SQL } from './postgres-session-recall-repairs.mjs';
 import { POSTGRES_DREAM_WINDOW_SQL } from './postgres-dream-window.mjs';
@@ -660,7 +661,7 @@ UPDATE conversation_entries SET has_payload_id=NULL;
 UPDATE conversation_archive_entries SET has_payload_id=NULL;
 `;
 
-export const POSTGRES_SESSION_FULL_SCHEMA_SQL = POSTGRES_SESSION_SCHEMA_SQL + POSTGRES_SESSION_ARCHIVE_SCHEMA_SQL + POSTGRES_SESSION_LOSSLESS_JSON_SCHEMA_SQL + POSTGRES_SESSION_OPERATOR_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_ROWS_SCHEMA_SQL + POSTGRES_SESSION_SEARCH_SCHEMA_SQL + POSTGRES_SESSION_NATIVE_SCHEMA_SQL + POSTGRES_SESSION_METADATA_SCHEMA_SQL + POSTGRES_SESSION_ASCII_SEARCH_SCHEMA_SQL + POSTGRES_CONTINUITY_STATE_SCHEMA_SQL + POSTGRES_RESET_INSTANT_SQL + POSTGRES_HISTORY_KEYSET_SQL + POSTGRES_LOGICAL_MEMBER_SQL + POSTGRES_ARCHIVE_RELATIONAL_ID_SQL + POSTGRES_CATALOG_SCALAR_ID_SQL + POSTGRES_LOGICAL_LOOKUP_INDEX_SQL + POSTGRES_AGENT_DELIVERY_SCHEMA_SQL + POSTGRES_AGENT_DELIVERY_OWNER_SQL + POSTGRES_OPERATOR_INSTANT_SQL + POSTGRES_ARCHIVE_LISTING_INDEX_SQL + POSTGRES_COMPACTION_PROJECTIONS_SQL + POSTGRES_ARCHIVE_LEXICAL_SQL + POSTGRES_ARCHIVE_CHAT_PROJECTION_SQL + POSTGRES_ARCHIVE_DISCOVERY_INDEX_SQL + POSTGRES_CHAT_RESULT_PROJECTION_SQL + POSTGRES_RESET_PROJECTIONS_SQL + POSTGRES_DREAM_WINDOW_SQL + POSTGRES_SESSION_RETRIEVAL_SQL + POSTGRES_SESSION_RECALL_REPAIRS_SQL;
+export const POSTGRES_SESSION_FULL_SCHEMA_SQL = POSTGRES_SESSION_SCHEMA_SQL + POSTGRES_SESSION_ARCHIVE_SCHEMA_SQL + POSTGRES_SESSION_LOSSLESS_JSON_SCHEMA_SQL + POSTGRES_SESSION_OPERATOR_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_LOOKUP_SCHEMA_SQL + POSTGRES_SESSION_ORIGINAL_ROWS_SCHEMA_SQL + POSTGRES_SESSION_SEARCH_SCHEMA_SQL + POSTGRES_SESSION_NATIVE_SCHEMA_SQL + POSTGRES_SESSION_METADATA_SCHEMA_SQL + POSTGRES_SESSION_ASCII_SEARCH_SCHEMA_SQL + POSTGRES_CONTINUITY_STATE_SCHEMA_SQL + POSTGRES_RESET_INSTANT_SQL + POSTGRES_HISTORY_KEYSET_SQL + POSTGRES_LOGICAL_MEMBER_SQL + POSTGRES_ARCHIVE_RELATIONAL_ID_SQL + POSTGRES_CATALOG_SCALAR_ID_SQL + POSTGRES_LOGICAL_LOOKUP_INDEX_SQL + POSTGRES_AGENT_DELIVERY_SCHEMA_SQL + POSTGRES_AGENT_DELIVERY_OWNER_SQL + POSTGRES_OPERATOR_INSTANT_SQL + POSTGRES_ARCHIVE_LISTING_INDEX_SQL + POSTGRES_COMPACTION_PROJECTIONS_SQL + POSTGRES_ARCHIVE_LEXICAL_SQL + POSTGRES_ARCHIVE_CHAT_PROJECTION_SQL + POSTGRES_ARCHIVE_DISCOVERY_INDEX_SQL + POSTGRES_CHAT_RESULT_PROJECTION_SQL + POSTGRES_RESET_PROJECTIONS_SQL + POSTGRES_DREAM_WINDOW_SQL + POSTGRES_SESSION_RETRIEVAL_SQL + POSTGRES_SESSION_RECALL_REPAIRS_SQL + POSTGRES_SESSION_RECALL_NONBLOCKING_SQL;
 
 const text = (value) => String(value ?? '');
 const required = (value, name) => { const result = text(value).trim(); if (!result) throw new Error(`${name} is required`); return result; };
@@ -1292,16 +1293,27 @@ export class PostgresSessionStore {
     return { entries, olderCursor: hasMore ? String(entries[0].sequence) : null };
   }
 
-  async projection({ agentId, sessionId, visibility, limit, predicate = null }) {
-    // Never invoke PostgreSQL JSON extraction on the entry: even extracting an
-    // unrelated field decodes escaped NUL and fails with 22P05. Scan newest first
-    // in bounded batches so the limit applies *after* visibility filtering.
+  async projection({ agentId, sessionId, visibility, limit, predicate = null, transactionClient = null, indexedVisibility = false }) {
+    // Display reads use the existing conservative GIN candidate projection, then
+    // compare the visibility scalar before hydrating matching entries.
+    // Validate before native extraction: unrelated NUL/surrogate escapes or
+    // JSONB-incompatible numbers must use the lossless lexical fallback. Both
+    // paths preserve escaped keys/values and JS's last-member semantics. NULL
+    // grams stay eligible. Normal payloads avoid a PL/pgSQL scan of every body.
+    // Keep the older generic path for callers on pre-Archive schemas.
     const aid = required(agentId, 'agentId'); const sid = required(sessionId, 'sessionId');
+    const grams = indexedVisibility ? [...new Set(Array.from({ length: visibility.length - 2 }, (_, i) => visibility.slice(i, i + 3)))] : null;
+    const candidate = indexedVisibility ? `AND (search_grams IS NULL OR search_grams @> $5::text[])
+        AND CASE WHEN search_grams IS NULL OR search_grams @> $5::text[] THEN
+          CASE WHEN pg_input_is_valid(entry::text,'jsonb') THEN entry::jsonb->'visibility'=to_jsonb($6::text)
+            ELSE burrow_history_key((burrow_json_members(entry,ARRAY['visibility']))[1]::text)=burrow_history_text($6) END
+          ELSE false END` : '';
     const size = limitValue(limit); const matches = []; let before = null;
     while (matches.length < size) {
-      const result = await this.pool.query(`SELECT sequence,entry FROM conversation_entries
+      const result = await (transactionClient || this.pool).query(`SELECT sequence,entry FROM conversation_entries
         WHERE agent_id=$1 AND session_id=$2 AND ($3::bigint IS NULL OR sequence<$3::bigint)
-        ORDER BY sequence DESC LIMIT $4`, [aid, sid, before, 256]);
+        ${candidate}
+        ORDER BY sequence DESC LIMIT $4`, [aid, sid, before, 256, ...(indexedVisibility ? [grams, visibility] : [])]);
       for (const row of result.rows) {
         if (row.entry.visibility === visibility && (!predicate || predicate(row.entry))) matches.push(rowEntry(row));
         if (matches.length === size) break;
@@ -1445,6 +1457,17 @@ export class PostgresSessionStore {
   // bounded canonical page has been selected.
   async readArchiveTranscriptPage(args = {}) {
     return readArchiveTranscriptPage(this.pool, args);
+  }
+
+  // Page, live projections and metadata must share one reset-generation snapshot.
+  async readActiveSessionDisplay(args = {}) {
+    return withArchiveRead(this.pool, async transactionClient => {
+      const page = await readArchiveTranscriptPage(this.pool, args, transactionClient);
+      if (!page || page.archiveSnapshot || args.before) return { page, activity: [], liveChat: [] };
+      const activity = await this.projection({ ...args, visibility: 'activity', limit: 20, transactionClient, indexedVisibility: true });
+      const liveChat = await this.projection({ ...args, visibility: 'chat', limit: 200, transactionClient, indexedVisibility: true });
+      return { page, activity, liveChat };
+    }, args);
   }
 
   // Reconstruct a reset's entire conversation without rewriting immutable

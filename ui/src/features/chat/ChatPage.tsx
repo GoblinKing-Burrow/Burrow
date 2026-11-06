@@ -74,8 +74,16 @@ export function ChatModelSelector({
   // still-pending write or move its failure onto a different agent.
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const busyOwners = useRef(new Set<string>());
+  const [temperatureDrafts, setTemperatureDrafts] = useState<
+    Record<string, { value: number; revision: number }>
+  >({});
+  const temperatureRevision = useRef(0);
+  const temperatureDraft = temperatureDrafts[identity];
   const nativeDraft = drafts[identity];
   const savingNative = savingSelection || nativeDraft?.pending === true;
+  // Preserve native disabled guards, but distinguish transient persistence from
+  // a run lock or an unavailable choice for stable save-only styling.
+  const savingOnly = savingNative && !locked;
   const retryNative = nativeDraft?.failed === true;
   const thinkingMode = nativeDraft?.displayPair
     ? (nativeDraft.patch.thinkingMode ?? null)
@@ -95,6 +103,7 @@ export function ChatModelSelector({
     ) ||
     savingNative ||
     Boolean(nativeDraft) ||
+    Boolean(temperatureDraft) ||
     (native && (thinking.modeInvalid || thinking.effortInvalid));
   useLayoutEffect(() => {
     onSelectionBlockedChange?.(blocked);
@@ -127,9 +136,10 @@ export function ChatModelSelector({
   };
   const saveNative = (nextMode: string | null, nextEffort: string) =>
     saveModelPatch({ thinkingMode: nextMode, effort: nextEffort }, true);
-  const temperature = Number.isFinite(selected.temperature)
+  const savedTemperature = Number.isFinite(selected.temperature)
     ? Math.max(0, Math.min(2, selected.temperature))
     : 0.2;
+  const temperature = temperatureDraft?.value ?? savedTemperature;
   const a2aInDefault = selected.contextConfig?.a2aInDefault !== false;
   const selectableSessions = sessions.filter((session) => {
     const id = session.id.toLowerCase();
@@ -162,7 +172,28 @@ export function ChatModelSelector({
     updateForModel(next, next?.models[0] ?? '');
   };
   const chooseModel = (nextModel: string) => updateForModel(provider, nextModel);
-  const chooseTemperature = (value: string) => updateAgent({ temperature: Number(value) });
+  const chooseTemperature = async (value: string) => {
+    const revision = ++temperatureRevision.current;
+    const temperature = Number(value);
+    // Drag feedback must not wait for persistence. The owner-scoped writer
+    // serializes/coalesces saves; only the newest intent may clear its draft.
+    setTemperatureDrafts((current) => ({
+      ...current,
+      [identity]: { value: temperature, revision },
+    }));
+    try {
+      await updateAgent({ temperature });
+    } catch {
+      // The writer reports save errors. Restore the acknowledged value below.
+    } finally {
+      setTemperatureDrafts((current) => {
+        if (current[identity]?.revision !== revision) return current;
+        const next = { ...current };
+        delete next[identity];
+        return next;
+      });
+    }
+  };
   const visibleSessions = [...selectableSessions];
   // Keep the selected address represented while session metadata is pending.
   if (sessionId && !visibleSessions.some((session) => session.id === sessionId)) {
@@ -198,6 +229,9 @@ export function ChatModelSelector({
             : void updateAgent({ effort: event.target.value })
         }
         disabled={locked || savingNative || !provider || (native && thinkingMode == null)}
+        data-saving-disabled={
+          (savingOnly && !!provider && (!native || thinkingMode != null)) || undefined
+        }
       >
         {!efforts.includes(effort) && <option value={effort}>Unavailable · {effort}</option>}
         {efforts.map((value) => (
@@ -219,8 +253,17 @@ export function ChatModelSelector({
         max="2"
         step="0.1"
         value={temperature}
-        onChange={(e) => chooseTemperature(e.target.value)}
-        disabled={locked || savingNative || !provider}
+        onChange={(e) => void chooseTemperature(e.target.value)}
+        disabled={
+          locked || Boolean(nativeDraft) || (savingSelection && !temperatureDraft) || !provider
+        }
+        data-saving-disabled={
+          (savingOnly &&
+            !!provider &&
+            !temperatureDraft &&
+            (Boolean(nativeDraft) || savingSelection)) ||
+          undefined
+        }
       />
     </label>
   );
@@ -236,6 +279,7 @@ export function ChatModelSelector({
           value={provider?.provider ?? ''}
           onChange={(e) => chooseProvider(e.target.value)}
           disabled={locked || savingNative || !savedProviders.length}
+          data-saving-disabled={(savingOnly && !!savedProviders.length) || undefined}
         >
           {!provider && (
             <option value="">
@@ -259,6 +303,7 @@ export function ChatModelSelector({
           value={model}
           onChange={(e) => chooseModel(e.target.value)}
           disabled={locked || savingNative || !models.length}
+          data-saving-disabled={(savingOnly && !!models.length) || undefined}
         >
           {!models.includes(model) && (
             <option value={model}>{model ? `Unavailable · ${model}` : 'Select model'}</option>
@@ -286,6 +331,7 @@ export function ChatModelSelector({
               value={thinkingMode ?? ''}
               aria-invalid={thinking.modeInvalid || undefined}
               disabled={locked || savingNative || !provider}
+              data-saving-disabled={(savingOnly && !!provider) || undefined}
               onChange={(event) => void saveNative(event.target.value, effort)}
             >
               {thinkingMode == null && <option value="">{thinking.legacyLabel}</option>}
@@ -357,11 +403,9 @@ export function ChatModelSelector({
           {ownerEditor.label}
         </button>
       )}
-      {savingNative && (
-        <span className="model-selection-save-status" role="status">
-          Saving model selection…
-        </span>
-      )}
+      <span className="sr-only" role="status" aria-live="polite">
+        {savingNative ? 'Saving model selection…' : ''}
+      </span>
       {retryNative && (
         <button
           className="new-session"
@@ -389,6 +433,9 @@ export function Chat({
   isNewSession,
   turns,
   isLoading,
+  onLoadOlder,
+  hasOlder,
+  isLoadingOlder,
   error,
   onDismissError,
   isSending,
@@ -432,6 +479,9 @@ export function Chat({
   liveAnswer: string;
   liveStage?: ChatLiveStage;
   a2aActivities?: import('../../app/api').ActiveA2AActivity[];
+  onLoadOlder?: () => Promise<void>;
+  hasOlder?: boolean;
+  isLoadingOlder?: boolean;
   runtimeUserMessage?: string;
   runtimeUserMessageMetadata?: SessionTurn['metadata'];
   onSend: (draft?: string, onAccepted?: () => void) => void;
@@ -688,6 +738,9 @@ export function Chat({
         isNewSession={isNewSession}
         turns={transcriptTurns}
         isLoading={isLoading}
+        onLoadOlder={onLoadOlder}
+        hasOlder={hasOlder}
+        isLoadingOlder={isLoadingOlder}
         error={error}
         onDismissError={onDismissError}
         isSending={isSending}

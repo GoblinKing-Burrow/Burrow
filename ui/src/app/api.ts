@@ -410,6 +410,8 @@ export type ActiveChatRunsResponse = {
   ok: boolean;
   runs: ActiveChatRun[];
   subagents?: ActiveSubagent[];
+  /** Pending Forge deliveries for the requested agent/session, not active model runs. */
+  pendingForgeDeliveries?: number;
 };
 
 export type SessionAttachment = {
@@ -439,6 +441,7 @@ export type GeneratedArtifact = {
 };
 
 export type SessionTurn = {
+  id?: string;
   type?: string;
   role?: string | null;
   content?: string;
@@ -455,6 +458,7 @@ export type SessionTurn = {
     outputArtifacts?: GeneratedArtifact[];
     progress?: RunProgress;
     streamedAnswer?: string;
+    contextReport?: import('../features/chat/contextReport').ContextReport;
     chatResultVersion?: number;
     terminalStatus?: import('../features/chat/chatTerminal').ChatTerminalStatus;
     modelFailure?: import('../features/chat/chatTerminal').ModelFailure;
@@ -586,6 +590,8 @@ export type ArchiveRunListResponse = { ok: true; runs: ArchiveRunDetail[] };
 export type ArchiveRunResponse = { ok: true; run: ArchiveRunDetail };
 
 export type ChatSession = {
+  hasMore?: boolean;
+  nextCursor?: string | null;
   id: string;
   turns?: SessionTurn[];
   activities?: SessionToolActivity[];
@@ -594,6 +600,7 @@ export type ChatSession = {
     a2aPeerAgentId?: string;
     conversationId?: string;
     transcriptGeneration?: string;
+    updatedAt?: string;
     resetAt?: string;
     resetGeneration?: number;
     resetOperationId?: string | null;

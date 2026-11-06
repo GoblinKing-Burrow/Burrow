@@ -1,4 +1,5 @@
 import { isNativeThinkingProvider } from './modelSelectionOptions';
+import { modelSelectionWriteVersion } from './useModelSelectionWriter';
 import { chatAgents } from './agentCatalog';
 import { minionOutcome } from './minionOutcome';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -40,6 +41,14 @@ export type RuntimeRegistryState = 'loading' | 'ready' | 'empty' | 'unavailable'
 const avatarFor = (agent: RuntimeAgent) =>
   agent.avatar || agent.name.slice(0, 1).toUpperCase() || 'A';
 const workspacePathFor = (agentId: string) => `/workspace/${agentId}`;
+const modelFields = (agent: Agent) => ({
+  provider: agent.provider,
+  modelConnectionId: agent.modelConnectionId,
+  model: agent.model,
+  effort: agent.effort,
+  thinkingMode: agent.thinkingMode,
+  temperature: agent.temperature,
+});
 
 const asAgent = (entry: AgentOverviewEntry): Agent => ({
   enabled: entry.agent.enabled,
@@ -113,27 +122,22 @@ async function loadLegacyOverview(
   return Promise.all(
     agents.map(async (agent) => {
       const sessionId = parentSessionIdForAgent(agent.id);
-      if (!agent.enabled || agent.modAgent)
+      if (!agent.enabled)
         return {
           agent,
           identity: identitiesByAgentId.get(agent.id),
           sessionId,
-          selection:
-            agent.enabled && agent.modAgent
-              ? (
-                  await api<{ selection: ModelSelection }>(
-                    `/api/agents/${encodeURIComponent(agent.id)}/model-selection`,
-                    { signal },
-                  )
-                ).selection
-              : null,
+          selection: null,
           status: { agents: [] },
           contexts: {},
         };
       const [statusResult, contextResult, selection] = await Promise.all([
-        api<{ agents: AgentStatus[] }>(
-          `/api/agent-status?sessionId=${encodeURIComponent(sessionId)}&agentId=${encodeURIComponent(agent.id)}`,
-          { signal },
+        (agent.modAgent
+          ? Promise.resolve({ agents: [] as AgentStatus[] })
+          : api<{ agents: AgentStatus[] }>(
+              `/api/agent-status?sessionId=${encodeURIComponent(sessionId)}&agentId=${encodeURIComponent(agent.id)}`,
+              { signal },
+            )
         )
           .then((status) => ({ status }))
           .catch((error: Error) => ({ error })),
@@ -207,6 +211,9 @@ export function useRuntimeAgents({
   const refreshAgents = useCallback(
     async (isCancelled: IsPollingCancelled = () => false, signal?: AbortSignal) => {
       const sequence = ++refreshSequence.current;
+      const selectionWritesAtStart = new Map(
+        agentsRef.current.map((agent) => [agent.id, modelSelectionWriteVersion(agent.id)]),
+      );
       let hydrated: Agent[] = [];
       let loadError: Error | undefined;
       try {
@@ -255,10 +262,13 @@ export function useRuntimeAgents({
               subagents: oldAgent?.subagents.map((child) => ({ ...child, retained: true })) ?? [],
             };
           const agent = asAgent(entry);
+          const parentContext = entry.contexts[entry.sessionId] ?? {};
           // Mod identities have no engineering workspace/profile/provider defaults.
           if (entry.agent.modAgent)
             return {
               ...agent,
+              context: contextPercent(parentContext),
+              contextDetails: contextDetails(parentContext),
               provider:
                 runtimeProviders.current.find((item) => item.id === agent.modelConnectionId)
                   ?.provider ?? '',
@@ -303,29 +313,23 @@ export function useRuntimeAgents({
           });
           const selection = entry.selection;
           const selectedProvider = runtimeProviders.current.find(
-            (item) => item.id === selection?.connectionId && item.models.includes(selection.model),
+            (item) => item.id === selection?.connectionId,
           );
-          const provider =
-            selectedProvider ??
-            runtimeProviders.current.find((item) => item.provider === agent.provider) ??
-            runtimeProviders.current[0];
+          // A saved identity is authoritative even if the connection or model
+          // disappeared. Only an agent without a saved selection gets defaults.
+          const provider = selection ? selectedProvider : runtimeProviders.current[0];
           const configured = !provider
             ? agent
             : (() => {
-                const model =
-                  selectedProvider && selection
-                    ? selection.model
-                    : provider.models.includes(agent.model)
-                      ? agent.model
-                      : provider.models[0];
+                const model = selection ? selection.model : provider.models[0];
                 const efforts = [
                   'off',
                   ...(provider.modelEfforts?.[model] ?? []).filter((item) => item !== 'off'),
                 ];
                 const effort =
-                  selectedProvider &&
                   selection &&
-                  (isNativeThinkingProvider(provider) ||
+                  (!provider.models.includes(model) ||
+                    isNativeThinkingProvider(provider) ||
                     efforts.includes(selection.reasoningEffort))
                     ? selection.reasoningEffort
                     : (provider.defaultEfforts?.[model] ?? agent.effort);
@@ -344,7 +348,6 @@ export function useRuntimeAgents({
                   temperature,
                 };
               })();
-          const parentContext = entry.contexts[entry.sessionId] ?? {};
           // An agent-level failure is not an authoritative empty minion list or
           // proof of agent-wide coverage. Keep every known child until a good load.
           const knownChildren = entry.error
@@ -400,7 +403,14 @@ export function useRuntimeAgents({
           ? { ...agent, subagents: [...agent.subagents, { ...retained, retained: true }] }
           : agent;
       });
-      setAgents(hydrated);
+      setAgents((current) =>
+        hydrated.map((agent) => {
+          if (modelSelectionWriteVersion(agent.id) === selectionWritesAtStart.get(agent.id))
+            return agent;
+          const saved = current.find((candidate) => candidate.id === agent.id);
+          return saved ? { ...agent, ...modelFields(saved) } : agent;
+        }),
+      );
       setRegistryState(hydrated.length === 0 ? 'empty' : 'ready');
       setRegistryStale(false);
       setRegistryError('');

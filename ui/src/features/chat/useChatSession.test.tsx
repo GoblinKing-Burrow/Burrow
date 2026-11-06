@@ -60,7 +60,13 @@ describe('useChatSession', () => {
     const { result } = renderHook(() => useChatSession(agentId));
     await waitFor(() => expect(result.current.sessionId).toBe(sessionId));
     const delayed = deferred<unknown>();
-    apiMock.mockReturnValueOnce(delayed.promise);
+    apiMock.mockImplementation((path, init) => {
+      if (init?.method === 'POST') return delayed.promise;
+      if (path === sessionListPath) return Promise.resolve({ sessions: [{ id: sessionId }] });
+      if (path.startsWith('/api/sessions/'))
+        return Promise.resolve({ session: { id: sessionId, turns: [] } });
+      return Promise.resolve({ runs: [] });
+    });
     let pending!: Promise<unknown>;
     act(() => {
       pending = result.current.resetSession();
@@ -118,11 +124,12 @@ describe('useChatSession', () => {
       });
       expect(result.current.turns).toEqual([{ role: 'user', content: 'Next message' }]);
       if (destination !== 'default') {
+        expect(localStorage.getItem('hc.chatConversations.v1')).toContain('Unrelated default');
         act(() => result.current.selectSession('default'));
-        expect(result.current.turns).toContainEqual({
-          role: 'assistant',
-          content: 'Unrelated default',
-        });
+        expect(result.current.turns).toEqual([]);
+        expect(result.current.isLoadingConversation).toBe(true);
+        await waitFor(() => expect(result.current.isLoadingConversation).toBe(false));
+        expect(result.current.turns).toEqual([{ role: 'assistant', content: 'Old context' }]);
       }
     },
   );
@@ -462,7 +469,7 @@ describe('useChatSession', () => {
     rerender({ agent: nextAgentId });
 
     expect(result.current.sessionId).toBe('');
-    expect(result.current.turns).toEqual([{ role: 'assistant', content: 'Previous conversation' }]);
+    expect(result.current.turns).toEqual([]);
     expect(result.current.isLoadingConversation).toBe(true);
 
     await act(async () => {
@@ -1338,7 +1345,13 @@ it('hydrates empty structured terminal and literal marker successes across reloa
     metadata: {
       chatResultVersion: 2,
       terminalStatus: 'failed',
-      modelFailure: { origin: 'upstream', code: 'provider_http_429', retryable: true, status: 429 },
+      modelFailure: {
+        origin: 'upstream',
+        code: 'provider_http_429',
+        retryable: true,
+        status: 429,
+        message: 'The usage limit has been reached',
+      },
       modelRecovery: { version: 1, retryCount: 1, requests: [{ state: 'exhausted' }] },
     },
   };
@@ -1433,4 +1446,172 @@ it('retains a reported error across automatic conversation hydration until dismi
   expect(result.current.chatError).toBe('Visible failure');
   act(() => result.current.clearError());
   expect(result.current.chatError).toBe('');
+});
+
+it('keeps B pagination visible when a delayed A refresh finishes offscreen', async () => {
+  const a = `/api/sessions/${sessionId}?agentId=${agentId}`;
+  const b = `/api/sessions/session-b?agentId=${agentId}`;
+  const delayed = deferred<{ session: { id: string; turns: never[]; hasMore: boolean } }>();
+  let delayA = false;
+  apiMock.mockImplementation(async (path) => {
+    if (path === sessionListPath) return { sessions: [{ id: sessionId }, { id: 'session-b' }] };
+    if (path === a && delayA) return delayed.promise;
+    if (path === a || path === b)
+      return {
+        session: {
+          id: path === b ? 'session-b' : sessionId,
+          turns: [],
+          hasMore: path === b,
+          nextCursor: 'older',
+        },
+      };
+    return { runs: [] };
+  });
+  const { result } = renderHook(() => useChatSession(agentId));
+  await waitFor(() => expect(result.current.sessionId).toBe(sessionId));
+  await waitFor(() => expect(result.current.isLoadingConversation).toBe(false));
+  delayA = true;
+  let refresh!: Promise<void>;
+  act(() => {
+    refresh = result.current.refreshConversation();
+  });
+  act(() => result.current.selectSession('session-b'));
+  await waitFor(() => expect(result.current.hasOlder).toBe(true));
+  await act(async () => {
+    delayed.resolve({ session: { id: sessionId, turns: [], hasMore: false } });
+    await refresh;
+  });
+  expect(result.current.sessionId).toBe('session-b');
+  expect(result.current.hasOlder).toBe(true);
+});
+
+it('does not restore removed rows into memory or durable cache after explicit invalidation', async () => {
+  const { clearConversationCache, readConversationCache } = await import('./chatConversationCache');
+  let removed = false;
+  const deleted = {
+    id: 'deleted',
+    role: 'assistant',
+    runId: 'deleted-run',
+    content: 'Removed on server',
+  };
+  apiMock.mockImplementation(async (path) => {
+    if (path === sessionListPath) return { sessions: [{ id: sessionId }] };
+    if (path === conversationPath)
+      return { session: { id: sessionId, turns: removed ? [] : [deleted], hasMore: false } };
+    return { runs: [] };
+  });
+  const { result } = renderHook(() => useChatSession(agentId));
+  await waitFor(() => expect(result.current.turns).toHaveLength(1));
+  removed = true;
+  act(() => clearConversationCache());
+  expect(result.current.turns).toEqual([]);
+  await act(async () => {
+    await result.current.refreshConversation();
+  });
+  expect(result.current.turns).toEqual([]);
+  expect(readConversationCache()[conversationCacheKey(agentId, sessionId)]).toEqual([]);
+});
+
+it('loads older pages on demand and retains them through a newest-page refresh', async () => {
+  const turn = (id: string) => ({ id, type: 'message', role: 'user', content: id });
+  apiMock.mockImplementation(async (path) => {
+    if (path === sessionListPath) return { sessions: [{ id: sessionId }] };
+    if (String(path).includes('before='))
+      return { session: { id: sessionId, turns: [turn('old')], hasMore: false, nextCursor: null } };
+    if (path === conversationPath)
+      return {
+        session: { id: sessionId, turns: [turn('new')], hasMore: true, nextCursor: 'cursor' },
+      };
+    throw new Error(`Unexpected path: ${path}`);
+  });
+  const { result } = renderHook(() => useChatSession(agentId));
+  await waitFor(() => expect(result.current.hasOlder).toBe(true));
+  expect(apiMock.mock.calls.some(([path]) => String(path).includes('before='))).toBe(false);
+  await act(async () => {
+    await result.current.loadOlder();
+  });
+  expect(result.current.turns.map((turn) => turn.content)).toEqual(['old', 'new']);
+  await act(async () => {
+    await result.current.refreshConversation();
+  });
+  expect(result.current.turns.map((turn) => turn.content)).toEqual(['old', 'new']);
+});
+
+it.each(['empty', 'user-only', 'assistant-only'] as const)(
+  'keeps the completed local pair through %s snapshots until each role is acknowledged',
+  async (snapshot) => {
+    const user = { role: 'user' as const, runId: 'final-run', content: 'Question' };
+    const answer = { role: 'assistant' as const, runId: 'final-run', content: 'Final answer' };
+    let persisted = [] as (typeof user | typeof answer)[];
+    apiMock.mockImplementation(async (path) => {
+      if (path === sessionListPath) return { sessions: [{ id: sessionId }] };
+      if (path === conversationPath) return { session: { id: sessionId, turns: persisted } };
+      return { runs: [], subagents: [] };
+    });
+    const { result, unmount } = renderHook(() => useChatSession(agentId));
+    await waitFor(() => expect(result.current.sessionId).toBe(sessionId));
+    await waitFor(() => expect(result.current.isLoadingConversation).toBe(false));
+    act(() => {
+      result.current.appendTurn(agentId, sessionId, user);
+      result.current.appendTurn(agentId, sessionId, answer);
+      result.current.setDraft('Next question');
+    });
+    persisted = snapshot === 'user-only' ? [user] : snapshot === 'assistant-only' ? [answer] : [];
+    await act(async () => {
+      await result.current.refreshConversation();
+    });
+    expect(result.current.turns).toHaveLength(2);
+    expect(result.current.turns).toEqual(expect.arrayContaining([user, answer]));
+    // A later empty snapshot must still retain the role not yet acknowledged.
+    persisted = [];
+    await act(async () => {
+      await result.current.refreshConversation();
+    });
+    if (snapshot !== 'assistant-only') expect(result.current.turns).toContainEqual(answer);
+    if (snapshot !== 'user-only') expect(result.current.turns).toContainEqual(user);
+    persisted = [user, answer];
+    await act(async () => {
+      await result.current.refreshConversation();
+    });
+    expect(result.current.turns).toEqual([user, answer]);
+    expect(result.current.draft).toBe('Next question');
+    // Confirmed server turns are not immortal pending writes: a purge wins.
+    persisted = [];
+    await act(async () => {
+      await result.current.refreshConversation();
+    });
+    expect(result.current.turns).toEqual([]);
+    unmount();
+  },
+);
+
+it('clears unacknowledged final turns on local reset, even without dated turns or reset metadata', async () => {
+  apiMock.mockImplementation(async (path) => {
+    if (path === sessionListPath) return { sessions: [{ id: sessionId }] };
+    if (path === conversationPath) return { session: { id: sessionId, turns: [] } };
+    return { ok: true, runs: [], subagents: [] };
+  });
+  const { result, unmount } = renderHook(() => useChatSession(agentId));
+  await waitFor(() => expect(result.current.isLoadingConversation).toBe(false));
+  await waitFor(() => expect(result.current.sessionId).toBe(sessionId));
+  act(() => {
+    result.current.appendTurn(agentId, sessionId, {
+      role: 'user',
+      runId: 'reset-run',
+      content: 'Question',
+    });
+    result.current.appendTurn(agentId, sessionId, {
+      role: 'assistant',
+      runId: 'reset-run',
+      content: 'Final answer',
+    });
+  });
+  await act(async () => {
+    await result.current.resetSession();
+  });
+  await act(async () => {
+    await result.current.refreshConversation();
+  });
+  expect(result.current.turns).toEqual([]);
+  unmount();
 });

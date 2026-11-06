@@ -89,3 +89,15 @@ The full review remains dated **1 November**. This is static source reconciliati
 Inspected assembly **2026.11.04.9**, commit `86f41581cf4feccbd2126db38a6b746db6483080`, records Core `b62c57ef5e831bacebf2214a31c04147471c1267` and UI `f952d9494f97326f3f656c5a5427e9d4efc20e3a`. This ordinary pass reconciles independent mod-management/Core API agent authority, reset operation receipts and read-only outcome recovery, automatic A2A final delivery and transcript attribution, empty initial peer-directory cursors, canonical owned-agent avatars, imperative Settings layout/selector/navigation contracts and opt-in Archive heading/date/timezone support. The application schema reaches migration 92.
 
 The full review remains dated **1 November 2026**. This is changed-source/static documentation reconciliation, not application/provider testing, runtime deployment, public release promotion or proof of your installed behavior. Earlier dated sections and public-source links are historical evidence; current component and skill receipts are maintained separately. Menagerie remains a homepage placeholder, without a new full documentation section.
+
+## 5 November implementation delta
+
+Inspected assembly **2026.11.05.4**, commit `1952f88ff182ef465370209f3f1969cbdfbd79e6`, records Core `6465a9b200bc550697ddfc41959d671eac9abf33` and UI `4f7f58f682a0cffe83290276307c66631a361de3`. This ordinary pass reconciles current-intent preference curation, indexed session recall and optional conversation embeddings, OpenAI-compatible embedding support, enabled-mod shared guidance, resident model-connection identity and retained Chat errors, and catalog-refresh controls. Switchboard's native Settings workspaces and historical Archive are reconciled in its component guide.
+
+The full page review remains dated **1 November**; unchanged pages retain that evidence. These are static source and test-file checks, not executed application/provider tests, a runtime deployment or a release promotion. Public mirrors and installed packages can lag development source. Menagerie's coming-soon placeholder and approved artwork/navigation remain unchanged.
+
+## 6 November implementation delta
+
+Inspected assembly **2026.11.06.8**, commit `e8acb74a168970eb5dbfdd463745144976811b19`, records Core `4e5a505c12b236ed394b09a577a2d583b409a69f` and UI `aa759fbf429cebd5fe070d3eb28491f63bf5fc77`. This ordinary source delta reconciles retained compacted scrollback, captured context reports, provider explanation/copy fidelity, the inclusive five-hour pool headroom floor, bounded unavailable-pool waits, nonblocking recall rollout/migration 96, current chat navigation and native Forge wait/assistant delivery. The operator Forge HTTP surface remains asynchronous.
+
+The full-page review remains dated **1 November**. This is static source and test-file inspection with documentation checks, not executed application/provider tests, runtime deployment, release promotion or verification of an installed build. Menagerie remains a coming-soon placeholder.

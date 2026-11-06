@@ -81,6 +81,12 @@ The runtime does not preload ordinary global profile/rules, engineering working 
 
 The native `mod_agent_tool` bridge exposes only the owning mod's currently published tools. Other supported capabilities must be explicitly enabled; this path does not implicitly grant engineering, shell, file, git, task or minion tools. Ordinary non-mod agents retain their existing context path. See [extension contracts](../development/extensions.md#mod-owned-native-agents).
 
+### Shared guidance from enabled mods
+
+Enabled mods can separately contribute current guidance to ordinary native agents and mod-owned residents, including A2A recipients. This is independent of the owning profile provider. Core renders it as a developer message, labels its mod provenance, and retains the captured contribution during prompt-pressure rebuilds. It never grants ownership/tools or replaces the agent's identity. Disabled, unloaded or replaced contributions do not carry into fresh turns; malformed or failed active providers block with `mod_agent_unavailable`. Historical shared snapshots are not current instructions.
+
+Side questions resolve shared guidance separately from their frozen conversation snapshot, record that resolution time, and retain the snapshot-only/no-tools boundary. See [the shared provider contract](../development/extensions.md#enabled-mod-shared-guidance).
+
 ## How evidence returns to later turns
 
 ```mermaid
@@ -151,3 +157,13 @@ Changed contracts above were checked statically against Backend `4057b50a5d5a9b1
 ## 3 November development delta
 
 The changed context and host contracts above were checked statically against Backend `32dde3266a231777ddfec6dba141d6b9972a21fd` on **2026-11-03**. No application, provider or database tests were run; unchanged historical sections retain their earlier qualifications. See [source coverage](../project/source-map.md).
+
+## 5 November development delta
+
+The changed preference, recall, embedding or shared-guidance contracts above were checked statically against Core `6465a9b200bc550697ddfc41959d671eac9abf33` on **5 November 2026**. No application, database or live-provider tests were run; unchanged historical sections retain their earlier qualifications. See [source coverage](../project/source-map.md).
+
+## Current request replay and bounded pool waits
+
+Checked **6 November 2026**: immutable provider dispatch snapshots remain evidence of the original request. Later replay drops only runtime-provenance-tagged historical support messages and preserves original user/image content; current support is assembled once. It does not strip user text by headings or rewrite the evidence.
+
+Pool eligibility now constrains required owners as well as new turns. Proven portable text/tool continuations can select an eligible alternate before dispatch; signed or otherwise account-bound history stops if its required owner cannot serve. A failed account's `Retry-After` does not delay a healthy alternate. If every destination is blocked, a known short availability deadline can extend the usual recovery delay up to the 30-second cap. Longer or unknown unavailability stops the live request instead of repeatedly probing. These rules retain the original provider failure and existing physical attempt budgets.

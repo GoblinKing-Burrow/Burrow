@@ -1234,3 +1234,251 @@ it('renders a Menagerie resident portrait in native chat turns', () => {
     avatar,
   );
 });
+
+it('offers older loading inline and disables duplicate requests while loading', () => {
+  const load = vi.fn(async () => {});
+  const props = {
+    selected: parent,
+    parent,
+    operator: { name: 'Rob', avatar: 'R' },
+    isNewSession: false,
+    turns: [message('Newest')],
+    isLoading: false,
+    error: '',
+    isSending: false,
+    activeRunId: '',
+    liveProgress: [],
+    liveAnswer: '',
+    hasOlder: true,
+    onLoadOlder: load,
+  };
+  const view = render(<ChatTranscript {...props} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Load older messages' }));
+  expect(load).toHaveBeenCalledTimes(1);
+  view.rerender(<ChatTranscript {...props} isLoadingOlder />);
+  expect(
+    (screen.getByRole('button', { name: 'Loading older messages…' }) as HTMLButtonElement).disabled,
+  ).toBe(true);
+});
+
+it.each(['', 'A genuine partial answer'])(
+  'displays actual provider prose and copies error details with content %s',
+  async (content) => {
+    const copied: string[] = [];
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true,
+      value: vi.fn(() => {
+        copied.push(document.querySelector<HTMLTextAreaElement>('body > textarea')?.value ?? '');
+        return true;
+      }),
+    });
+    show(
+      [
+        {
+          type: 'message',
+          role: 'assistant',
+          content,
+          metadata: {
+            chatResultVersion: 2,
+            terminalStatus: 'failed',
+            modelFailure: {
+              origin: 'upstream',
+              code: 'provider_http_429',
+              status: 429,
+              retryable: true,
+              message: 'The usage limit has been reached',
+            },
+            modelRecovery: { version: 1, retryCount: 2, requests: [{ state: 'exhausted' }] },
+          },
+        },
+      ],
+      parent,
+    );
+    expect(screen.getByRole('alert').textContent).toContain('The usage limit has been reached');
+    expect(screen.getByRole('alert').textContent).not.toContain('requests (HTTP 429)');
+    const copy = screen.getByRole('button', { name: /Copy Hatchet message/ });
+    expect(copy.className).toBe('copy-message');
+    fireEvent.click(copy);
+    await waitFor(() => expect(copy.textContent).toContain('Copied'));
+    expect(copied).toHaveLength(1);
+    expect(copied[0]).toContain('The usage limit has been reached');
+    expect(copied[0]).toContain('HTTP status: 429');
+    expect(copied[0]).toContain('Recovery 1: exhausted');
+    if (content) expect(copied[0]).toContain(content);
+  },
+);
+
+it('renders provider prose literally, never as executable markup', () => {
+  const prose = '<script>alert(1)</script> **limit reached**';
+  const { container } = show(
+    [
+      {
+        type: 'message',
+        role: 'assistant',
+        content: '',
+        metadata: {
+          chatResultVersion: 2,
+          terminalStatus: 'failed',
+          modelFailure: {
+            origin: 'upstream',
+            code: 'provider_http_400',
+            status: 400,
+            retryable: false,
+            message: prose,
+          },
+        },
+      },
+    ],
+    parent,
+  );
+  expect(screen.getByText(prose)).toBeTruthy();
+  expect(container.querySelector('script')).toBeNull();
+});
+
+it('renders ordered readable context blocks, closed technical disclosures, and existing code copy without raw HTML', async () => {
+  const writeText = vi.fn(async () => {});
+  const secureContext = window.isSecureContext;
+  Object.defineProperty(window, 'isSecureContext', { configurable: true, value: true });
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+  const { container } = show(
+    [
+      {
+        type: 'message',
+        role: 'assistant',
+        content: 'Readable fallback',
+        metadata: {
+          kind: 'context-command-report',
+          contextReport: {
+            version: 1,
+            blocks: [
+              { title: '', markdown: '# Context report\n\n**Source:** saved portrait · 12 KB' },
+              { title: '1. system — instructions', markdown: 'System text\n\n- One\n- Two' },
+              { title: '2. user — operator', markdown: 'User text <script>alert(1)</script>' },
+              { title: 'Tool schemas', markdown: 'Technical schema', collapsed: true },
+              {
+                title: 'Raw provider request (redacted)',
+                markdown: '```json\n{"messages": []}\n```',
+                collapsed: true,
+              },
+            ],
+          },
+        },
+      },
+    ],
+    parent,
+  );
+  expect(screen.queryByText('Readable fallback')).toBeNull();
+  expect([...container.querySelectorAll('h3')].map((n) => n.textContent)).toEqual([
+    '1. system — instructions',
+    '2. user — operator',
+  ]);
+  expect(container.querySelectorAll('li')).toHaveLength(2);
+  const details = [...container.querySelectorAll('details')];
+  expect(details).toHaveLength(2);
+  expect(details.every((node) => !node.open)).toBe(true);
+  expect(container.querySelector('script')).toBeNull();
+  fireEvent.click(screen.getByText('Raw provider request (redacted)'));
+  expect(details[1].open).toBe(true);
+  fireEvent.click(screen.getByRole('button', { name: 'Copy code block' }));
+  await waitFor(() => expect(writeText).toHaveBeenCalledWith('{"messages": []}'));
+  Object.defineProperty(window, 'isSecureContext', { configurable: true, value: secureContext });
+});
+
+it.each([
+  { contextReport: { version: 1, blocks: [{ title: '', markdown: 'Untrusted report' }] } },
+  { kind: 'context-command-report', contextReport: { version: 2, blocks: [] } },
+])('preserves normal Markdown fallback for unmarked or malformed metadata: %j', (metadata) => {
+  show(
+    [
+      {
+        type: 'message',
+        role: 'assistant',
+        content: '**Readable fallback**',
+        metadata: metadata as never,
+      },
+    ],
+    parent,
+  );
+  expect(screen.getByText('Readable fallback').tagName).toBe('STRONG');
+  expect(screen.queryByText('Untrusted report')).toBeNull();
+});
+
+it('allows a context report with an empty fallback but never replaces operator messages', () => {
+  const contextReport = {
+    version: 1 as const,
+    blocks: [{ title: '', markdown: 'Report without fallback' }],
+  };
+  show(
+    [
+      {
+        type: 'message',
+        role: 'assistant',
+        content: '',
+        metadata: { kind: 'context-command-report', contextReport },
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: 'Operator message',
+        metadata: { kind: 'context-command-report', contextReport },
+      },
+    ],
+    parent,
+  );
+  expect(screen.getAllByText('Report without fallback')).toHaveLength(1);
+  expect(screen.getByText('Operator message')).toBeTruthy();
+});
+
+it('offers jump to latest only away from the bottom and resumes following after a jump', () => {
+  const props = {
+    selected: parent,
+    parent,
+    operator: { name: 'King', avatar: 'K' },
+    isNewSession: false,
+    turns: [message('History')],
+    isLoading: false,
+    error: '',
+    isSending: true,
+    activeRunId: 'run',
+    liveProgress: [],
+    liveAnswer: '',
+  };
+  const view = render(<ChatTranscript {...props} />);
+  const scroller = view.container.querySelector('.chat-messages') as HTMLDivElement;
+  Object.defineProperties(scroller, {
+    scrollHeight: { configurable: true, value: 1200 },
+    clientHeight: { configurable: true, value: 400 },
+  });
+  scroller.scrollTop = 800;
+  fireEvent.scroll(scroller);
+  expect(screen.queryByRole('button', { name: 'Jump to latest message' })).toBeNull();
+  scroller.scrollTop = 200;
+  fireEvent.scroll(scroller);
+  const jump = screen.getByRole('button', { name: 'Jump to latest message' });
+  expect(jump.getAttribute('type')).toBe('button');
+  expect(scroller.contains(jump)).toBe(false);
+  view.rerender(<ChatTranscript {...props} liveAnswer="New streamed content" />);
+  expect(scroller.scrollTop).toBe(200);
+  fireEvent.click(jump);
+  expect(scroller.scrollTop).toBe(1200);
+  expect(screen.queryByRole('button', { name: 'Jump to latest message' })).toBeNull();
+  Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 1400 });
+  view.rerender(<ChatTranscript {...props} liveAnswer="More streamed content" />);
+  expect(scroller.scrollTop).toBe(1400);
+});
+
+it('hides jump to latest when manually returning near the bottom and never shows it for a short chat', () => {
+  const view = show([message('A short chat')], parent);
+  const scroller = view.container.querySelector('.chat-messages') as HTMLDivElement;
+  expect(screen.queryByRole('button', { name: 'Jump to latest message' })).toBeNull();
+  Object.defineProperties(scroller, {
+    scrollHeight: { configurable: true, value: 1200 },
+    clientHeight: { configurable: true, value: 400 },
+  });
+  scroller.scrollTop = 0;
+  fireEvent.scroll(scroller);
+  expect(screen.getByRole('button', { name: 'Jump to latest message' })).toBeTruthy();
+  scroller.scrollTop = 780;
+  fireEvent.scroll(scroller);
+  expect(screen.queryByRole('button', { name: 'Jump to latest message' })).toBeNull();
+});

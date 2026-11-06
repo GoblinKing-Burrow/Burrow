@@ -331,3 +331,19 @@ Migration **90**, `mod-owned-agents`, adds the nullable `agents.mod_agent_json` 
 | 92 | `reset-archive-projection-copies` | Reuses completed Chat visibility/occurrence projections when reset copies unchanged originals, including a known null occurrence instant; new or changed payloads still require projection. |
 
 Reset now copies existing lexical/occurrence projections rather than reparsing every original in application memory. Unprojected originals retain fallback/backfill handling; these changes do not make an archive summary or a timeout proof of completion. Session metadata atomically records the reset operation receipt with its generation. Neither migration changes PostgreSQL's major version or authorizes manual ledger/SQL edits. Statically checked against Core `b62c57ef5e831bacebf2214a31c04147471c1267`; this documentation review did not execute migrations.
+
+## 5 November migration additions
+
+| Version | Migration | Purpose |
+|---|---|---|
+| 93 | `indexed-session-recall` | Derived occurrence/lexical indexes, write triggers and a durable bounded background backfill checkpoint; native originals remain authoritative. |
+| 94 | `background-conversation-embeddings` | Independent default-false `conversation_enabled`, derived passage/occurrence/vector storage and durable queues/backfill state; shares the existing embedding connection/model. |
+| 95 | `session-recall-projection-repairs` | Preserves grandfathered null source storage clocks in derived recall and reuses completed recall/operator/Dream projections for verified unchanged reset copies. |
+
+Startup does not scan or embed all retained history. Broad session recall remains explicitly not-ready until lexical backfill completes; exact source/session expansion still works. Conversation embeddings require separate consent and pgvector support; missing vector support does not disable lexical retrieval. Disabling or reindexing a derived index does not delete original conversations. Migration 95 preserves published v93/v94 checksums and does not rewrite retained history. These are application migrations, not a PostgreSQL major upgrade or permission to edit the ledger. Statically checked against Core `6465a9b200bc550697ddfc41959d671eac9abf33`; no migrations were run in this documentation review.
+
+## Migration 96: nonblocking recall preparation
+
+Checked **6 November 2026** against Core `4e5a505c12b236ed394b09a577a2d583b409a69f`: additive migration **96** leaves 93–95 unchanged and scans no retained source rows. Structurally irrelevant records bypass expensive content folding/ranking while keeping logical identity, clock and eligibility, so newer ineligible occurrences still shadow older dialogue correctly. The lexical extractor preserves lossless JSON/Unicode handling without a content-length cutoff.
+
+Backfill prepares transaction-local projections before row locks, then uses a short parent-before-source publication window with version rechecks. Trigger projections win; changed unresolved occurrences retry the page instead of being skipped. Default preparation/page budget is 60 seconds, publication ownership budget 250ms, and inter-page yield 100ms. Timeout shrinks the active page size to a minimum of one; four consecutive committed full pages grow it by one toward configured `pageSize` (default 16). Status distinguishes `pageSize` and `activePageSize`. This is source review; no migration or database test was run.

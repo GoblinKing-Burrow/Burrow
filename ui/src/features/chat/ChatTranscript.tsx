@@ -1,3 +1,4 @@
+import { contextReport, type ContextReport } from './contextReport';
 import {
   chatInputLabel,
   pendingChatInput,
@@ -6,6 +7,7 @@ import {
 } from './chatInputs';
 import { chatToolIdentity } from './chatToolIdentity';
 import {
+  chatTerminalCopy,
   chatTerminalDiagnostic,
   chatTerminalMetadata,
   type ChatTerminalMetadata,
@@ -49,6 +51,9 @@ type ChatTranscriptProps = {
   isNewSession: boolean;
   turns: SessionTurn[];
   isLoading: boolean;
+  onLoadOlder?: () => Promise<void>;
+  hasOlder?: boolean;
+  isLoadingOlder?: boolean;
   error: string;
   onDismissError?: () => void;
   isSending: boolean;
@@ -72,6 +77,9 @@ export const ChatTranscript = memo(function ChatTranscript({
   isNewSession,
   turns,
   isLoading,
+  onLoadOlder,
+  hasOlder,
+  isLoadingOlder,
   error,
   onDismissError,
   isSending,
@@ -105,7 +113,10 @@ export const ChatTranscript = memo(function ChatTranscript({
           chatTerminalMetadata(turn.metadata)?.terminalStatus !== undefined &&
           chatTerminalMetadata(turn.metadata)?.terminalStatus !== 'completed') ||
         turn.metadata?.attachments?.length ||
-        turn.metadata?.outputArtifacts?.length) &&
+        turn.metadata?.outputArtifacts?.length ||
+        (turn.role === 'assistant' &&
+          turn.metadata?.kind === 'context-command-report' &&
+          contextReport(turn.metadata.contextReport))) &&
       (turn.role === 'user' || turn.role === 'assistant' || turn.role === 'agent') &&
       !(
         turn.role === 'user' &&
@@ -162,17 +173,23 @@ export const ChatTranscript = memo(function ChatTranscript({
     (isNewSession || !messages.length);
   const messagesRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const updateScrollIntent = () => {
     const container = messagesRef.current;
     if (!container) return;
     stickToBottomRef.current =
       container.scrollHeight - container.scrollTop - container.clientHeight < 48;
+    setShowJumpToLatest(!stickToBottomRef.current);
   };
-  useLayoutEffect(() => {
+  const syncScroll = () => {
     const container = messagesRef.current;
-    if (container && !isLoading && stickToBottomRef.current)
-      container.scrollTop = container.scrollHeight;
-  }, [
+    if (!container) return;
+    if (!isLoading && stickToBottomRef.current) container.scrollTop = container.scrollHeight;
+    setShowJumpToLatest(
+      container.scrollHeight - container.scrollTop - container.clientHeight >= 48,
+    );
+  };
+  useLayoutEffect(syncScroll, [
     isLoading,
     isNewSession,
     messages.length,
@@ -181,186 +198,244 @@ export const ChatTranscript = memo(function ChatTranscript({
     liveAnswer,
     activeActivity,
     chatInputs,
+    error,
   ]);
+  // Images, expanded tool details and viewport changes can alter the bottom
+  // without adding a turn. Follow only when the reader has not scrolled away.
+  useEffect(() => {
+    const container = messagesRef.current;
+    if (!container || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(syncScroll);
+    observer.observe(container);
+    for (const child of container.children) observer.observe(child);
+    return () => observer.disconnect();
+  });
   return (
-    <div
-      className={`chat-messages ${isEmptySession ? 'new-session-view' : ''}`}
-      ref={messagesRef}
-      onScroll={updateScrollIntent}
-      aria-busy={isLoading || isSending}
-    >
-      {isEmptySession ? (
-        <div className="new-session-empty">
-          <img src="/burrow-logo.png" alt="Burrow" />
-        </div>
-      ) : (
-        <>
-          {isSubagent && (
-            <div className="stream-banner">
-              <span>Minion stream</span>
-              <strong>{selected.name}</strong>
-              <small>
-                Workspace remains attached to {parent.name}
-                {parentSessionName && <> · {parentSessionName}</>}
-              </small>
-            </div>
-          )}
-          {isLoading && (
-            <p className="chat-state">
-              {messages.length ? 'Refreshing conversation…' : 'Loading conversation…'}
-            </p>
-          )}
-          {runtimeUserMessage &&
-            !messages.some(
-              (turn) =>
-                turn.role === 'user' &&
-                (!activeRunId || turn.runId === activeRunId) &&
-                textFromChatValue(turn.content) === runtimeUserMessage,
-            ) && (
-              <ChatMessage
-                side="operator"
-                name={runtimeIdentity.name}
-                avatar={runtimeIdentity.avatar}
-                time="Now"
-                text={runtimeUserMessage}
-              />
+    <div className="chat-transcript">
+      <div
+        className={`chat-messages ${isEmptySession ? 'new-session-view' : ''}`}
+        ref={messagesRef}
+        onScroll={updateScrollIntent}
+        aria-busy={isLoading || isSending}
+      >
+        {isEmptySession ? (
+          <div className="new-session-empty">
+            <img src="/burrow-logo.png" alt="Burrow" />
+          </div>
+        ) : (
+          <>
+            {hasOlder && onLoadOlder && (
+              <button
+                className="secondary"
+                disabled={isLoadingOlder}
+                onClick={async () => {
+                  const container = messagesRef.current;
+                  const height = container?.scrollHeight ?? 0;
+                  const top = container?.scrollTop ?? 0;
+                  stickToBottomRef.current = false;
+                  await onLoadOlder();
+                  requestAnimationFrame(() => {
+                    if (container && container === messagesRef.current && !stickToBottomRef.current)
+                      container.scrollTop = top + container.scrollHeight - height;
+                  });
+                }}
+              >
+                {isLoadingOlder ? 'Loading older messages…' : 'Load older messages'}
+              </button>
             )}
-          {messages.map((turn, index) => {
-            const { name: userName, avatar: userAvatar } = userIdentity(turn.metadata);
-            const isAgentMessage = turn.role === 'agent';
-            const fromCurrentAgent = turn.metadata?.fromAgentId === selected.id;
-            const senderName =
-              turn.metadata?.fromAgentName ?? turn.metadata?.fromAgentId ?? 'Agent';
-            const recipientName = turn.metadata?.toAgentId ?? selected.name;
-            const messageName = isAgentMessage ? `${senderName} → ${recipientName}` : selected.name;
-            const persistedActivity = turn.metadata?.toolActivity;
-            const isPersistedTerminalTurn =
-              turn.role === 'assistant' &&
-              turn.runId === activeRunId &&
-              Boolean(
-                turn.metadata?.progress ||
-                  persistedActivity ||
-                  turn.content ||
-                  chatTerminalMetadata(turn.metadata),
-              );
-            return (
-              <ChatMessage
-                chatInput={turn.metadata?.chatInput}
-                input={
-                  turn.metadata?.chatInput ? inputById.get(turn.metadata.chatInput.id) : undefined
-                }
-                onPromote={onPromote}
-                onInputAction={onInputAction}
-                inputActionPending={inputActionPending}
-                key={`${turn.runId ?? 'turn'}-${index}`}
-                side={
-                  turn.role === 'user' || (isAgentMessage && !fromCurrentAgent)
-                    ? 'operator'
-                    : 'agent'
-                }
-                name={
-                  turn.role === 'user' ? userName : isAgentMessage ? messageName : selected.name
-                }
-                avatar={
-                  turn.role === 'user'
-                    ? userAvatar
-                    : isAgentMessage && !fromCurrentAgent
-                      ? senderName.slice(0, 1).toUpperCase()
-                      : selected.avatar
-                }
-                time={
-                  turn.metadata?.steering
-                    ? `${formatTime(turn.ts)} · ${turn.metadata.steering.status === 'pending' ? 'Pending — next model boundary' : turn.metadata.steering.status === 'delivered' ? 'Delivered to run' : 'Not delivered — retained as follow-up'}`
-                    : formatTime(turn.ts)
-                }
-                text={textFromChatValue(turn.content)}
-                activity={
-                  turn.role === 'assistant'
-                    ? (persistedActivity ??
-                      (turn.runId === activeRunId
-                        ? activeActivity
-                        : activityByRun.get(turn.runId ?? '')))
-                    : undefined
-                }
-                progress={turn.role === 'assistant' ? turn.metadata?.progress : undefined}
-                terminal={
-                  turn.role === 'assistant' ? chatTerminalMetadata(turn.metadata) : undefined
-                }
-                streamedAnswer={
-                  turn.role === 'assistant' ? turn.metadata?.streamedAnswer : undefined
-                }
-                activityLive={
-                  turn.role === 'assistant' &&
-                  turn.runId === activeRunId &&
-                  !isPersistedTerminalTurn
-                }
-                attachments={turn.metadata?.attachments}
-                outputArtifacts={
-                  turn.role === 'assistant' ? turn.metadata?.outputArtifacts : undefined
-                }
-                attachmentAgentId={attachmentAgentId ?? parent.id}
-              />
-            );
-          })}
-          {a2aActivities.length > 0 && (
-            <section className="a2a-activity-list" aria-label="Agent-to-agent activity">
-              {a2aActivities.map((activity) => (
-                <A2AActivityCard
-                  key={activity.id}
-                  activity={activity}
-                  selectedName={selected.name}
+            {isSubagent && (
+              <div className="stream-banner">
+                <span>Minion stream</span>
+                <strong>{selected.name}</strong>
+                <small>
+                  Workspace remains attached to {parent.name}
+                  {parentSessionName && <> · {parentSessionName}</>}
+                </small>
+              </div>
+            )}
+            {isLoading && (
+              <p className="chat-state">
+                {messages.length ? 'Refreshing conversation…' : 'Loading conversation…'}
+              </p>
+            )}
+            {runtimeUserMessage &&
+              !messages.some(
+                (turn) =>
+                  turn.role === 'user' &&
+                  (!activeRunId || turn.runId === activeRunId) &&
+                  textFromChatValue(turn.content) === runtimeUserMessage,
+              ) && (
+                <ChatMessage
+                  side="operator"
+                  name={runtimeIdentity.name}
+                  avatar={runtimeIdentity.avatar}
+                  time="Now"
+                  text={runtimeUserMessage}
                 />
-              ))}
-            </section>
-          )}
-          {visibleRuntimeChildActivities.length > 0 && (
-            <section className="a2a-activity-list" aria-label="Minion activity">
-              {visibleRuntimeChildActivities.map((activity) => (
-                <ToolActivityCard
-                  key={activity.runId}
-                  activity={activity}
-                  live={activity.status === 'running'}
-                />
-              ))}
-            </section>
-          )}
-          {isSending &&
-            !messages.some(
-              (turn) =>
+              )}
+            {messages.map((turn, index) => {
+              const { name: userName, avatar: userAvatar } = userIdentity(turn.metadata);
+              const isAgentMessage = turn.role === 'agent';
+              const fromCurrentAgent = turn.metadata?.fromAgentId === selected.id;
+              const senderName =
+                turn.metadata?.fromAgentName ?? turn.metadata?.fromAgentId ?? 'Agent';
+              const recipientName = turn.metadata?.toAgentId ?? selected.name;
+              const messageName = isAgentMessage
+                ? `${senderName} → ${recipientName}`
+                : selected.name;
+              const persistedActivity = turn.metadata?.toolActivity;
+              const isPersistedTerminalTurn =
                 turn.role === 'assistant' &&
                 turn.runId === activeRunId &&
                 Boolean(
                   turn.metadata?.progress ||
-                    turn.metadata?.toolActivity ||
+                    persistedActivity ||
                     turn.content ||
                     chatTerminalMetadata(turn.metadata),
-                ),
-            ) && (
-              <LiveAssistantTurn
-                name={selected.name}
-                avatar={selected.avatar}
-                progress={liveProgress}
-                activity={activeActivity}
-                answer={liveAnswer}
-                stage={liveStage}
-              />
+                );
+              return (
+                <ChatMessage
+                  chatInput={turn.metadata?.chatInput}
+                  input={
+                    turn.metadata?.chatInput ? inputById.get(turn.metadata.chatInput.id) : undefined
+                  }
+                  onPromote={onPromote}
+                  onInputAction={onInputAction}
+                  inputActionPending={inputActionPending}
+                  key={`${turn.runId ?? 'turn'}-${index}`}
+                  side={
+                    turn.role === 'user' || (isAgentMessage && !fromCurrentAgent)
+                      ? 'operator'
+                      : 'agent'
+                  }
+                  name={
+                    turn.role === 'user' ? userName : isAgentMessage ? messageName : selected.name
+                  }
+                  avatar={
+                    turn.role === 'user'
+                      ? userAvatar
+                      : isAgentMessage && !fromCurrentAgent
+                        ? senderName.slice(0, 1).toUpperCase()
+                        : selected.avatar
+                  }
+                  time={
+                    turn.metadata?.steering
+                      ? `${formatTime(turn.ts)} · ${turn.metadata.steering.status === 'pending' ? 'Pending — next model boundary' : turn.metadata.steering.status === 'delivered' ? 'Delivered to run' : 'Not delivered — retained as follow-up'}`
+                      : formatTime(turn.ts)
+                  }
+                  text={textFromChatValue(turn.content)}
+                  activity={
+                    turn.role === 'assistant'
+                      ? (persistedActivity ??
+                        (turn.runId === activeRunId
+                          ? activeActivity
+                          : activityByRun.get(turn.runId ?? '')))
+                      : undefined
+                  }
+                  progress={turn.role === 'assistant' ? turn.metadata?.progress : undefined}
+                  terminal={
+                    turn.role === 'assistant' ? chatTerminalMetadata(turn.metadata) : undefined
+                  }
+                  streamedAnswer={
+                    turn.role === 'assistant' ? turn.metadata?.streamedAnswer : undefined
+                  }
+                  report={
+                    turn.role === 'assistant' && turn.metadata?.kind === 'context-command-report'
+                      ? contextReport(turn.metadata.contextReport)
+                      : undefined
+                  }
+                  activityLive={
+                    turn.role === 'assistant' &&
+                    turn.runId === activeRunId &&
+                    !isPersistedTerminalTurn
+                  }
+                  attachments={turn.metadata?.attachments}
+                  outputArtifacts={
+                    turn.role === 'assistant' ? turn.metadata?.outputArtifacts : undefined
+                  }
+                  attachmentAgentId={attachmentAgentId ?? parent.id}
+                />
+              );
+            })}
+            {a2aActivities.length > 0 && (
+              <section className="a2a-activity-list" aria-label="Agent-to-agent activity">
+                {a2aActivities.map((activity) => (
+                  <A2AActivityCard
+                    key={activity.id}
+                    activity={activity}
+                    selectedName={selected.name}
+                  />
+                ))}
+              </section>
             )}
-        </>
-      )}
-      {error && (
-        <div className="chat-error" role="alert">
-          <span>{error}</span>
-          {onDismissError && (
-            <button
-              type="button"
-              className="secondary"
-              onClick={onDismissError}
-              aria-label="Dismiss chat error"
-            >
-              Dismiss
-            </button>
-          )}
-        </div>
+            {visibleRuntimeChildActivities.length > 0 && (
+              <section className="a2a-activity-list" aria-label="Minion activity">
+                {visibleRuntimeChildActivities.map((activity) => (
+                  <ToolActivityCard
+                    key={activity.runId}
+                    activity={activity}
+                    live={activity.status === 'running'}
+                  />
+                ))}
+              </section>
+            )}
+            {isSending &&
+              !messages.some(
+                (turn) =>
+                  turn.role === 'assistant' &&
+                  turn.runId === activeRunId &&
+                  Boolean(
+                    turn.metadata?.progress ||
+                      turn.metadata?.toolActivity ||
+                      turn.content ||
+                      chatTerminalMetadata(turn.metadata),
+                  ),
+              ) && (
+                <LiveAssistantTurn
+                  name={selected.name}
+                  avatar={selected.avatar}
+                  progress={liveProgress}
+                  activity={activeActivity}
+                  answer={liveAnswer}
+                  stage={liveStage}
+                />
+              )}
+          </>
+        )}
+        {error && (
+          <div className="chat-error" role="alert">
+            <span>{error}</span>
+            {onDismissError && (
+              <button
+                type="button"
+                className="secondary"
+                onClick={onDismissError}
+                aria-label="Dismiss chat error"
+              >
+                Dismiss
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+      {showJumpToLatest && (
+        <button
+          type="button"
+          className="chat-jump-latest"
+          aria-label="Jump to latest message"
+          title="Jump to latest message"
+          onClick={() => {
+            const container = messagesRef.current;
+            if (!container) return;
+            stickToBottomRef.current = true;
+            container.scrollTop = container.scrollHeight;
+            setShowJumpToLatest(false);
+          }}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 4v16m-6-6 6 6 6-6" />
+          </svg>
+        </button>
       )}
     </div>
   );
@@ -455,6 +530,39 @@ function Markdown({ children }: { children: string }) {
     <ReactMarkdown remarkPlugins={markdownPlugins} components={markdownComponents}>
       {children}
     </ReactMarkdown>
+  );
+}
+
+function ContextCommandReport({ report }: { report: ContextReport }) {
+  return (
+    <div className="context-report">
+      {report.blocks.map((block, index) =>
+        block.collapsed ? (
+          <details className="streamed-answer context-report-details" key={index}>
+            <summary>
+              <span>{block.title || 'Technical details'}</span>
+              <svg
+                className="streamed-answer-chevron"
+                width="12"
+                height="12"
+                viewBox="0 0 16 16"
+                aria-hidden="true"
+              >
+                <path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.5" />
+              </svg>
+            </summary>
+            <div className="streamed-answer-body">
+              <Markdown>{block.markdown}</Markdown>
+            </div>
+          </details>
+        ) : (
+          <section className="context-report-block" key={index}>
+            {block.title && <h3>{block.title}</h3>}
+            <Markdown>{block.markdown}</Markdown>
+          </section>
+        ),
+      )}
+    </div>
   );
 }
 
@@ -863,6 +971,7 @@ export function ChatMessage({
   activity,
   progress,
   streamedAnswer,
+  report,
   terminal,
   activityLive,
   attachments = [],
@@ -887,6 +996,7 @@ export function ChatMessage({
   activity?: ToolActivity;
   progress?: RunProgress;
   streamedAnswer?: string;
+  report?: ContextReport;
   terminal?: ChatTerminalMetadata;
   activityLive?: boolean;
   attachments?: SessionAttachment[];
@@ -899,8 +1009,11 @@ export function ChatMessage({
     side === 'agent' &&
     terminal?.terminalStatus !== undefined &&
     terminal.terminalStatus !== 'completed';
+  const copyText = [text, hasTerminalError && terminal ? chatTerminalCopy(terminal) : '']
+    .filter(Boolean)
+    .join('\n\n');
   const copy = async () => {
-    const didCopy = await copyMarkdown(text);
+    const didCopy = await copyMarkdown(copyText);
     setCopyState(didCopy ? 'copied' : 'failed');
     window.setTimeout(() => setCopyState('idle'), 1500);
   };
@@ -949,9 +1062,9 @@ export function ChatMessage({
           <ProgressCard items={progress.items} status={progress.status} />
         ) : null}
         {hasTerminalError && terminal ? <TerminalErrorCard terminal={terminal} /> : null}
-        {text && (
+        {(text || report) && (
           <div className="message-bubble final-answer">
-            <Markdown>{text}</Markdown>
+            {report ? <ContextCommandReport report={report} /> : <Markdown>{text}</Markdown>}
           </div>
         )}
         {chatInput && side === 'operator' && (
@@ -998,7 +1111,7 @@ export function ChatMessage({
               Use in main conversation
             </button>
           )}
-        {text && (
+        {copyText && (
           <button
             className="copy-message"
             onClick={copy}

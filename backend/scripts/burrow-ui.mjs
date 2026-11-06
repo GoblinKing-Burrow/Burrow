@@ -1,8 +1,8 @@
 #!/usr/bin/env node
+import { activeSessionDetail } from './ui/active-session-detail.mjs';
 import { assertModAgentAvailable } from '../src/mod-agent-runtime.mjs';
 import { createAgentReferenceImageRoutes, createModReferenceImageContentRoute, createOperatorReferenceImageRoutes } from './ui/agent-reference-image-routes.mjs';
 import { createBoardTaskExecutor } from '../src/task-execution.mjs';
-import { isDisplayChatMessage } from '../src/session-entry.mjs';
 import { chatResultMetadata } from '../src/chat-result-metadata.mjs';
 import { compactChatTurn } from '../src/compact-chat-turn.mjs';
 import { createArchiveReadProcess } from './ui/archive-read-process.mjs';
@@ -118,6 +118,7 @@ import { operationalEvent } from '../src/operational-log.mjs';
 import { instrumentHttpResponse, correlateHttpRun, recordHttpFailure, observeHttpResult, observeHttpRunEvent, observeModelRecovery, createCatalogRefreshDiagnostics } from '../src/http-operational-log.mjs';
 import { logAuthFailure, startAuthLoginTelemetry, observeAuthEnvironmentOverride } from '../src/ui-auth-diagnostics.mjs';
 import { latestProviderRequest } from '../src/provider-request-inspection.mjs';
+import { contextReport } from '../src/context-report.mjs';
 import { chatCommandHelpText, chatCommandResponse, parseChatCommand } from '../src/chat-commands.mjs';
 import { activeChatRunKey, activeChatRunSummaries, activeChatRunSummary, cancelActiveChatRun, registerActiveAgentRun } from '../src/active-chat-runs.mjs';
 import { toolActivityPresentation, toolActivityStatus } from '../src/tool-activity-labels.mjs';
@@ -2001,18 +2002,10 @@ async function sessionActivities({ sessionId, turns } = {}) {
 }
 
 
-async function sessionDetail(id, { rootDir, agentId = null } = {}) {
+async function sessionDetail(id, { rootDir, agentId = null, limit, before } = {}) {
   agentId ||= (await resolveAgentRuntime()).agentId;
-  const metadata = await postgresApplication.stores.conversations.getMetadata({ agentId, sessionId: id });
-  if (!metadata) return null;
-  const [chatEntries, activityTurns] = await Promise.all([
-    postgresApplication.stores.conversations.projection({ agentId, sessionId: id, visibility: 'chat', limit: 200 }),
-    postgresApplication.stores.conversations.projection({ agentId, sessionId: id, visibility: 'activity', limit: 20 }),
-  ]);
-  const chatTurns = chatEntries.filter(isChatMessage);
-  const visibleTurns = chatEntries.filter(entry => isDisplayChatMessage(entry) || Boolean(entry.metadata?.chatInput && entry.role));
-  const turns = [...visibleTurns, ...activityTurns].sort((a,b) => String(a.ts || '').localeCompare(String(b.ts || ''))).map(compactChatTurn);
-  return { id, turnCount: metadata.turnCount ?? turns.length, metadata, summary: metadata.summary || summarizeSessionTurns(chatTurns, { maxChars: 2000 }), turns, activities: activityTurns.filter((turn) => turn.metadata?.toolActivity).map((turn) => ({ ...turn.metadata.toolActivity, runId: turn.runId || null })) };
+  return activeSessionDetail({ store: postgresApplication.stores.conversations, agentId, sessionId: id,
+    cursorSecret: settingsKeyFromEnvironment(), limit, before, summarizeSessionTurns });
 }
 
 async function listTraces(sessionId = 'default', agentId = null) {
@@ -2567,64 +2560,6 @@ function commandText(title, fields = []) {
   return [title, ...fields.filter((field) => field?.[1] !== null && field?.[1] !== undefined).map(([label, value]) => `${label}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)].join('\n');
 }
 
-function redactProviderRequest(value, key = '') {
-  if (/authorization|api[-_]?key|token|secret|password/i.test(key)) return '[redacted]';
-  if (Array.isArray(value)) return value.map((item) => redactProviderRequest(item));
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, redactProviderRequest(item, name)]));
-  return value;
-}
-
-function providerContentChars(message = {}) {
-  const value = message?.type === 'function_call_output' ? message.output : message.content;
-  const content = typeof value === 'string' ? value : JSON.stringify(value ?? '');
-  const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls.reduce((total, call) => total + String(call?.function?.name || '').length + String(call?.function?.arguments || '').length, 0) : 0;
-  return content.length + toolCalls;
-}
-
-function contextFullText({ request, agentRuntime, sessionId, status }) {
-  const body = redactProviderRequest(request.body);
-  const messages = Array.isArray(body.messages) ? body.messages : Array.isArray(body.input) ? body.input : [];
-  const manifest = Array.isArray(request.payload?.providerMessageManifest) ? request.payload.providerMessageManifest : [];
-  const messageLines = messages.map((message, index) => {
-    const item = manifest[index] || {};
-    const role = message?.role || message?.type || 'unknown';
-    const source = item.source || 'provider-visible';
-    const state = item.status || 'selected';
-    return `## ${index + 1}. ${role} — ${source} (${state}; ${providerContentChars(message)} chars)\n\n\`\`\`json\n${JSON.stringify(message, null, 2)}\n\`\`\``;
-  });
-  const sourceTotals = manifest.reduce((totals, item, index) => {
-    const source = item.source || 'provider-visible';
-    const current = totals.get(source) || { messages: 0, chars: 0 };
-    current.messages += 1; current.chars += providerContentChars(messages[index] || {}); totals.set(source, current); return totals;
-  }, new Map());
-  const accounting = [...sourceTotals.entries()].map(([source, item]) => `- ${source}: ${item.messages} message${item.messages === 1 ? '' : 's'}, ${item.chars} chars`).join('\n') || '- [No role-structured provider messages]';
-  const estimatedTokens = status?.context?.estimatedTokens ?? null;
-  const capacityTokens = status?.context?.capacityTokens ?? null;
-  return [
-    'Context — full running provider context',
-    `Agent: ${agentRuntime.agentId}`,
-    `Session: ${sessionId}`,
-    `Run: ${request.runId}`,
-    `Sent: ${request.ts}`,
-    `Provider request: ${request.payload?.api || 'unknown'}`,
-    `Messages: ${messages.length}`,
-    `Provider-visible chars: ${request.payload?.promptChars ?? messages.reduce((total, message) => total + providerContentChars(message), 0)}`,
-    `Estimated context tokens: ${estimatedTokens ?? 'unavailable'}${capacityTokens ? ` / ${capacityTokens}` : ''}`,
-    '',
-    '# accounting', accounting,
-    '',
-    '# exact role-structured messages sent to the model',
-    messageLines.join('\n\n') || '[No role-structured provider messages; inspect the exact transport payload below.]',
-    '',
-    '# provider request options',
-    'These affect provider behavior but are not context messages.',
-    `\`\`\`json\n${JSON.stringify(Object.fromEntries(Object.entries(body).filter(([key]) => !['messages', 'input'].includes(key))), null, 2)}\n\`\`\``,
-    '',
-    '# unavailable from this completed request',
-    'Nothing provider-visible is reconstructed or omitted above. Categories absent from the messages were not sent on this request. A future next-turn preview would be a different command and must be labeled as a preview.',
-  ].join('\n');
-}
-
 function contextMeterLines(context = {}, compaction = {}, memory = {}) {
   return [
     ['Context scope', context.scope || 'historical'],
@@ -2637,28 +2572,6 @@ function contextMeterLines(context = {}, compaction = {}, memory = {}) {
     ['Compaction', compaction.active ? 'active' : 'idle'],
     ['Memory source', memory.source || 'none'],
   ];
-}
-
-function renderContextInspection({ inspection = {}, status = {}, agentRuntime, model } = {}) {
-  const files = inspection.support?.profileFiles?.files || [];
-  const profile = files.length ? ['# profile-files', ...files.map((file) => `## ${file.name}\n${file.content || ''}`)].join('\n\n') : '# profile-files\n[No profile files selected]';
-  const summary = inspection.priorSummary?.present ? `# prior-conversation-summary\n${inspection.priorSummary.text}` : '# prior-conversation-summary\n[None]';
-  const conversation = inspection.recentMessages?.length
-    ? ['# conversation', ...inspection.recentMessages.map((message) => `## ${message.role || message.type || 'message'}\n${String(message.content || '')}`)].join('\n\n')
-    : '# conversation\n[No retained conversation turns]';
-  const meter = status.context || {};
-  const continuity = inspection.workingContinuity || {};
-  const continuityLines = continuity.scope
-    ? ['# working-continuity', `Scope: ${continuity.scope}`, `Selection: ${continuity.reason || 'unknown'}; ${continuity.included?.length || 0}/${continuity.candidateCount || 0} active records included; ${continuity.omittedCount || 0} omitted; ${continuity.chars || 0} chars.`, ...(continuity.included || []).map((item) => `- ${item.id} [${item.kind}/${item.state}] — ${item.selectionReason || 'unknown'}; sources: ${(item.sourceRefs || []).join(', ') || 'none'}; expires: ${item.expiresAt || 'unknown'}`)].join('\n')
-    : '# working-continuity\n[No explicit project scope; no ambient STM was included.]';
-  return [
-    commandText('Context — current reconstruction', [['Agent', agentRuntime.agentId], ['Session', inspection.sessionId], ['Model', model || 'unconfigured'], ...contextMeterLines(meter, status.compaction, { source: inspection.memoryProvenance?.source || 'none' }), ['Selected profile files', files.map((file) => file.name).join(', ') || 'none'], ['Retained conversation turns', inspection.rawRecentTurnCount ?? 0], ['Prior summary', inspection.priorSummary?.present ? `${inspection.priorSummary.chars} chars` : 'none']]),
-    'This is the current reconstructible prompt context: selected profile files, retained summary, retained conversation, and the latest receipt-backed Working Continuity projection. STM is local operational context, not current verified evidence. Dynamic request-only support is identified in the runtime receipt but is not replayed here.',
-    profile,
-    continuityLines,
-    summary,
-    conversation,
-  ].join('\n\n');
 }
 
 async function handleChatCommand({ parsed, sessionId, agentRuntime, runId = null, onProgress = null, signal = null } = {}) {
@@ -2750,14 +2663,14 @@ async function handleChatCommand({ parsed, sessionId, agentRuntime, runId = null
   const status = await inspectSessionContextStatus({ stores: postgresApplication.stores, agentId: agentRuntime.agentId, rootDir: projectRoot, dataRoot: agentRuntime.agentWorkspaceRoot, sessionId, limits, contextConfig: runtime.contextConfig, contextWindow: runtime.modelConfig?.contextWindow, contextTokens: runtime.modelConfig?.contextTokens, liveContext: active?.contextUsage || null });
   const context = status.context || {};
   if (parsed.command === 'context') {
-    if (parsed.args === 'full') {
-      const traceSessionRoot = resolveRuntimeTracePath({ cacheRoot: runtime.runtimeState.cacheRoot, workspaceRoot: runtime.runtimeState.workspaceRoot, agentId: agentRuntime.agentId, sessionId });
-      const request = await latestProviderRequest({ traceSessionRoot, sessionId, runId: context.runId || null });
-      if (!request) return { status: 404, response: chatCommandResponse({ command: 'context', sessionId, text: 'No full running provider context is available for this session. The selected request may predate persisted request capture.', receipt: { error: 'provider_request_unavailable', runId: context.runId || null }, ok: false }) };
-      return { status: 200, response: chatCommandResponse({ command: 'context', sessionId, text: contextFullText({ request, agentRuntime, sessionId, status }), receipt: { mode: 'full', runId: request.runId, sentAt: request.ts, requestId: request.payload?.requestId || null, messageCount: request.payload?.messageCount ?? null, promptChars: request.payload?.promptChars ?? null, bodyChars: request.payload?.bodyChars ?? null, estimatedTokens: context.estimatedTokens ?? null, capacityTokens: context.capacityTokens ?? null } }) };
-    }
-    const inspection = await inspectSessionContext({ stores: postgresApplication.stores, agentId: agentRuntime.agentId, rootDir: projectRoot, dataRoot: agentRuntime.agentWorkspaceRoot, sessionId, limits, includeProfileFiles: true, agentRuntime, contextWindow: runtime.modelConfig?.contextWindow, contextTokens: runtime.modelConfig?.contextTokens });
-    return { status: 200, response: chatCommandResponse({ command: 'context', sessionId, text: renderContextInspection({ inspection, status, agentRuntime, model: runtime.modelConfig?.model }), receipt: { context: { estimatedTokens: context.estimatedTokens ?? null, capacityTokens: context.capacityTokens ?? null, percent: context.percent ?? null, pressure: context.pressure ?? 'unknown', source: context.source ?? null }, reconstruction: { profileFiles: inspection.support?.profileFiles?.files?.map((file) => ({ name: file.name, chars: file.chars })) || [], rawRecentTurnCount: inspection.rawRecentTurnCount ?? 0, priorSummaryChars: inspection.priorSummary?.chars ?? 0 }, compaction: { active: Boolean(status.compaction?.active), next: status.compaction?.next || null }, memory: { source: inspection.memoryProvenance?.source || 'none' } } }) };
+    const traceSessionRoot = resolveRuntimeTracePath({ cacheRoot: runtime.runtimeState.cacheRoot, workspaceRoot: runtime.runtimeState.workspaceRoot, agentId: agentRuntime.agentId, sessionId });
+    const request = await latestProviderRequest({ traceSessionRoot, sessionId, runId: context.runId || null, requestId: context.requestId || null });
+    if (!request) return { status: 404, response: chatCommandResponse({ command: 'context', sessionId, text: 'No captured provider request is available for this session meter. Send a message first; older requests may predate request capture. Current settings have not been substituted for missing captured context.', receipt: { error: 'provider_request_unavailable', runId: context.runId || null, requestId: context.requestId || null }, ok: false }) };
+    const full = parsed.args === 'full';
+    const presentation = contextReport({ request, agentRuntime, sessionId, status, full });
+    const response = chatCommandResponse({ command: 'context', sessionId, text: presentation.text, receipt: { mode: full ? 'full' : 'overview', runId: request.runId, sentAt: request.ts, requestId: request.payload?.requestId || null, messageCount: request.payload?.messageCount ?? null, promptChars: request.payload?.promptChars ?? null, estimatedTokens: context.requestId === request.payload?.requestId ? context.estimatedTokens ?? null : null, capacityTokens: context.capacityTokens ?? null } });
+    response.result.contextReport = presentation.report;
+    return { status: 200, response };
   }
   return { status: 200, response: chatCommandResponse({ command: 'status', sessionId, text: commandText('Status', [['Agent', agentRuntime.agentId], ['Session', sessionId], ['Model', runtime.modelConfig?.model || 'unconfigured'], ['Model configured', Boolean(runtime.modelConfig?.model)], ['Run', active ? `${active.runId} (${active.phase})` : 'idle'], ...contextMeterLines(context, status.compaction, { source: status.recall?.used ? 'session recall' : 'none' })]), receipt: { agentId: agentRuntime.agentId, model: runtime.modelConfig?.model || null, modelConfigured: Boolean(runtime.modelConfig?.model), activeRun: active ? activeChatRunSummary(active) : null, context, compaction: { active: Boolean(status.compaction?.active), next: status.compaction?.next || null }, memory: { source: status.recall?.used ? 'session recall' : 'none' } } }) };
 }
@@ -3100,7 +3013,7 @@ async function currentActiveChatRunSummaries({ agentId = null, sessionId = null 
     }
   }
   runs.sort((a, b) => a.agentId.localeCompare(b.agentId) || a.depth - b.depth);
-  return { runs, subagents: childRecords };
+  return { runs, subagents: childRecords, pendingForgeDeliveries: await postgresApplication.stores.forge.pendingChatDeliveryCount({ agentId, sessionId }) };
 }
 
 const exportRoute = createExportRoutes({ readJsonBody, sendJson, exportCatalog, normalizeImportRequest, decodeExport, buildExport, exportSnapshot, importPreview, applyImport });
@@ -3621,6 +3534,8 @@ server.listen(port, host, () => {
       disabled: loadedMods.filter(mod => mod.status === 'disabled').length, failed: loadedMods.filter(mod => mod.status === 'failed').length },
   });
   await serverLogger.event('listener_started', { host, port, pid: process.pid, version: releaseVersion });
+  const forgeDelivery = await postgresApplication.stores.forge.reconcileChatDeliveries();
+  if (forgeDelivery.failed) await serverLogger.event('forge_delivery_recovery_failed', forgeDelivery, { level: 'warn', component: 'forge' });
   await postgresApplication.stores.dreamCycles.reconcileInterrupted();
   if (shuttingDown) return;
   if (backgroundSchedulersEnabled()) {

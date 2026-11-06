@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from './api';
 import type { SavedProvider } from './types';
 import { useRuntimeAgents } from './useRuntimeAgents';
+import { chatProvider } from './modelSelectionOptions';
 import { reconcileModelCatalog } from './useRuntimeDashboard';
 import { childStreamId } from './useRuntimeSelection';
 
@@ -1180,5 +1181,278 @@ it('hydrates a saved resident LB selection in the legacy overview path without e
     subagents: [],
   });
   expect(reportError).not.toHaveBeenCalled();
+  runtimeProviders.current = [];
+});
+
+describe('resident context hydration', () => {
+  beforeEach(() => {
+    apiMock.mockReset();
+  });
+
+  it.each(['overview', 'legacy'])(
+    'hydrates resident context through %s without engineering defaults',
+    async (mode) => {
+      const resident = { id: 'gerald', name: 'Gerald', enabled: true, modAgent: true };
+      const status = {
+        context: {
+          usageRatio: 0.423,
+          estimatedTokens: 42300,
+          capacityTokens: 100000,
+          pressure: 'normal',
+          source: 'estimated',
+        },
+        compaction: { active: true, summarizedTurnCount: 8, rawRecentTurnCount: 4 },
+        recall: { used: true, scope: 'session', sourceCount: 2 },
+      };
+      apiMock.mockImplementation(async (path) => {
+        if (path === '/api/agents') return { agents: [resident] };
+        if (path === '/api/agents/overview') {
+          if (mode === 'legacy') throw Object.assign(new Error('Not found'), { status: 404 });
+          return {
+            agents: [
+              {
+                agent: resident,
+                sessionId: 'default',
+                selection: null,
+                status: { agents: [] },
+                contexts: { default: status },
+              },
+            ],
+          };
+        }
+        if (path === '/api/settings/identities') return { agents: [] };
+        if (path === '/api/agents/gerald/model-selection') return { selection: null };
+        if (path === '/api/session/context-status?agentId=gerald&sessionId=default')
+          return { status };
+        throw new Error(`Unexpected path: ${path}`);
+      });
+      const { result } = renderRuntimeAgents('gerald');
+      await waitFor(() => expect(result.current.agents[0]?.context).toBe(42));
+      expect(result.current.agents[0]).toMatchObject({
+        workspace: '',
+        provider: '',
+        subagents: [],
+        contextDetails: {
+          estimatedTokens: 42300,
+          capacityTokens: 100000,
+          compactionActive: true,
+          summarizedTurnCount: 8,
+          rawRecentTurnCount: 4,
+          recallUsed: true,
+          recallScope: 'session',
+          recallSourceCount: 2,
+        },
+      });
+      expect(apiMock.mock.calls.some(([path]) => path.startsWith('/api/agent-status'))).toBe(false);
+      if (mode === 'legacy')
+        expect(apiMock).toHaveBeenCalledWith(
+          '/api/session/context-status?agentId=gerald&sessionId=default',
+          expect.anything(),
+        );
+    },
+  );
+});
+
+it.each(['missing connection', 'missing model', 'catalog delayed'])(
+  'retains ordinary agent saved selection with %s instead of substituting a default',
+  async (mode) => {
+    apiMock.mockReset();
+    const available = [
+      { id: 'lb', provider: 'Load balancer', models: ['fallback'] },
+      { id: 'saved', provider: 'Saved', models: ['other'] },
+    ] as SavedProvider[];
+    runtimeProviders.current = mode === 'catalog delayed' ? [] : available;
+    const selection = {
+      connectionId: mode === 'missing connection' ? 'deleted' : 'saved',
+      model: 'old-model',
+      reasoningEffort: 'high',
+      thinkingMode: 'adaptive',
+      temperature: 1.4,
+    };
+    apiMock.mockImplementation(async (path) => {
+      if (path === '/api/agents') return { agents: [{ id: 'smatchet' }] };
+      if (path === '/api/agents/overview')
+        return {
+          agents: [
+            {
+              agent: { id: 'smatchet', name: 'Smatchet', enabled: true },
+              sessionId: 'default',
+              selection,
+              status: { agents: [] },
+              contexts: {},
+            },
+          ],
+        };
+      throw new Error(`Unexpected path: ${path}`);
+    });
+    const { result, unmount } = renderRuntimeAgents('smatchet');
+    await waitFor(() => expect(result.current.registryState).toBe('ready'));
+    const [hydrated] = result.current.agents;
+    expect(hydrated).toMatchObject({
+      modelConnectionId: selection.connectionId,
+      model: selection.model,
+      effort: 'high',
+      temperature: 1.4,
+      thinkingMode: 'adaptive',
+    });
+    const [reconciled] = reconcileModelCatalog([hydrated], available);
+    expect(reconciled).toMatchObject({
+      modelConnectionId: selection.connectionId,
+      model: selection.model,
+      temperature: 1.4,
+      thinkingMode: 'adaptive',
+      effort: hydrated.effort,
+    });
+    const sendProvider = chatProvider(reconciled, available);
+    expect(!sendProvider || !sendProvider.models.includes(reconciled.model)).toBe(true);
+    unmount();
+    runtimeProviders.current = [];
+  },
+);
+
+it('still assigns first-time ordinary agent defaults when no selection was saved', async () => {
+  apiMock.mockReset();
+  runtimeProviders.current = [
+    {
+      id: 'lb',
+      provider: 'Load balancer',
+      apiType: 'openai-responses',
+      url: '',
+      apiKey: '',
+      models: ['fallback'],
+      defaultEfforts: { fallback: 'low' },
+    },
+  ] as SavedProvider[];
+  apiMock.mockImplementation(async (path) => {
+    if (path === '/api/agents') return { agents: [{ id: 'smatchet' }] };
+    if (path === '/api/agents/overview')
+      return {
+        agents: [
+          {
+            agent: { id: 'smatchet', name: 'Smatchet', enabled: true },
+            sessionId: 'default',
+            selection: null,
+            status: { agents: [] },
+            contexts: {},
+          },
+        ],
+      };
+    throw new Error(`Unexpected path: ${path}`);
+  });
+  const { result, unmount } = renderRuntimeAgents('smatchet');
+  await waitFor(() => expect(result.current.registryState).toBe('ready'));
+  expect(result.current.agents[0]).toMatchObject({
+    provider: 'Load balancer',
+    modelConnectionId: 'lb',
+    model: 'fallback',
+    effort: 'low',
+  });
+  unmount();
+  runtimeProviders.current = [];
+});
+
+it('keeps acknowledged model, connection and tuning across an older in-flight overview', async () => {
+  apiMock.mockReset();
+  const providers = [
+    { id: 'old', provider: 'Old', models: ['old-model'] },
+    { id: 'new', provider: 'New', models: ['new-model'] },
+  ] as SavedProvider[];
+  runtimeProviders.current = providers;
+  let releaseOverview!: (value: unknown) => void;
+  let calls = 0;
+  const overview = (connectionId: string, model: string, temperature: number, percent: number) => ({
+    agents: [
+      {
+        agent: { id: 'smatchet', name: 'Smatchet', enabled: true },
+        sessionId: 'default',
+        selection: { connectionId, model, reasoningEffort: 'low', temperature },
+        status: { agents: [] },
+        contexts: { default: { context: { percent } } },
+      },
+    ],
+  });
+  apiMock.mockImplementation(async (path, options) => {
+    if (path === '/api/agents') return { agents: [{ id: 'smatchet' }] };
+    if (path === '/api/agents/overview') {
+      calls++;
+      if (calls === 2)
+        return new Promise((resolve) => {
+          releaseOverview = resolve;
+        });
+      return overview('old', 'old-model', 0.2, calls === 1 ? 10 : 90);
+    }
+    if (path === '/api/agents/smatchet/model-selection' && options?.method === 'PUT')
+      return { selection: { model: 'new-model', reasoningEffort: 'high', temperature: 1.4 } };
+    throw new Error(`Unexpected path: ${path}`);
+  });
+  const { useModelSelectionWriter } = await import('./useModelSelectionWriter');
+  const { result, unmount } = renderHook(() => {
+    const registry = useRuntimeAgents({
+      selectedAgentId: 'smatchet',
+      selectedStreamId: 'smatchet',
+      setSelectedAgentId,
+      parentSessionIdForAgent: () => 'default',
+      runtimeProviders,
+      setSelectedStreamId,
+      onNoAgents,
+      reportError,
+    });
+    const write = useModelSelectionWriter(
+      providers,
+      (id, patch) =>
+        registry.setAgents((all) =>
+          all.map((agent) => (agent.id === id ? { ...agent, ...patch } : agent)),
+        ),
+      reportError,
+    );
+    return { ...registry, write };
+  });
+  await waitFor(() => expect(result.current.agents[0]?.context).toBe(10));
+  let old!: Promise<void>;
+  act(() => {
+    old = result.current.refreshAgents();
+  });
+  await waitFor(() => expect(releaseOverview).toBeDefined());
+  await act(async () => {
+    expect(
+      await result.current.write(result.current.agents[0], {
+        provider: 'New',
+        modelConnectionId: 'new',
+        model: 'new-model',
+        effort: 'high',
+        temperature: 1.4,
+      }),
+    ).toBe(true);
+  });
+  expect(result.current.agents[0]).toMatchObject({
+    provider: 'New',
+    modelConnectionId: 'new',
+    model: 'new-model',
+    effort: 'high',
+    temperature: 1.4,
+  });
+  await act(async () => {
+    releaseOverview(overview('old', 'old-model', 0.2, 75));
+    await old;
+  });
+  expect(result.current.agents[0]).toMatchObject({
+    provider: 'New',
+    modelConnectionId: 'new',
+    model: 'new-model',
+    effort: 'high',
+    temperature: 1.4,
+    context: 75,
+  });
+  await act(async () => {
+    await result.current.refreshAgents();
+  });
+  expect(result.current.agents[0]).toMatchObject({
+    provider: 'Old',
+    modelConnectionId: 'old',
+    model: 'old-model',
+    temperature: 0.2,
+    context: 90,
+  });
+  unmount();
   runtimeProviders.current = [];
 });

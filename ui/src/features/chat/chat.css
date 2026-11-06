@@ -5,6 +5,13 @@
   min-height: 0;
   padding: 18px;
 }
+.chat-transcript {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
 .chat-messages {
   display: flex;
   flex: 1;
@@ -981,6 +988,8 @@
   letter-spacing: 0.02em;
 }
 .model-error-card p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   margin: 0 0 8px;
   color: var(--text-strong);
 }
@@ -1286,4 +1295,77 @@
 }
 .chat-error > button {
   flex-shrink: 0;
+}
+
+.context-report-block + .context-report-block {
+  margin-top: 20px;
+}
+.context-report-block > :first-child {
+  margin-top: 0;
+}
+.context-report-block > :last-child {
+  margin-bottom: 0;
+}
+.context-report-block h3 {
+  margin: 0 0 8px;
+  font-size: 1em;
+}
+.context-report .context-report-details {
+  width: 100%;
+  margin: 12px 0 0;
+  color: var(--text);
+}
+.context-report-details summary {
+  padding: 8px 10px;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.context-report-details summary > span:first-child {
+  color: inherit;
+  font-size: inherit;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.context-report-details summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: inherit;
+}
+.context-report-details .streamed-answer-chevron {
+  flex-shrink: 0;
+}
+
+.chat-jump-latest {
+  position: absolute;
+  z-index: 3;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 1px solid var(--accent-border);
+  border-radius: 50%;
+  background: var(--surface, #15151d);
+  color: var(--accent);
+  box-shadow: 0 3px 12px #0008;
+}
+.chat-jump-latest:hover {
+  background: color-mix(in srgb, var(--accent) 15%, var(--surface, #15151d));
+  border-color: var(--accent);
+}
+.chat-jump-latest:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.chat-jump-latest svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
