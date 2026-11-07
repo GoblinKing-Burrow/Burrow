@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { createPostgresOpenAiResetStore } from '../src/postgres-openai-reset-store.mjs';
+import { startOpenAiResetScheduler } from '../src/openai-reset-scheduler.mjs';
 import { activeSessionDetail } from './ui/active-session-detail.mjs';
 import { assertModAgentAvailable } from '../src/mod-agent-runtime.mjs';
 import { createAgentReferenceImageRoutes, createModReferenceImageContentRoute, createOperatorReferenceImageRoutes } from './ui/agent-reference-image-routes.mjs';
@@ -40,7 +42,7 @@ import { browserTabSettings, saveBrowserTabSettings } from '../src/browser-tab-s
 import { otelSettings, readOtelRuntimeConfig, saveOtelSettings } from '../src/otel-settings.mjs';
 import { createReconfigurableOtelRuntime } from '../src/otel-runtime.mjs';
 import { artifactResponseHeaders } from '../src/artifact-response-policy.mjs';
-import { postgresConfig, postgresTransactionContext, withPostgresTransaction } from '../src/postgres-foundation.mjs';
+import { postgresConfig } from '../src/postgres-foundation.mjs';
 import { acquirePostgresRuntimeOwnership } from '../src/postgres-runtime-ownership.mjs';
 import { readJsonBody } from '../src/request-resource-budgets.mjs';
 import { operatorTimezone, saveOperatorTimezone } from '../src/timezone.mjs';
@@ -54,7 +56,6 @@ import { runtimeDiagnosticSessionDetail, runtimeDiagnosticContextSummary, runtim
 import { releaseVersion } from '../src/release-version.mjs';
 import { createServer } from 'node:http';
 import { promises as fs } from 'node:fs';
-import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inspectSessionContext, inspectSessionContextStatus } from '../src/context-engine.mjs';
@@ -79,20 +80,17 @@ import { postgresContinuity } from '../src/postgres-continuity.mjs';
 import { generateArchiveSummary } from '../src/archive-summary.mjs';
 import { loadWorkingContinuityAsync, normalizeContinuityScope, projectHandoffsIntoWorkingContinuity } from '../src/working-memory-continuity.mjs';
 import { workingContextFromSession } from '../src/working-context.mjs';
-import { appendGroupChannelTurn, createGroupChannel, listGroupChannels, readGroupChannel, readGroupChannelTurns } from '../src/group-channel-store.mjs';
-import { resolveGroupMentionTargets } from '../src/group-channel-routing.mjs';
+import { createGroupChannel, listGroupChannels, readGroupChannelTurns } from '../src/group-channel-store.mjs';
 import { runRetentionCleanup } from '../src/retention.mjs';
 import { normalizeRetentionPolicy, readRetentionPolicy, readRetentionPolicyState, retentionPolicyFailureState, retentionPolicySuccessState, saveRetentionPolicy, writeRetentionPolicyState } from '../src/retention-settings.mjs';
 import { createRetentionScheduler } from '../src/retention-scheduler.mjs';
 import { createInstallStagingCleanupScheduler } from '../src/install-staging-cleanup.mjs';
 import { authorityExplanationFromTraceSummary, latestAuthorityExplanationForSession, listAuthorityExplanationsForSession, summarizeTrace, validTraceRunId } from '../src/trace-summary.mjs';
-import { routeRequest } from '../src/request-router.mjs';
 import { planTurn } from '../src/turn-planner.mjs';
 import { workbenchWorkflow } from '../src/workbench-workflow.mjs';
 import { runWorkbenchStep } from '../src/workbench-runner.mjs';
-import { resolveExecutionTarget } from '../src/execution-context.mjs';
 import { createExecutionProviderRegistry } from '../src/process-execution-router.mjs';
-import { buildChatSupportStatus, buildWorkbenchStatus } from '../src/workbench-status.mjs';
+import { buildWorkbenchStatus } from '../src/workbench-status.mjs';
 import { allowedNextSteps, appendWorkItemStep, archiveWorkItem, createWorkItem, listWorkItems, readWorkItem, workItemEligibility } from '../src/work-item-store.mjs';
 import { searchBurrowSessionEvidence, searchSessionEvidence } from '../src/session-search.mjs';
 import { CODEX_CLIENT_VERSION_CACHE_TTL_MS, isProviderPool, assertConnection, assertProviderPoolMembers, providerPoolModels, normalizeModels, discoverModels, refreshCodexClientVersionCache } from '../src/model-settings-store.mjs';
@@ -116,12 +114,14 @@ import { createRuntimeMetricsCollector } from '../src/runtime-metrics.mjs';
 import { createRuntimeServerLogger, safeOperationalError } from '../src/runtime-server-log.mjs';
 import { operationalEvent } from '../src/operational-log.mjs';
 import { instrumentHttpResponse, correlateHttpRun, recordHttpFailure, observeHttpResult, observeHttpRunEvent, observeModelRecovery, createCatalogRefreshDiagnostics } from '../src/http-operational-log.mjs';
+import { BASIC_SESSION_COOKIE, basicCredentials, parseCookieHeader, planUiAuthSettings, safeUiAuthSettings, setBasicSessionCookie, verifyBasicSessionCookie, verifyScryptPassword, createUiAuthService } from '../src/ui-auth-service.mjs';
 import { logAuthFailure, startAuthLoginTelemetry, observeAuthEnvironmentOverride } from '../src/ui-auth-diagnostics.mjs';
 import { latestProviderRequest } from '../src/provider-request-inspection.mjs';
 import { contextReport } from '../src/context-report.mjs';
 import { chatCommandHelpText, chatCommandResponse, parseChatCommand } from '../src/chat-commands.mjs';
+import { createAgentRunCompletionDispatch } from '../src/agent-run-completion-dispatch.mjs';
 import { activeChatRunKey, activeChatRunSummaries, activeChatRunSummary, cancelActiveChatRun, registerActiveAgentRun } from '../src/active-chat-runs.mjs';
-import { toolActivityPresentation, toolActivityStatus } from '../src/tool-activity-labels.mjs';
+import { toolActivityPresentation } from '../src/tool-activity-labels.mjs';
 import { executionBoundaryStatus, readExecutionBoundaries, saveExecutionBoundaries } from '../src/execution-boundaries.mjs';
 import { clearOidcCookies, completeOidcCallback, oidcCookieClearHeader, oidcLoginUrl, oidcSessionFromRequest, sendOidcSessionCookie, setOidcStateCookie } from '../src/ui-oidc-auth.mjs';
 import { buildExport, decodeExport, exportCatalog, normalizeImportRequest } from '../src/export-service.mjs';
@@ -130,7 +130,7 @@ import { createTaskBoardRoutes } from './ui/task-board-routes.mjs';
 import { createWorkbenchRoutes } from './ui/workbench-routes.mjs';
 import { configureForgeStoreFactory } from '../src/forge-agent-tools.mjs';
 import { createPostgresApplication } from '../src/postgres-composition.mjs';
-import { settingsKeyFromEnvironment } from '../src/model-settings-store.mjs';
+import { settingsKeyFromEnvironment } from '../src/settings-key.mjs';
 import { createForgeRoutes } from './ui/forge-routes.mjs';
 import { createDreamRoutes } from './ui/dream-routes.mjs';
 import { createSettingsRoutes } from './ui/settings-routes.mjs';
@@ -198,7 +198,14 @@ const configuredRunCancellationGraceMs = Number(process.env.BURROW_RUN_CANCELLAT
 const RUN_CANCELLATION_GRACE_MS = Number.isFinite(configuredRunCancellationGraceMs) ? Math.max(1_000, configuredRunCancellationGraceMs) : 5_000;
 const authorityConfig = httpAuthorityConfig({ host, port });
 browserOriginConfig(); // Validate optional environment override at startup.
-const activeChatRuns = new Map();
+let completionDispatch = null;
+const activeChatRuns = new class extends Map {
+  delete(key) {
+    const removed = super.delete(key);
+    if (removed) queueMicrotask(() => completionDispatch?.activityChanged());
+    return removed;
+  }
+}();
 const executionProviders = createExecutionProviderRegistry();
 const sessionContinuityHeads = new Map();
 // The continuity head rejects stale writes, but browser requests sharing a
@@ -223,7 +230,6 @@ let installStagingCleanupScheduler = null;
 let recoveryContinuationScheduler = null;
 const traceStatusCache = new Map();
 const TRACE_STATUS_CACHE_MS = 30_000;
-const BASIC_SESSION_COOKIE = 'hc_basic_session';
 const OPENAI_OAUTH_USAGE_URL = process.env.BURROW_OPENAI_OAUTH_USAGE_URL || 'https://chatgpt.com/backend-api/wham/usage';
 const requestLifecycle = createBackgroundLifecycle({ name: 'runtime_request', logger: serverLogger });
 const runtimePostgresConfig = postgresConfig();
@@ -242,7 +248,8 @@ const postgresApplication = await createPostgresApplication({
   connections: async (filter) => postgresApplication.stores.models.list(filter),
   resolveConfig: (connectionId, modelId) => resolveModelConfig({ stores: postgresApplication.stores, modelConnectionId: connectionId, model: modelId }),
 });
-const { anthropicOauthUsage, openaiOauthUsage, openaiResetCredits, consumeOpenaiResetCredit } = createProviderUsageService({ modelLookup: modelsStore, authSecretToken, fetchImpl: globalThis.fetch, clock: Date.now, openaiUsageUrl: OPENAI_OAUTH_USAGE_URL });
+const { anthropicOauthUsage, openaiOauthUsage, openaiResetCredits, consumeOpenaiResetCredit, pollExpiringResets } = createProviderUsageService({ modelLookup: modelsStore, authSecretToken, fetchImpl: globalThis.fetch, clock: Date.now,
+  resetStore: createPostgresOpenAiResetStore(modelsStore().pool), openaiUsageUrl: OPENAI_OAUTH_USAGE_URL });
 await serverLogger.event('database_ready', {}, { component: 'postgres' });
 configureMcpProviderStateStore(postgresApplication.stores.mcpProviderStates, { logger: serverLogger });
 await hydrateMcpProviderStates({ runtimeRoot: process.env.BURROW_MCPORTER_ROOT || path.join(runtimeRoot, 'integrations', 'mcporter') }).catch(() => serverLogger.event('mcp_provider_state_hydration_failed', { errorCode: 'mcp_provider_state_hydration_failed' }, { level: 'warn', component: 'mcp' }));
@@ -825,137 +832,7 @@ async function saveCuratorSettings(body = {}) {
   } catch (error) { return { ok: false, status: 400, error: String(error?.message || error) }; }
 }
 
-function normalizeUiAuthRecord(record = {}) {
-  const mode = String(record.mode || 'none').trim().toLowerCase();
-  const allowedModes = new Set(['none', 'trusted-proxy', 'basic', 'oidc']);
-  if (!allowedModes.has(mode)) throw new Error('ui_auth_mode_invalid');
-  const trustedProxy = record.trustedProxy && typeof record.trustedProxy === 'object' ? record.trustedProxy : {};
-  const basic = record.basic && typeof record.basic === 'object' ? record.basic : {};
-  const sessionTtlSeconds = Math.max(60, Math.floor(Number(basic.sessionTtlSeconds ?? 12 * 60 * 60) || 12 * 60 * 60));
-  return {
-    mode,
-    trustedProxy: {
-      allowedProxies: (Array.isArray(trustedProxy.allowedProxies) ? trustedProxy.allowedProxies : [])
-        .map((value) => String(value || '').trim()).filter(Boolean),
-      userHeader: String(trustedProxy.userHeader || 'x-forwarded-user').trim().toLowerCase() || 'x-forwarded-user',
-    },
-    basic: {
-      username: String(basic.username || '').trim(),
-      passwordHash: String(basic.passwordHash || '').trim(),
-      sessionTtlSeconds,
-      insecureCookies: basic.insecureCookies === true,
-    },
-    oidc: {
-      issuer: String(record.oidc?.issuer || '').trim(),
-      clientId: String(record.oidc?.clientId || '').trim(),
-      clientSecret: String(record.oidc?.clientSecret || '').trim(),
-      clientSecretConfigured: Boolean(record.oidc?.clientSecretConfigured),
-      redirectUri: String(record.oidc?.redirectUri || '').trim(),
-      scopes: (Array.isArray(record.oidc?.scopes) ? record.oidc.scopes : ['openid', 'email', 'profile']).map((value) => String(value || '').trim()).filter(Boolean),
-      allowedEmails: (Array.isArray(record.oidc?.allowedEmails) ? record.oidc.allowedEmails : []).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean),
-      allowedDomains: (Array.isArray(record.oidc?.allowedDomains) ? record.oidc.allowedDomains : []).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean),
-    },
-  };
-}
-
-function safeUiAuthSettings(record = {}) {
-  const normalized = normalizeUiAuthRecord(record);
-  return {
-    mode: normalized.mode,
-    trustedProxy: normalized.trustedProxy,
-    basic: {
-      username: normalized.basic.username,
-      passwordConfigured: Boolean(normalized.basic.passwordHash),
-      sessionTtlSeconds: normalized.basic.sessionTtlSeconds,
-      insecureCookies: normalized.basic.insecureCookies,
-    },
-    oidc: {
-      issuer: normalized.oidc.issuer,
-      clientId: normalized.oidc.clientId,
-      clientSecretConfigured: Boolean(normalized.oidc.clientSecret || normalized.oidc.clientSecretConfigured),
-      redirectUri: normalized.oidc.redirectUri,
-      scopes: normalized.oidc.scopes,
-      allowedEmails: normalized.oidc.allowedEmails,
-      allowedDomains: normalized.oidc.allowedDomains,
-    },
-  };
-}
-
-async function readUiAuthRecord() {
-  const record = normalizeUiAuthRecord(await metadataStore().get('ui_auth') || {});
-  record.oidc.clientSecretConfigured = Boolean(record.oidc.clientSecretConfigured || await uiAuthSecretStore().has('oidcClientSecret'));
-  return record;
-}
-
-async function uiAuthSettings() {
-  const runtime = await runtimeConfig();
-  return { ok: true, auth: safeUiAuthSettings(await readUiAuthRecord()), effective: { mode: runtime.ui.authMode, enabled: runtime.ui.authEnabled, source: runtime.ui.authSource } };
-}
-
-function hashBasicPassword(password) {
-  const salt = randomBytes(16);
-  return `scrypt:16384:${salt.toString('base64url')}:${scryptSync(String(password || ''), salt, 32, { N: 16384 }).toString('base64url')}`;
-}
-
-function planUiAuthSettings(body, existing) {
-    const mode = String(body.mode || existing.mode || 'none').trim().toLowerCase();
-    if (!['none', 'trusted-proxy', 'basic', 'oidc'].includes(mode)) return { ok: false, status: 400, error: 'ui_auth_mode_invalid' };
-    const trustedProxyInput = body.trustedProxy && typeof body.trustedProxy === 'object' ? body.trustedProxy : {};
-    const basicInput = body.basic && typeof body.basic === 'object' ? body.basic : {};
-    const oidcInput = body.oidc && typeof body.oidc === 'object' ? body.oidc : {};
-    const next = normalizeUiAuthRecord({
-      mode,
-      trustedProxy: {
-        allowedProxies: Array.isArray(trustedProxyInput.allowedProxies) ? trustedProxyInput.allowedProxies : existing.trustedProxy.allowedProxies,
-        userHeader: trustedProxyInput.userHeader ?? existing.trustedProxy.userHeader,
-      },
-      basic: {
-        username: basicInput.username ?? existing.basic.username,
-        passwordHash: basicInput.password !== undefined ? hashBasicPassword(basicInput.password) : existing.basic.passwordHash,
-        sessionTtlSeconds: basicInput.sessionTtlSeconds ?? existing.basic.sessionTtlSeconds,
-        insecureCookies: basicInput.insecureCookies ?? existing.basic.insecureCookies,
-      },
-      oidc: {
-        issuer: oidcInput.issuer ?? existing.oidc.issuer,
-        clientId: oidcInput.clientId ?? existing.oidc.clientId,
-        clientSecret: oidcInput.clientSecret !== undefined ? oidcInput.clientSecret : '',
-        clientSecretConfigured: existing.oidc.clientSecretConfigured,
-        redirectUri: oidcInput.redirectUri ?? existing.oidc.redirectUri,
-        scopes: Array.isArray(oidcInput.scopes) ? oidcInput.scopes : existing.oidc.scopes,
-        allowedEmails: Array.isArray(oidcInput.allowedEmails) ? oidcInput.allowedEmails : existing.oidc.allowedEmails,
-        allowedDomains: Array.isArray(oidcInput.allowedDomains) ? oidcInput.allowedDomains : existing.oidc.allowedDomains,
-      },
-    });
-    if (next.mode === 'trusted-proxy' && !next.trustedProxy.allowedProxies.length) return { ok: false, status: 400, error: 'trusted_proxy_allowed_proxies_required' };
-    if (next.mode === 'basic' && (!next.basic.username || !next.basic.passwordHash)) return { ok: false, status: 400, error: 'basic_username_password_required' };
-    const replacementSecret = oidcInput.clientSecret !== undefined && String(oidcInput.clientSecret || '').trim() ? String(oidcInput.clientSecret) : null;
-    next.oidc.clientSecretConfigured = Boolean(next.oidc.clientSecretConfigured || replacementSecret);
-    if (next.mode === 'oidc' && (!next.oidc.issuer || !next.oidc.clientId || !next.oidc.clientSecretConfigured)) return { ok: false, status: 400, error: 'oidc_issuer_client_secret_required' };
-    return { ok: true, next, replacementSecret };
-}
-
-async function saveUiAuthSettings(body = {}) {
-  try {
-    const plan = planUiAuthSettings(body, await readUiAuthRecord());
-    if (!plan.ok) return plan;
-    const { next, replacementSecret } = plan;
-    const stored = normalizeUiAuthRecord(next);
-    stored.oidc.clientSecret = '';
-    stored.oidc.clientSecretConfigured = next.oidc.clientSecretConfigured;
-    const metadata = metadataStore();
-    const secrets = uiAuthSecretStore();
-    await withPostgresTransaction(metadata.pool, async (client) => {
-      const pool = postgresTransactionContext(client);
-      // Borrow one context without losing store configuration or injected failures.
-      const transactionalMetadata = Object.assign(Object.create(Object.getPrototypeOf(metadata)), metadata, { pool });
-      const transactionalSecrets = Object.assign(Object.create(Object.getPrototypeOf(secrets)), secrets, { pool });
-      if (replacementSecret) await transactionalSecrets.set('oidcClientSecret', replacementSecret);
-      await transactionalMetadata.set('ui_auth', stored);
-    });
-    const runtime = await runtimeConfig();
-    return { ok: true, auth: safeUiAuthSettings(next), effective: { mode: runtime.ui.authMode, enabled: runtime.ui.authEnabled, source: runtime.ui.authSource } };
-  } catch (error) { return { ok: false, status: 400, error: String(error?.message || error) }; }
-}
+const { readUiAuthRecord, uiAuthSettings, saveUiAuthSettings } = createUiAuthService({ metadataStore, uiAuthSecretStore, runtimeConfig });
 
 async function chatIdentities() { return { ok: true, ...await modelsStore().identities() }; }
 async function saveChatIdentity(body = {}) {
@@ -1238,68 +1115,6 @@ function headerValue(req, name) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function basicCredentials(req) {
-  const auth = String(req.headers.authorization || '');
-  if (!auth.toLowerCase().startsWith('basic ')) return null;
-  const decoded = Buffer.from(auth.slice(6).trim(), 'base64').toString('utf8');
-  const separator = decoded.indexOf(':');
-  if (separator < 0) return null;
-  return { username: decoded.slice(0, separator), password: decoded.slice(separator + 1) };
-}
-
-function parseCookieHeader(header = '') {
-  const cookies = {};
-  for (const part of String(header || '').split(';')) {
-    const separator = part.indexOf('=');
-    if (separator < 0) continue;
-    const key = part.slice(0, separator).trim();
-    if (!key) continue;
-    cookies[key] = decodeURIComponent(part.slice(separator + 1).trim());
-  }
-  return cookies;
-}
-
-function basicSessionSignature(payload, passwordHash) {
-  return createHmac('sha256', `burrow-basic-session:${String(passwordHash || '')}`).update(payload).digest('base64url');
-}
-
-function signBasicSession({ username, passwordHash, ttlSeconds }) {
-  const expiresAt = Date.now() + Math.max(60, Number(ttlSeconds) || 0) * 1000;
-  const payload = Buffer.from(JSON.stringify({ username, expiresAt }), 'utf8').toString('base64url');
-  return `${payload}.${basicSessionSignature(payload, passwordHash)}`;
-}
-
-function verifyBasicSessionCookie(value, auth, nowMs = Date.now()) {
-  const [payload, signature] = String(value || '').split('.');
-  if (!payload || !signature || !auth?.basic?.passwordHash || !auth.basic.username) return null;
-  const expected = basicSessionSignature(payload, auth.basic.passwordHash);
-  const actual = Buffer.from(signature);
-  const expectedBuffer = Buffer.from(expected);
-  if (actual.length !== expectedBuffer.length || !timingSafeEqual(actual, expectedBuffer)) return null;
-  let decoded = null;
-  try { decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')); } catch { return null; }
-  if (decoded?.username !== auth.basic.username) return null;
-  if (!Number.isFinite(Number(decoded.expiresAt)) || Number(decoded.expiresAt) <= nowMs) return null;
-  return { username: decoded.username, expiresAt: new Date(Number(decoded.expiresAt)).toISOString() };
-}
-
-function setBasicSessionCookie(res, auth) {
-  const ttlSeconds = Math.max(60, Number(auth.basic?.sessionTtlSeconds) || 12 * 60 * 60);
-  const cookie = signBasicSession({ username: auth.basic.username, passwordHash: auth.basic.passwordHash, ttlSeconds });
-  res.setHeader('set-cookie', `${BASIC_SESSION_COOKIE}=${encodeURIComponent(cookie)}; HttpOnly;${auth.basic?.insecureCookies === true ? '' : ' Secure;'} SameSite=Lax; Path=/; Max-Age=${ttlSeconds}`);
-}
-
-function verifyScryptPassword(password, encoded) {
-  const parts = String(encoded || '').split(':');
-  if (parts.length !== 4 || parts[0] !== 'scrypt') return false;
-  const cost = Number(parts[1]);
-  if (!Number.isInteger(cost) || cost < 2 ** 12 || cost > 2 ** 20) return false;
-  const salt = Buffer.from(parts[2], 'base64url');
-  const expected = Buffer.from(parts[3], 'base64url');
-  if (!salt.length || !expected.length) return false;
-  const actual = scryptSync(String(password || ''), salt, expected.length, { N: cost });
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
-}
 
 function denyBasic(res, reason) {
   res.setHeader('www-authenticate', 'Basic realm="Burrow", charset="UTF-8"');
@@ -1935,19 +1750,6 @@ async function listDirs(dir) {
   }
 }
 
-async function sessionPreview(id) {
-  try {
-    const { agentId } = await resolveAgentRuntime();
-    const meta = await postgresApplication.stores.conversations.getMetadata({ agentId, sessionId: id });
-    const turns = await postgresApplication.stores.conversations.projection({ agentId, sessionId: id, visibility: 'chat', limit: 20 });
-    const last = turns.at(-1) || null;
-    return { id, turnCount: meta?.turnCount ?? turns.length, createdAt: meta?.createdAt || null, updatedAt: meta?.updatedAt || last?.ts || null, lastRole: meta?.lastRole || last?.role || null, lastContent: last?.content || '', summary: meta?.summary || '' };
-  } catch (error) {
-    if (error?.code === 'ENOENT') return { id, turnCount: 0, updatedAt: null, lastRole: null, lastContent: '' };
-    throw error;
-  }
-}
-
 function boundedInteger(value, { fallback = 100, min = 1, max = 500 } = {}) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
@@ -1963,13 +1765,6 @@ async function listSessions({ rootDir, rootDirs = null, agentId = null, includeA
   return rows.filter((item) => !isInternalContextSession(item)).filter((item) => !query || JSON.stringify(item).toLowerCase().includes(String(query).toLowerCase())).filter((item) => !since || String(item.updatedAt || "") > since).slice(0, resolvedLimit ?? undefined).map((item) => ({ ...item, id: item.sessionId }));
 }
 
-function activityItemFromTraceCard(card = {}) {
-  const payload = card.payload || card;
-  const presentation = toolActivityPresentation(payload);
-  if (!presentation) return null;
-  return { ...presentation, status: toolActivityStatus({ card, payload }) };
-}
-
 function runtimeTraceRoot(runtime, sessionId = 'default', agentId = runtime.runtimeState.agentId) {
   return resolveRuntimeTracePath({
     cacheRoot: runtime.runtimeState.cacheRoot,
@@ -1978,29 +1773,6 @@ function runtimeTraceRoot(runtime, sessionId = 'default', agentId = runtime.runt
     sessionId,
   });
 }
-
-async function sessionActivities({ sessionId, turns } = {}) {
-  const runtime = await runtimeConfig();
-  const receiptRuns = [...new Set((turns || []).filter((turn) => turn.type === 'receipt' && turn.runId).map((turn) => turn.runId))];
-  const activities = [];
-  for (const runId of receiptRuns.slice(-20)) {
-    const trace = await summarizeTrace({ conversationStore: postgresApplication.stores.conversations, agentId: runtime.runtimeState.agentId, rootDir: runtimeTraceRoot(runtime, sessionId), runId, includeToolOutput: false, includeRelatedWorkTrace: false });
-    const items = (trace.cards || []).filter((card) => card.stream === 'tool').map(activityItemFromTraceCard).filter(Boolean);
-    const uniqueItems = items.filter((item, index, all) => all.findIndex((candidate) => candidate.label === item.label && candidate.status === item.status && candidate.detail === item.detail) === index);
-    if (!uniqueItems.length) continue;
-    const failures = uniqueItems.some((item) => item.status === 'error');
-    const complete = uniqueItems.every((item) => item.status === 'ok' || item.status === 'error');
-    activities.push({
-      runId,
-      status: failures ? 'warn' : complete ? 'ok' : 'running',
-      title: failures ? 'Finished with an issue' : complete ? 'Done' : 'Working…',
-      summary: complete ? `Used ${uniqueItems.length} tool${uniqueItems.length === 1 ? '' : 's'}.` : uniqueItems.at(-1)?.label || 'Working…',
-      items: uniqueItems,
-    });
-  }
-  return activities;
-}
-
 
 async function sessionDetail(id, { rootDir, agentId = null, limit, before } = {}) {
   agentId ||= (await resolveAgentRuntime()).agentId;
@@ -2302,7 +2074,6 @@ async function workbenchPlan(body = {}, agentRuntime = null) {
   const workspaceRoot = body.workspaceRoot ? String(body.workspaceRoot) : null;
   const action = body.action ? String(body.action) : null;
   const turnPlan = planTurn({ message, action, workspaceContext: { workspaceRoot } });
-  const route = await routeRequest({ rootDir: projectRoot, message, workspaceContext: { workspaceRoot }, turnPlan });
   const session = turnPlan.intentFacts?.authoritative
     ? {
         kind: turnPlan.intentFacts.kind,
@@ -2336,7 +2107,6 @@ async function workbenchRun(body = {}, agentRuntime = null) {
   const target = body.target && typeof body.target === 'object' ? body.target : null;
   const action = body.action ? String(body.action) : null;
   const turnPlan = planTurn({ message, action, workspaceContext: { workspaceRoot } });
-  const route = await routeRequest({ rootDir: projectRoot, message, workspaceContext: { workspaceRoot }, turnPlan });
   const session = turnPlan.intentFacts?.authoritative
     ? {
         kind: turnPlan.intentFacts.kind,
@@ -2386,7 +2156,6 @@ async function createWorkbenchItem(body = {}, agentRuntime = null) {
   const workspaceRoot = body.workspaceRoot ? String(body.workspaceRoot) : null;
   const action = body.action ? String(body.action) : null;
   const turnPlan = planTurn({ message, action, workspaceContext: { workspaceRoot } });
-  const route = await routeRequest({ rootDir: projectRoot, message, workspaceContext: { workspaceRoot }, turnPlan });
   const session = turnPlan.intentFacts?.authoritative
     ? { kind: turnPlan.intentFacts.kind, reason: 'explicit-action' }
     : { kind: 'chat', reason: 'model-owned' };
@@ -2768,6 +2537,7 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
   correlateHttpRun(res, { runId, sessionId, agentId: agentRuntime.agentId });
   if (activeChatRuns.has(activeChatRunKey(agentRuntime.agentId, runId))) throw Object.assign(new Error('chat_run_id_already_used'), { statusCode: 409 });
   const controller = new AbortController();
+  completionDispatch?.trackHttp(agentRuntime.agentId, runId, res, { sessionId, source: coreApiCaller(req) ? 'backdoor-api' : 'operator-chat', startedAt: new Date().toISOString() });
   const record = { agentId: agentRuntime.agentId, runId, sessionId, controller, startedAt: new Date().toISOString(), phase: 'thinking', latestUserMessage: String(body.message || '').trim().slice(0, 16_000), objective: String(body.message || '').trim().slice(0, 16_000), progress: [], contextUsage: null, cancelled: false, reason: null, detached: false, steeringReady: false };
   const headKey = sessionContinuityHeadKey(agentRuntime.agentId, sessionId);
   sessionContinuityHeads.set(headKey, record);
@@ -3142,7 +2912,7 @@ const coreApi = createCoreApiDispatcher({
     sessionId: actor?.caller.sessionId, runId: actor?.caller.runId,
   }, { component: 'api' }),
 });
-const modLoadOptions = { coreApi, logger: serverLogger, modAuthority, modManagement: modManagementCapability, onExecutionProviderActivated: async modId => { if (modId === 'node-goblin') await applyOtelConfigurationToNodeGoblins(); }, stores: postgresApplication.stores, modStoreFactory: postgresApplication.modStoreFactory, enabledModIds: postgresApplication.enabledModIds, modCatalogWriter: postgresApplication.modCatalogWriter, runtimeRoot: modsRuntimeRoot, executionProviders, resolveAgentRuntime, scheduledJobScheduler: scheduler(), externalTurnDispatcher, generationDispatcher, runtimeDiagnostics, resolveAgentWorkspaceRoot: async (id) => {
+const modLoadOptions = { coreApi, logger: serverLogger, modAuthority, modManagement: modManagementCapability, onExecutionProviderActivated: async modId => { if (modId === 'node-goblin') await applyOtelConfigurationToNodeGoblins(); }, stores: postgresApplication.stores, modStoreFactory: postgresApplication.modStoreFactory, enabledModIds: postgresApplication.enabledModIds, modCatalogWriter: postgresApplication.modCatalogWriter, runtimeRoot: modsRuntimeRoot, executionProviders, resolveAgentRuntime, scheduledJobScheduler: scheduler(), externalTurnDispatcher, generationDispatcher, runtimeDiagnostics, activeAgentRuns: activeChatRuns, pendingHttpRuns: () => completionDispatch?.pendingHttpRuns() || [], resolveAgentWorkspaceRoot: async (id) => {
   const agent = await agentsStore().get(id);
   if (!agent) throw new Error('agent_not_found');
   return agentRuntimeContext({ runtimeState: (await runtimeConfig()).runtimeState, agent }).agentWorkspaceRoot;
@@ -3182,7 +2952,7 @@ async function transitionMod({ modId, enabled, installed, action, reactivate = f
     loadedMods = installed
       ? loadedMods.map((entry) => entry.id === modId ? { ...entry, host: null, routes: [], store: null, lifecycleCleanup: null, status: 'disabled' } : entry)
       : loadedMods.filter((entry) => entry.id !== modId);
-    await reconcileRuntimeManagedSkills();
+    await managedSkillSynchronizer.tick();
     return;
   }
   if (reactivate && old) {
@@ -3212,7 +2982,9 @@ async function transitionMod({ modId, enabled, installed, action, reactivate = f
     throw error;
   }
   if (old) await cleanupMods([old], { logger: serverLogger });
-  await reconcileRuntimeManagedSkills();
+  // Skill delivery is auxiliary: its synchronizer owns failure diagnostics and
+  // periodic retries. A missing upstream skill must not undo a valid mod update.
+  await managedSkillSynchronizer.tick();
   await modLoadOptions.onExecutionProviderActivated?.(modId);
 }
 const modDistribution = createModDistribution({
@@ -3232,6 +3004,8 @@ await migrateLegacyExecutionProviderApproval({
   agents: await agentsStore().list({ includeDisabled: true }),
 });
 loadedMods = await loadMods(modLoadOptions);
+completionDispatch = createAgentRunCompletionDispatch({ feed: postgresApplication.stores.agentRuns,
+  activeRuns: activeChatRuns, getHosts: () => loadedMods.filter(mod => mod.status === 'loaded').map(mod => mod.host) });
 await managedSkillSynchronizer.tick();
 await applyOtelConfigurationToNodeGoblins();
 modsStarting = false;
@@ -3454,6 +3228,7 @@ function closeOnlyProducer(resource) {
   let closing = null;
   return { stop() { closing ||= Promise.resolve().then(() => resource.close()); closing.catch(() => {}); }, close() { this.stop(); return closing; } };
 }
+const openaiResetScheduler = startOpenAiResetScheduler(pollExpiringResets);
 const archiveReadProducer = closeOnlyProducer(archiveReadProcess);
 const skillSyncProducer = closeOnlyProducer(skillGitSync);
 const modDistributionProducer = closeOnlyProducer({ async close() {
@@ -3469,7 +3244,7 @@ const closeRuntimeResources = createCoordinatedShutdown({
     httpClosePromise = new Promise(resolve => server.close(() => resolve()));
     server.closeIdleConnections?.();
   },
-  producers: () => [archiveReadProducer, skillSyncProducer, managedSkillSynchronizer, modDistributionProducer, completionEventRunner, chatInputRunner, externalTurnDispatcher, generationDispatcher, requestLifecycle, startupLifecycle, scheduledJobScheduler, dreamCycleScheduler, tiddleScheduler, retentionScheduler, installStagingCleanupScheduler, recoveryContinuationScheduler, versionRefreshProducer],
+  producers: () => [openaiResetScheduler, archiveReadProducer, skillSyncProducer, managedSkillSynchronizer, modDistributionProducer, completionEventRunner, chatInputRunner, externalTurnDispatcher, generationDispatcher, requestLifecycle, startupLifecycle, scheduledJobScheduler, dreamCycleScheduler, tiddleScheduler, retentionScheduler, installStagingCleanupScheduler, recoveryContinuationScheduler, versionRefreshProducer],
   beforeDrain: async () => {
     try {
       await recordActiveRunInterruptions({ stores: postgresApplication.stores, activeRuns: activeChatRuns, resolveAgentRuntime, reason: shutdownReason });

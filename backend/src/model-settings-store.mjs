@@ -1,11 +1,10 @@
 import { safeOperationalError } from './runtime-server-log.mjs';
 import { operationalEvent } from './operational-log.mjs';
 import { googleNativeApi, discoverGoogleModels } from './model-adapters/google-native-catalog.mjs';
-import { randomBytes, randomUUID, createCipheriv, createDecipheriv } from 'node:crypto';
-import { openaiOAuthIdentity, refreshOpenAiOAuth } from './openai-oauth-login.mjs';
+export { settingsKeyFromEnvironment } from './settings-key.mjs';
+export { encrypt, decrypt } from './model-secret-codec.mjs';
+import { openaiOAuthIdentity } from './openai-oauth-login.mjs';
 import { anthropicSupportsTemperature, isAnthropicMessagesConnection, normalizeAnthropicModelMetadata, anthropicDiscoveredReasoningEfforts, anthropicThinkingCapabilities } from './anthropic-model-capabilities.mjs';
-
-const AAD_PREFIX = 'burrow-model-secret-v1';
 
 // These are producer-owned whole codes, not a grammar for accepting provider
 // prose. The legacy code:status form is accepted only for these exact HTTP
@@ -49,7 +48,6 @@ function modelHttpError(code, status) {
   return Object.assign(new Error(`${code}:${status}`), { code, upstreamStatus: status });
 }
 
-function now() { return new Date().toISOString(); }
 function normalize(value) { return String(value ?? '').trim(); }
 function asBoolean(value) { return value === true || value === 1; }
 function parseJson(value, fallback) { try { return JSON.parse(value); } catch { return fallback; } }
@@ -89,9 +87,6 @@ function codexClientVersionFromCache(cache = {}) {
   return parseSemver(cache.currentVersion)?.raw || parseSemver(cache.lastGoodCatalogVersion)?.raw || CODEX_CLIENT_VERSION_FLOOR;
 }
 
-const AUTH_SECRET_NAME = 'providerAuth';
-const LEGACY_API_KEY_SECRET_NAME = 'apiKey';
-const OAUTH_REFRESH_SKEW_MS = 60_000;
 const ANTHROPIC_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const ANTHROPIC_OAUTH_TOKEN_ENDPOINTS = Object.freeze([
   'https://platform.claude.com/v1/oauth/token',
@@ -105,17 +100,6 @@ const GITHUB_CODEX_LATEST_URL = 'https://api.github.com/repos/openai/codex/relea
 const MODELS_DEV_CATALOG_META_KEY = 'models_dev_catalog';
 export const MODELS_DEV_CATALOG_URL = 'https://models.dev/catalog.json';
 export const MODELS_DEV_CATALOG_CACHE_TTL_MS = 24 * 60 * 60_000;
-
-const oauthRefreshes = new Map();
-
-
-export function settingsKeyFromEnvironment(env = process.env) {
-  const encoded = normalize(env.BURROW_SETTINGS_KEY);
-  if (!encoded) throw new Error('settings_encryption_key_missing');
-  const key = Buffer.from(encoded, 'base64');
-  if (key.length !== 32) throw new Error('settings_encryption_key_invalid');
-  return key;
-}
 
 export function isProviderPool(connection = {}) { return ['openai-lb', 'anthropic-lb'].includes(connection.apiType); }
 
@@ -161,7 +145,7 @@ export function assertConnection(input = {}) {
   if (!apiType) throw new Error('api_type_required');
   if (!/^https?:\/\//i.test(baseUrl)) throw new Error('base_url_invalid');
   const acceptedInput = [...new Set((Array.isArray(input.acceptedInput) ? input.acceptedInput : []).map(normalize).filter((type) => ['text', 'image'].includes(type)))];
-  return { provider, apiType, baseUrl, acceptedInput, ...(isProviderPool(input) ? { pool: normalizeProviderPool(input.pool) } : {}) };
+  return { provider, apiType, baseUrl, acceptedInput, autoUseExpiringResets: input.autoUseExpiringResets === true && !isProviderPool(input), ...(isProviderPool(input) ? { pool: normalizeProviderPool(input.pool) } : {}) };
 }
 
 const MODEL_INPUT_CAPABILITIES = Object.freeze(['text', 'image', 'audio', 'video', 'file']);
@@ -344,27 +328,6 @@ export function normalizeReasoningEffort(value) {
   return effort;
 }
 
-function aad(secretId, connectionId, name) { return Buffer.from(`${AAD_PREFIX}|${secretId}|connection|${connectionId}|${name}`); }
-export function encrypt(key, secretId, connectionId, name, value) {
-  const nonce = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', key, nonce);
-  cipher.setAAD(aad(secretId, connectionId, name));
-  const ciphertext = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()]);
-  return { ciphertext, nonce, authTag: cipher.getAuthTag() };
-}
-export function decrypt(key, row) {
-  let lastError;
-  for (const prefix of [AAD_PREFIX, 'hatchetclaw-model-secret-v1']) {
-    try {
-      const decipher = createDecipheriv('aes-256-gcm', key, row.nonce);
-      decipher.setAAD(Buffer.from(`${prefix}|${row.id}|connection|${row.connection_id}|${row.name}`));
-      decipher.setAuthTag(row.auth_tag);
-      return Buffer.concat([decipher.update(row.ciphertext), decipher.final()]).toString('utf8');
-    } catch (error) { lastError = error; }
-  }
-  throw lastError;
-}
-
 export function assertIdentity(input = {}) {
   const kind = normalize(input.kind);
   const id = normalize(input.id);
@@ -384,6 +347,7 @@ export function publicConnection(row) {
   const canonical = canonicalizeOauthConnection({ provider: row.provider, apiType: row.api_type, baseUrl: row.base_url }, authPreview);
   return {
     id: row.id, provider: row.provider, apiType: canonical.apiType, baseUrl: row.base_url,
+    autoUseExpiringResets: row.auto_use_expiring_resets === true && !isProviderPool({ apiType: canonical.apiType }),
     ...(isProviderPool({ apiType: canonical.apiType }) ? { pool: parseJson(row.pool_json, null) } : {}),
     acceptedInput: parseJson(row.accepted_input_json, ['text', 'image']),
     models: normalizeModels(parseJson(row.models_json, []), { provider: row.provider, apiType: canonical.apiType }),

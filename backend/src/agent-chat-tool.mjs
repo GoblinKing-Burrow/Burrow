@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { contextSessionId } from './model-context-boundary.mjs';
 import { conversationAuthority } from './conversation-authority.mjs';
 import { assertModAgentAvailable } from './mod-agent-runtime.mjs';
+import { chatTerminalStatus } from './chat-result-metadata.mjs';
+import { projectModelFailure } from './model-recovery-projection.mjs';
 
 const ID = /^[a-zA-Z0-9._-]{1,96}$/;
 const MAX_MESSAGE = 20_000;
@@ -103,13 +105,14 @@ function provenance({ sender, senderRuntime, recipient, sourceSessionId, targetS
   };
 }
 
-async function appendAgentMessage({ conversationStore, agentId: transcriptAgentId, sessionId: targetSessionId, content, sender, senderRuntime, recipient, sourceSessionId, sourceRunId, messageMode, direction, deliveryId, replyToEntryId = null }) {
+async function appendAgentMessage({ conversationStore, agentId: transcriptAgentId, sessionId: targetSessionId, content, sender, senderRuntime, recipient, sourceSessionId, sourceRunId, messageMode, direction, deliveryId, replyToEntryId = null, entersPrompt = undefined, replyOutcome = null }) {
   return conversationAuthority({ store: conversationStore, agentId: transcriptAgentId }).appendTurnIfAbsent({
     sessionId: targetSessionId,
     role: 'agent',
     content,
     runId: sourceRunId,
-    metadata: provenance({ sender, senderRuntime, recipient, sourceSessionId, targetSessionId, sourceRunId, messageMode, direction, replyToEntryId }),
+    ...(entersPrompt === undefined ? {} : { entersPrompt }),
+    metadata: { ...provenance({ sender, senderRuntime, recipient, sourceSessionId, targetSessionId, sourceRunId, messageMode, direction, replyToEntryId }), ...(replyOutcome || {}) },
   }, { idempotencyKey: `${deliveryId}:${direction}` });
 }
 
@@ -140,8 +143,9 @@ export async function sendAgentMessage({ conversationStore = null, senderRuntime
   const separateInbox = recipientRuntime.agent?.contextConfig?.a2aInDefault === false;
   const incomingSession = separateInbox ? `a2a-${sender}` : 'default';
   const explicitSession = text(targetSessionId);
-  const session = sessionId(explicitSession || implicitReplySession || incomingSession);
-  const peerInbox = separateInbox && !explicitSession && !implicitReplySession;
+  const requestedSession = sessionId(explicitSession || implicitReplySession || incomingSession);
+  const session = separateInbox && requestedSession === 'default' ? incomingSession : requestedSession;
+  const peerInbox = separateInbox && ((!explicitSession && !implicitReplySession) || requestedSession === 'default');
   const sourceMetadata = await conversationStore.getMetadata({ agentId: sender, sessionId: sourceSessionId || 'default' });
   const source = sessionId(sourceMetadata?.contextIsolation?.historySessionId || sourceSessionId || 'default');
   const deliveryId = createHash('sha256').update(JSON.stringify([sender, recipient, source, session, runId || null, resolvedMode, body])).digest('hex');
@@ -154,8 +158,10 @@ export async function sendAgentMessage({ conversationStore = null, senderRuntime
 
   const deliver = async () => {
     // A queued request must not enter either transcript if its owner went away.
+    abortSignal?.throwIfAborted();
     await assertFreshA2AParticipant(senderRuntime, resolveRecipientRuntime);
     await assertFreshA2AParticipant(recipientRuntime, resolveRecipientRuntime);
+    abortSignal?.throwIfAborted();
     // Only automatic ingress owns peer-inbox metadata. Labels are presentation,
     // never routing keys; a display-name change cannot create another lane.
     // Materialize on contact, not on the preference toggle, and retain unrelated
@@ -165,6 +171,7 @@ export async function sendAgentMessage({ conversationStore = null, senderRuntime
         update: metadata => ({ ...metadata, a2aPeerAgentId: sender,
           label: `A2A - ${text(senderRuntime.agent?.name) || sender}` }) });
     }
+    abortSignal?.throwIfAborted();
     const recipientEntry = await appendAgentMessage({
       conversationStore, agentId: recipient, sessionId: session, content: body,
       sender, senderRuntime, recipient, sourceSessionId: source, sourceRunId: runId,
@@ -250,17 +257,33 @@ export async function sendAgentMessage({ conversationStore = null, senderRuntime
         return await complete(failed);
       }
       await assertOwner();
+      // A blocked peer answer is a legitimate attributed answer. Failed, cancelled
+      // and incomplete partials remain visible, but never become prompt history.
+      const replyDecision = reply?.decision || null;
+      const replyStatus = chatTerminalStatus({ ...reply, ok: reply?.ok !== false });
+      const failedPartial = replyDecision !== 'blocked' && replyStatus !== 'completed';
+      // Mirrored final answers are incoming A2A too, not an exception to the
+      // sender's inbox preference. Resolve afresh: the owner may toggle mid-run.
+      const replyRecipientRuntime = await resolveRecipientRuntime(sender);
+      const replySession = source === 'default' && replyRecipientRuntime?.agent?.contextConfig?.a2aInDefault === false
+        ? `a2a-${recipient}` : source;
+      if (replySession !== source) {
+        await conversationStore.updateMetadata({ agentId: sender, sessionId: replySession,
+          update: metadata => ({ ...metadata, a2aPeerAgentId: recipient,
+            label: `A2A - ${text(recipientRuntime.agent?.name) || recipient}` }) });
+      }
       const replyEntry = await appendAgentMessage({
-        conversationStore, agentId: sender, sessionId: source, content: replyText,
+        conversationStore, agentId: sender, sessionId: replySession, content: replyText,
         sender: recipient, senderRuntime: recipientRuntime, recipient: sender,
         sourceSessionId: session, sourceRunId: reply?.runId || null,
         messageMode: 'reply', direction: 'inbound', deliveryId: `${deliveryId}:reply`, replyToEntryId: sourceEntry.id,
+        entersPrompt: !failedPartial, replyOutcome: { decision: replyDecision, terminalStatus: replyDecision === 'blocked' ? 'blocked' : replyStatus, ...(failedPartial ? { modelFailure: projectModelFailure(reply?.modelFailure || { code: replyDecision || 'model_failed' }) } : {}) },
       });
       const result = {
         ...receipt,
-        ok: reply?.ok !== false,
+        ok: reply?.ok !== false && !failedPartial && replyDecision !== 'blocked',
         reply: {
-          ok: reply?.ok !== false,
+          ok: reply?.ok !== false && !failedPartial && replyDecision !== 'blocked',
           decision: reply?.decision || null,
           error: reply?.error || null,
           runId: reply.runId || null,

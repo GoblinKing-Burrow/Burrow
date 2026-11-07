@@ -130,7 +130,11 @@ export async function loadEffectiveSkillCatalog({ workspaceRoot, agentId, agentR
   const resolvedAgentId = runtimeAgentId || normalizeId(agentId);
   const globalRoot = path.join(workspace, 'global', 'skills');
   const managedRoot = path.join(workspace, 'global', 'managed-skills');
-  const agentRoot = runtimeSkillsRoot || path.join(workspace, resolvedAgentId, 'skills');
+  // Historical "global" agents must not claim workspace/global/skills as private,
+  // including when an older runtime context still supplies that shared path.
+  const agentRoot = resolvedAgentId === 'global' && (!runtimeSkillsRoot || runtimeSkillsRoot === globalRoot)
+    ? path.join(workspace, 'global', 'agent-skills')
+    : runtimeSkillsRoot || path.join(workspace, resolvedAgentId, 'skills');
   const [globalSkills, managedSkills, agentSkills] = await Promise.all([
     loadOwnedSkillRoot({ skillsRoot: globalRoot, owner: { scope: 'global', agentId: null }, overrides }),
     loadOwnedSkillRoot({ skillsRoot: managedRoot, owner: { scope: 'managed', agentId: null, readOnly: true }, overrides }),
@@ -138,16 +142,12 @@ export async function loadEffectiveSkillCatalog({ workspaceRoot, agentId, agentR
   ]);
   let databaseSkills = [];
   if (skillStore) {
-    const store = skillStore;
-    const ownsStore = !skillStore;
-    try {
-      databaseSkills = (await store.effective(resolvedAgentId)).map((skill) => ({
-        ...skill, priority: 0, path: skill.storage === 'filesystem' ? 'SKILL.md' : null, sourcePath: null, absolutePath: skill.storage === 'filesystem' ? path.join(skill.installedPath,'SKILL.md') : null,
-        sourceExists: true, owner: { scope: skill.global ? 'global' : 'agent', agentId: skill.global ? null : resolvedAgentId },
-        ownership: { scope: skill.storage || 'postgres', agentId: skill.global ? null : resolvedAgentId, contentOwner: skill.contentOwner, storage: skill.storage || 'postgres' },
-        portability: { memoryIndexable: true, memoryStoresBody: false },
-      }));
-    } finally { if (ownsStore) await store.close?.(); }
+    databaseSkills = (await skillStore.effective(resolvedAgentId)).map((skill) => ({
+      ...skill, priority: 0, path: skill.storage === 'filesystem' ? 'SKILL.md' : null, sourcePath: null, absolutePath: skill.storage === 'filesystem' ? path.join(skill.installedPath,'SKILL.md') : null,
+      sourceExists: true, owner: { scope: skill.global ? 'global' : 'agent', agentId: skill.global ? null : resolvedAgentId },
+      ownership: { scope: skill.storage || 'postgres', agentId: skill.global ? null : resolvedAgentId, contentOwner: skill.contentOwner, storage: skill.storage || 'postgres' },
+      portability: { memoryIndexable: true, memoryStoresBody: false },
+    }));
   }
   // Managed IDs are authoritative and read-only. Ordinary agent/global skills keep
   // their existing precedence for every ID not reserved by an active managed source.

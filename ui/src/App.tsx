@@ -37,7 +37,9 @@ import {
 } from './features/workspace/WorkspaceRail';
 import { RightRail } from './features/panels/RightRail';
 import { AccountStatus } from './features/panels/AccountStatus';
-import { Chat, ChatModelSelector, Editor } from './features/chat/ChatPage';
+import { Chat } from './features/chat/ChatPage';
+import { ChatModelSelector } from './features/chat/ChatModelSelector';
+import { Editor } from './features/chat/WorkspaceEditor';
 import { useChatRun } from './features/chat/useChatRun';
 import { useChatComposers } from './features/chat/useChatComposers';
 import { ChatComposerDialogs } from './features/chat/ChatComposerDialogs';
@@ -217,10 +219,15 @@ function AppContent() {
   } = usePersistedLayout();
   const workspacePanelVisible =
     page === 'chat' &&
-    !leftCollapsed &&
-    (leftRailLayout === 'divided'
-      ? leftTopPanel === 'workspace' || leftBottomPanel === 'workspace'
-      : leftSinglePanel === 'workspace');
+    !activeMod &&
+    ((!leftCollapsed &&
+      (leftRailLayout === 'divided'
+        ? leftTopPanel === 'workspace' || leftBottomPanel === 'workspace'
+        : leftSinglePanel === 'workspace')) ||
+      (!rightCollapsed &&
+        (rightRailLayout === 'divided'
+          ? rightTopPanel === 'workspace' || rightBottomPanel === 'workspace'
+          : rightSinglePanel === 'workspace')));
   const { workspaceFiles, openFile, saveFile } = useWorkspaceFiles({
     tabs,
     selectedAgentId,

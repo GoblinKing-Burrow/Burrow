@@ -1,7 +1,6 @@
 import { finalAnswerAfterToolLoopPrompt } from './runtime-final-synthesis-prompt.mjs';
 import { accumulateCompletionEvidence } from './completion-addendum.mjs';
-import { compactSkippedToolActions, skippedToolSummary, executedToolResultPrompt } from './tool-continuation-prompt.mjs';
-import path from 'node:path';
+import { compactSkippedToolActions, executedToolResultPrompt } from './tool-continuation-prompt.mjs';
 import { nativeToolSchemas, parseActionProposal } from './action-proposal.mjs';
 import { reviewProposalActions } from './action-safety.mjs';
 import { createModelAdapter } from './model-adapter.mjs';
@@ -13,11 +12,11 @@ import { normalizeExecutionPolicyInput } from './execution-policy.mjs';
 import { accumulateToolConsequences, summarizeToolResults } from './runtime-result-shapes.mjs';
 import { inspectRuntimeObject } from './runtime-heap-diagnostics.mjs';
 import { normalizeNativeToolCalls, normalizeProviderMessages } from './provider-messages.mjs';
-import { serializeContinuationEvidence } from './continuation-evidence.mjs';
+import './continuation-evidence.mjs';
 import { inspectionResultSummary, shouldFollowReadOnlyInspection, hasExecutedInspectionEvidence, hasExecutedReadFileEvidence, missingInspectionTargets, shouldForceInspectionEvidence, defaultInspectionFileList, runDefaultReadOnlyInspection, pendingInspectionFallback } from './inspection-evidence.mjs';
 import { CHAT_TOOL_HISTORY_LIMIT, CHAT_TOOL_RESULT_HISTORY_LIMIT, CHAT_TOOL_CALL_HISTORY_LIMIT, compactToolCalls, boundedToolArgumentValue, stableJson, fingerprint, toolPlanFingerprint, exactRepeatVerdict, loopReceiptText, appendBoundedChatHistory, appendBoundedMapEntry, compactPromptEvidenceResult, runtimeObservationFacts, materialEvidenceKeys, recordMaterialProgress, repeatedToolCallObservations, semanticInspectionObservations, logChatToolLoopHeapStage, normalizedToolOutcome } from './tool-loop-detection.mjs';
 import { runProposalLoop, runVerificationGate, runCommitGate, completeMutationAfterInspection, completeMutationRepairAfterNoAction, completeMutationRepairAfterToolFailure, completeVerificationAfterMutation, proposalFromNativeToolCalls } from './mutation-gates.mjs';
-import { prepareNativeToolContinuation } from './native-continuation-preparation.mjs';
+import { prepareNativeToolContinuationAsync } from './native-continuation-preparation.mjs';
 import { adapterOutputArtifactsFromResult } from './model-output-artifacts.mjs';
 
 // facts for the agent and operator; they are not instructions or tool gates.
@@ -71,10 +70,6 @@ function compactLoopProposalReview(proposalReview = null) {
 
 function ownershipMetrics(value) {
   return inspectRuntimeObject(value, { nodeBudget: 5_000, estimatedCharBudget: 2_000_000, stringSampleChars: 8_000 });
-}
-
-function allSkippedChatTools(chatToolLoop = {}) {
-  return chatToolLoop.skipped || (chatToolLoop.iterations || []).flatMap((iteration) => iteration.proposalExecution?.skipped || []);
 }
 
 async function executeChatToolCalls({ model, workspaceRoot = null, rootDir = null, dataRoot = null, sessionId = null, conversationId = null, iteration = 0, traceLogger = null, executionPolicy = null, modelConfig = null, executionContext = null, abortSignal = null } = {}) {
@@ -538,21 +533,26 @@ export async function runPlainModelTurn({
       await logChatToolLoopHeapStage(traceLogger, 'chat-tool-loop-after-continuation-prompt-build', { iteration, followupPrompt: useNativeContinuation ? '[provider-native tool continuation]' : followupPrompt, followupInput, chatToolLoop, promptEvidenceResults });
       if (abortSignal?.aborted) throw abortSignal.reason || new Error('agent_stopped');
       await logChatToolLoopHeapStage(traceLogger, 'chat-tool-loop-before-model-call', { iteration, followupInput, chatToolLoop, promptEvidenceResults });
+      const pendingSteering = await steeringMessages();
       const nativeContinuation = useNativeContinuation
-        ? prepareNativeToolContinuation({
+        ? await prepareNativeToolContinuationAsync({
             baseMessages: normalizeProviderMessages(nativeTranscript),
             toolCalls: nativeToolCalls,
             toolResults: rawToolResults,
             modelConfig,
             tools: continuationToolSchemas(),
-          })
+            contextThreshold,
+            pendingSteering,
+          }, { adapter, signal: abortSignal, traceLogger })
         : null;
-      const pendingSteering = await steeringMessages();
-      if (pendingSteering.length) {
-        if (nativeContinuation) nativeContinuation.messages.push(...pendingSteering);
-        else {
+      if (!nativeContinuation) {
+        if (pendingSteering.length) {
           followupInput.messages = [...(followupInput.messages || [{ role: 'user', content: followupInput.prompt }]), ...pendingSteering];
           followupInput.prompt = null;
+        }
+        if (followupInput.messages) {
+          const prepared = await prepareNativeToolContinuationAsync({ baseMessages: followupInput.messages, modelConfig, tools: toolLoopNoProgress ? [] : continuationToolSchemas(), contextThreshold }, { adapter, signal: abortSignal, traceLogger });
+          followupInput.messages = prepared.messages;
         }
       }
       if (nativeContinuation?.compacted) await traceLogger?.event?.('native-continuation-prepared', {
@@ -595,12 +595,7 @@ export async function runPlainModelTurn({
       rawToolResults = null;
       executed = null;
       if (useNativeContinuation && Array.isArray(model?.nativeTranscript)) {
-        nativeTranscript = normalizeProviderMessages([
-          ...model.nativeTranscript.filter((entry) => {
-            const content = String(entry?.content || '');
-            return true;
-          }),
-        ]);
+        nativeTranscript = normalizeProviderMessages(model.nativeTranscript);
       }
       await logChatToolLoopHeapStage(traceLogger, 'chat-tool-loop-after-model-response', {
         iteration,
@@ -680,7 +675,6 @@ export async function runPlainModelTurn({
     delete model.output_artifacts;
   }
   const outputArtifacts = [];
-  const skipped = allSkippedChatTools(chatToolLoop);
   const answerText = model?.ok === false ? (partialAnswerText || (proposal?.answerText ?? null)) : proposal?.answerText ?? null;
   const runtime = createRuntimeTurnResult({
     finalText: answerText || '',

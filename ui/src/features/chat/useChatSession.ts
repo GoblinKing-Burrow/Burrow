@@ -32,7 +32,7 @@ export function useChatSession(selectedAgentId: string) {
   const [olderState, setOlderState] = useState<{ key: string; hasMore: boolean; loading: boolean }>(
     { key: '', hasMore: false, loading: false },
   );
-  const olderRequest = useRef(false);
+  const olderRequest = useRef<object | null>(null);
   const olderBySession = useRef(new Map<string, boolean>());
   // A read may finish after navigation. Only its caller, after validating its
   // scope, may change the pagination state of the displayed conversation.
@@ -64,7 +64,7 @@ export function useChatSession(selectedAgentId: string) {
     setOlderState({
       key: conversationCacheKey(agentId, id),
       hasMore: Boolean(session.hasMore),
-      loading: false,
+      loading: olderRequest.current !== null,
     });
   }, []);
   const [draftCache, setDraftCache] = useState<DraftCache>(readDraftCache);
@@ -79,8 +79,10 @@ export function useChatSession(selectedAgentId: string) {
   const [turns, setTurns] = useState<SessionTurn[]>([]);
   const attachmentKey = JSON.stringify([selectedAgentId, sessionId]);
   const attachmentScopeRef = useRef({ key: attachmentKey });
-  if (attachmentScopeRef.current.key !== attachmentKey)
+  if (attachmentScopeRef.current.key !== attachmentKey) {
     attachmentScopeRef.current = { key: attachmentKey };
+    olderRequest.current = null;
+  }
   const attachmentScope = attachmentScopeRef.current;
   const attached = attachmentState?.scope === attachmentScope ? attachmentState.files : [];
   const isAttachmentScopeCurrent = useCallback(
@@ -88,7 +90,6 @@ export function useChatSession(selectedAgentId: string) {
     [attachmentScope],
   );
 
-  const [chatError, setChatError] = useState('');
   const [isLoadingConversation, setIsLoadingConversation] = useState(false);
   const childSessionsRef = useRef(new Set<string>());
   const [, setToolActivityVersion] = useState(0);
@@ -156,6 +157,31 @@ export function useChatSession(selectedAgentId: string) {
   // handoff as loading synchronously, before the empty-session view is eligible.
   const committedAgentIdRef = useRef(selectedAgentId);
   const isSwitchingAgent = committedAgentIdRef.current !== selectedAgentId;
+  const [errorsByConversation, setErrorsByConversation] = useState<Record<string, string>>({});
+  const errorKey = conversationCacheKey(selectedAgentId, sessionId);
+  const chatError = isSwitchingAgent
+    ? ''
+    : (errorsByConversation[errorKey] ??
+      errorsByConversation[conversationCacheKey(selectedAgentId, '')] ??
+      '');
+  // An async run reports against its captured origin, not the currently selected chat.
+  const reportError = useCallback((message: string, agentId?: string, targetSessionId?: string) => {
+    const current = selectedChatRef.current;
+    const key = conversationCacheKey(
+      agentId ?? current.agentId,
+      targetSessionId ?? current.sessionId,
+    );
+    setErrorsByConversation((errors) => ({ ...errors, [key]: message }));
+  }, []);
+  const setChatError = reportError;
+  const clearError = useCallback(() => {
+    const { agentId, sessionId: selectedSessionId } = selectedChatRef.current;
+    setErrorsByConversation((errors) => ({
+      ...errors,
+      [conversationCacheKey(agentId, selectedSessionId)]: '',
+      [conversationCacheKey(agentId, '')]: '',
+    }));
+  }, []);
   const draftKey =
     selectedAgentId && sessionId ? conversationCacheKey(selectedAgentId, sessionId) : '';
   const draft = draftKey ? (draftCache[draftKey]?.value ?? '') : '';
@@ -522,11 +548,16 @@ export function useChatSession(selectedAgentId: string) {
     const scope = attachmentScopeRef.current;
     const cacheKey = conversationCacheKey(selectedAgentId, sessionId);
     const generation = conversationCacheGeneration;
-    olderRequest.current = true;
+    const request = {};
+    olderRequest.current = request;
     setOlderState((current) => ({ ...current, loading: true }));
     try {
       const session = await sessionRepository.loadOlder(selectedAgentId, sessionId);
-      if (attachmentScopeRef.current !== scope || generation !== conversationCacheGeneration)
+      if (
+        attachmentScopeRef.current !== scope ||
+        olderRequest.current !== request ||
+        generation !== conversationCacheGeneration
+      )
         return;
       const next = reconcileSnapshot(
         cacheKey,
@@ -541,8 +572,10 @@ export function useChatSession(selectedAgentId: string) {
       if (attachmentScopeRef.current === scope)
         setChatError(`Could not load older messages: ${(error as Error).message}`);
     } finally {
-      olderRequest.current = false;
-      setOlderState((current) => ({ ...current, loading: false }));
+      if (attachmentScopeRef.current === scope && olderRequest.current === request) {
+        olderRequest.current = null;
+        setOlderState((current) => ({ ...current, loading: false }));
+      }
     }
   }, [selectedAgentId, sessionId, sessionRepository]);
 
@@ -563,7 +596,6 @@ export function useChatSession(selectedAgentId: string) {
       setTurns([]);
       setIsLoadingConversation(true);
       setIsNewSession(false);
-      setChatError('');
     },
     [selectedAgentId, sessionId, clearActivity],
   );
@@ -581,7 +613,6 @@ export function useChatSession(selectedAgentId: string) {
       setTurns([]);
       setIsLoadingConversation(true);
       setIsNewSession(false);
-      setChatError('');
     },
     [clearActivity, selectedAgentId, sessionId],
   );
@@ -596,7 +627,6 @@ export function useChatSession(selectedAgentId: string) {
       setTurns([]);
       setIsLoadingConversation(true);
       setIsNewSession(false);
-      setChatError('');
     },
     [clearActivity, selectedAgentId, sessionId],
   );
@@ -723,8 +753,6 @@ export function useChatSession(selectedAgentId: string) {
       ),
     [attachmentScope],
   );
-  const reportError = useCallback((message: string) => setChatError(message), []);
-  const clearError = useCallback(() => setChatError(''), []);
 
   return {
     loadOlder,
@@ -734,7 +762,8 @@ export function useChatSession(selectedAgentId: string) {
       !isSwitchingAgent &&
       olderState.key === conversationCacheKey(selectedAgentId, sessionId) &&
       olderState.hasMore,
-    isLoadingOlder: olderState.loading,
+    isLoadingOlder:
+      olderState.key === conversationCacheKey(selectedAgentId, sessionId) && olderState.loading,
     composerResetGeneration,
     isAttachmentScopeCurrent,
     attached,

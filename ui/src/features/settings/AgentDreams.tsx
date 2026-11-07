@@ -1,7 +1,7 @@
+import { createPortal } from 'react-dom';
 import { isUnsavedChangesModalTarget, useUnsavedChanges } from '../../app/UnsavedChanges';
 import { ProviderModelFields } from './ProviderModelFields';
 import { useEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import type { SavedProvider } from '../../app/types';
 import { api } from '../../app/api';
 import { Field, SettingSection } from './SettingsPrimitives';
@@ -570,6 +570,7 @@ export function AgentDreams({
               type="button"
               data-dream-independent-action
               disabled={disabled || previewBusy || sourceInvalid}
+              className="secondary"
               aria-describedby="dream-memory-preview-help"
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => void generatePreview()}
@@ -582,6 +583,7 @@ export function AgentDreams({
                 data-dream-independent-action
                 disabled={disabled || previewBusy}
                 onMouseDown={(event) => event.preventDefault()}
+                className="secondary"
                 onClick={() => void generatePreview(true)}
               >
                 Preview new sample

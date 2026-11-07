@@ -1,3 +1,4 @@
+import { POSTGRES_AGENT_RUN_FEED_SQL } from './postgres-agent-run-feed.mjs';
 import { POSTGRES_SESSION_RECALL_NONBLOCKING_SQL } from './postgres-session-recall-nonblocking.mjs';
 import { POSTGRES_SESSION_RETRIEVAL_SQL } from './postgres-session-retrieval.mjs';
 import { POSTGRES_SESSION_RECALL_REPAIRS_SQL } from './postgres-session-recall-repairs.mjs';
@@ -242,4 +243,41 @@ UPDATE core_mod_authority SET mod_management_agent_ids=admin_agent_ids, core_api
   { version: 94, name: 'background-conversation-embeddings', sql: `ALTER TABLE brain_embedding_settings ADD COLUMN conversation_enabled boolean NOT NULL DEFAULT false;\n` + POSTGRES_CONVERSATION_EMBEDDINGS_SQL },
   { version: 95, name: 'session-recall-projection-repairs', sql: POSTGRES_SESSION_RECALL_REPAIRS_SQL },
   { version: 96, name: 'nonblocking-session-recall', sql: POSTGRES_SESSION_RECALL_NONBLOCKING_SQL },
+  { version: 97, name: 'openai-expiring-reset-claims', sql: `
+ALTER TABLE model_connections ADD COLUMN auto_use_expiring_resets BOOLEAN NOT NULL DEFAULT false;
+CREATE TABLE openai_reset_credit_claims (
+ account_key TEXT NOT NULL, credit_id TEXT NOT NULL, request_id TEXT NOT NULL,
+ claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ PRIMARY KEY(account_key,credit_id), UNIQUE(account_key,request_id)
+);
+` },
+  { version: 98, name: 'openai-reset-durable-outcomes', sql: `
+ALTER TABLE openai_reset_credit_claims
+ ADD COLUMN expires_at TIMESTAMPTZ,
+ ADD COLUMN outcome TEXT NOT NULL DEFAULT 'unknown' CHECK (outcome IN ('unknown','consumed','retryable','unavailable')),
+ ADD COLUMN retry_at TIMESTAMPTZ,
+ ADD COLUMN code TEXT,
+ ADD COLUMN http_status INTEGER,
+ ADD COLUMN error TEXT;
+CREATE TABLE openai_reset_credit_attempts (
+ account_key TEXT NOT NULL,
+ credit_id TEXT NOT NULL,
+ request_id TEXT NOT NULL,
+ claimed_at TIMESTAMPTZ NOT NULL,
+ expires_at TIMESTAMPTZ,
+ outcome TEXT NOT NULL CHECK (outcome IN ('unknown','consumed','retryable','unavailable')),
+ settled_at TIMESTAMPTZ,
+ retry_at TIMESTAMPTZ,
+ code TEXT,
+ http_status INTEGER,
+ error TEXT,
+ PRIMARY KEY(account_key,request_id),
+ FOREIGN KEY(account_key,credit_id) REFERENCES openai_reset_credit_claims(account_key,credit_id)
+);
+-- Legacy v97 claims have no expiry/outcome evidence: preserve the unknown fence.
+INSERT INTO openai_reset_credit_attempts(account_key,credit_id,request_id,claimed_at,expires_at,outcome)
+ SELECT account_key,credit_id,request_id,claimed_at,NULL,'unknown' FROM openai_reset_credit_claims;
+CREATE INDEX openai_reset_credit_claims_unknown_idx ON openai_reset_credit_claims(account_key) WHERE outcome='unknown';
+` },
+  { version: 99, name: 'agent-run-completion-feed', sql: POSTGRES_AGENT_RUN_FEED_SQL },
 ]);

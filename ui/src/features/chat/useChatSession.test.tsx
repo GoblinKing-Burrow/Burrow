@@ -1,5 +1,5 @@
-import { act, renderHook, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../../app/api';
 import { conversationCacheKey, useChatSession } from './useChatSession';
 
@@ -7,6 +7,10 @@ vi.mock('../../app/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../app/api')>()),
   api: vi.fn(),
 }));
+
+// Vitest globals are disabled, so RTL cannot auto-register its afterEach hook.
+// Unmount every hook before jsdom teardown to stop the background pollers.
+afterEach(cleanup);
 
 const apiMock = vi.mocked(api);
 const agentId = 'luna';
@@ -1615,3 +1619,104 @@ it('clears unacknowledged final turns on local reset, even without dated turns o
   expect(result.current.turns).toEqual([]);
   unmount();
 });
+
+describe('UI02 conversation-scoped error state', () => {
+  it('shows a late A error only when A is selected again, never in B', async () => {
+    apiMock.mockImplementation(async (path) => {
+      if (path === sessionListPath || path === '/api/sessions?agentId=other')
+        return { sessions: [{ id: sessionId }] };
+      if (path === conversationPath || path === `/api/sessions/${sessionId}?agentId=other`)
+        return { session: { id: sessionId, turns: [] } };
+      throw new Error(`Unexpected path: ${path}`);
+    });
+    const { result, rerender } = renderHook(({ selected }) => useChatSession(selected), {
+      initialProps: { selected: agentId },
+    });
+    await waitFor(() => expect(result.current.sessionId).toBe(sessionId));
+    act(() => result.current.reportError('Message failed: lost connection', agentId, sessionId));
+    expect(result.current.chatError).toBe('Message failed: lost connection');
+    rerender({ selected: 'other' });
+    await waitFor(() => expect(result.current.sessionId).toBe(sessionId));
+    act(() => result.current.reportError('Message failed: late A failure', agentId, sessionId));
+    expect(result.current.chatError).toBe('');
+    rerender({ selected: agentId });
+    await waitFor(() => expect(result.current.sessionId).toBe(sessionId));
+    expect(result.current.chatError).toBe('Message failed: late A failure');
+  });
+});
+
+it.each(['session', 'agent', 'return'] as const)(
+  'owns pending older requests across %s navigation and ignores stale completion',
+  async (navigation) => {
+    const pending: ReturnType<typeof deferred<unknown>>[] = [];
+    apiMock.mockImplementation(async (path) => {
+      const url = new URL(String(path), 'http://fixture');
+      if (url.pathname === '/api/sessions') return { sessions: [{ id: sessionId }, { id: 'b' }] };
+      if (url.searchParams.has('before')) {
+        const request = deferred<unknown>();
+        pending.push(request);
+        return request.promise;
+      }
+      return {
+        session: {
+          id: url.pathname.split('/').pop(),
+          turns: [],
+          hasMore: true,
+          nextCursor: 'older',
+        },
+      };
+    });
+    const { result, rerender } = renderHook(({ agent }) => useChatSession(agent), {
+      initialProps: { agent: agentId },
+    });
+    await waitFor(() => expect(result.current.hasOlder).toBe(true));
+    let first!: Promise<void>;
+    act(() => {
+      first = result.current.loadOlder();
+    });
+    expect(result.current.isLoadingOlder).toBe(true);
+    if (navigation === 'agent') rerender({ agent: 'other' });
+    else act(() => result.current.selectSession('b'));
+    await waitFor(() => expect(result.current.hasOlder).toBe(true));
+    expect(result.current.isLoadingOlder).toBe(false);
+    if (navigation === 'return') {
+      act(() => result.current.selectSession(sessionId));
+      await waitFor(() => expect(result.current.hasOlder).toBe(true));
+    }
+    let second!: Promise<void>;
+    act(() => {
+      second = result.current.loadOlder();
+    });
+    expect(pending).toHaveLength(2);
+    // The old request cannot release the new destination's lock or loading flag.
+    await act(async () => {
+      pending[0].resolve({
+        session: {
+          id: sessionId,
+          turns: [{ id: 'stale', role: 'user', content: 'stale' }],
+          hasMore: false,
+        },
+      });
+      await first;
+    });
+    expect(result.current.isLoadingOlder).toBe(true);
+    expect(result.current.turns.some((turn) => turn.content === 'stale')).toBe(false);
+    await act(async () => {
+      await result.current.loadOlder();
+    });
+    expect(pending).toHaveLength(2);
+    await act(async () => {
+      pending[1].resolve({
+        session: {
+          id: result.current.sessionId,
+          turns: [{ id: 'current', role: 'user', content: 'current' }],
+          hasMore: false,
+        },
+      });
+      await second;
+    });
+    expect(result.current.turns.map((turn) => turn.content)).toEqual(['current']);
+    expect(result.current.isLoadingOlder).toBe(false);
+    expect(result.current.hasOlder).toBe(false);
+  },
+);
