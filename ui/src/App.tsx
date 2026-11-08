@@ -6,16 +6,15 @@ import {
 import { chatAgents, capabilityAgents } from './app/agentCatalog';
 import { UnsavedChangesProvider, useUnsavedNavigation } from './app/UnsavedChanges';
 import { useBrowserTabTitle } from './app/browserTab';
-import { readAttachment } from './app/readAttachment';
-import { isWithinAttachmentBudget } from './features/chat/attachmentValidation';
+import { useAppMutations } from './app/useAppMutations';
 import { useModelSelectionWriter } from './app/useModelSelectionWriter';
 import { useConfirm } from './app/ConfirmDialog';
 import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { PointerEvent } from 'react';
 import type { Agent, Page, PanelId, SettingsTab } from './app/types';
-import { api, attachmentDisplayName, type RuntimeHealth, type SetupStatus } from './app/api';
+import { api, type RuntimeHealth, type SetupStatus } from './app/api';
 
-import { loadModPanels, modsChangedEvent, type ModPanel } from './app/modPanels';
+import { useModDiscovery } from './app/useModDiscovery';
 import { ModPanelHost } from './features/mods/ModPanelHost';
 import {
   clampRailSplit,
@@ -45,13 +44,6 @@ import { useChatComposers } from './features/chat/useChatComposers';
 import { ChatComposerDialogs } from './features/chat/ChatComposerDialogs';
 import { AppStatusBar, DocumentTabs } from './app/AppChrome';
 
-const isSupportedAttachment = (file: File) =>
-  file.type.startsWith('image/') ||
-  file.type.startsWith('text/') ||
-  ['application/json', 'application/xml', 'application/rtf'].includes(file.type) ||
-  /\.(txt|md|markdown|json|csv|xml|html?|css|js|ts|tsx|jsx|py|rb|go|rs|java|c|cpp|h|yaml|yml|rtf)$/i.test(
-    file.name,
-  );
 import { useWorkspaceFiles } from './features/workspace/useWorkspaceFiles';
 import { useChatSession } from './features/chat/useChatSession';
 const Settings = lazy(() =>
@@ -141,37 +133,8 @@ function AppContent() {
     setPage('chat');
   };
   // Burrow is a single local runtime. Node Goblin integrations are explicit mod-owned APIs.
-  const [modPanels, setModPanels] = useState<ModPanel[]>([]);
-  const [modsLoaded, setModsLoaded] = useState(false);
+  const { modPanels, modsLoaded } = useModDiscovery();
   const [activeModId, setActiveModId] = useState<string | null>(null);
-  useEffect(() => {
-    let live = true;
-    let sequence = 0;
-    const refresh = () => {
-      const current = ++sequence;
-      void loadModPanels()
-        .then((panels) => {
-          if (live && current === sequence) {
-            setModPanels(panels);
-            setModsLoaded(true);
-          }
-        })
-        .catch(() => {
-          if (live && current === sequence) {
-            setModPanels([]);
-            setModsLoaded(true);
-          }
-        });
-    };
-    refresh();
-    window.addEventListener(modsChangedEvent, refresh);
-    const interval = window.setInterval(refresh, 30000);
-    return () => {
-      live = false;
-      window.removeEventListener(modsChangedEvent, refresh);
-      window.clearInterval(interval);
-    };
-  }, []);
   const activeMod = modPanels.find((mod) => mod.modId === activeModId);
   useEffect(() => {
     if (modsLoaded && activeModId && !activeMod) {
@@ -372,37 +335,16 @@ function AppContent() {
         return next;
       }),
   );
-  const updateAgent = async (patch: Partial<Agent>) => {
-    if (!selected) return;
-    if (patch.contextConfig) {
-      const contextConfig = { a2aInDefault: patch.contextConfig.a2aInDefault };
-      try {
-        await api(`/api/agents/${encodeURIComponent(selected.resourceId ?? selected.id)}`, {
-          method: 'PATCH',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ contextConfig }),
-        });
-        setAgents((all) =>
-          all.map((agent) =>
-            agent.id === selected.id
-              ? { ...agent, contextConfig: { ...agent.contextConfig, ...contextConfig } }
-              : agent,
-          ),
-        );
-        await refreshSessions(selected.id).catch((error: Error) =>
-          reportError(`A2A routing saved, but could not refresh sessions: ${error.message}`),
-        );
-      } catch (error) {
-        reportError(
-          error instanceof Error
-            ? `Could not update A2A routing: ${error.message}`
-            : 'Could not update A2A routing.',
-        );
-      }
-      return;
-    }
-    return writeModelSelection(selected, patch);
-  };
+  const { updateAgent, attachImage } = useAppMutations({
+    selected,
+    setAgents,
+    refreshSessions,
+    reportError,
+    writeModelSelection,
+    attached,
+    isAttachmentScopeCurrent,
+    setAttachment,
+  });
 
   const confirmDiscard = useConfirm();
   const closeTab = async (id: string) => {
@@ -444,36 +386,6 @@ function AppContent() {
       resettingSessionRef.current = false;
       setIsResettingSession(false);
     }
-  };
-  const attachImage = (files: File[]) => {
-    const admittedSizes = attached.map((item) => item.size);
-    const accepted = files.filter((file) => {
-      if (!isSupportedAttachment(file)) {
-        reportError(
-          `${file.name}: Attach an image or text document. PDF extraction is not supported.`,
-        );
-        return false;
-      }
-      if (!isWithinAttachmentBudget(admittedSizes, file.size)) {
-        reportError(
-          `${file.name}: Attachment exceeds the client file, count, or batch safety budget.`,
-        );
-        return false;
-      }
-      admittedSizes.push(file.size);
-      return true;
-    });
-    if (!accepted.length) return;
-    void Promise.all(
-      accepted.map((file, index) => readAttachment(file, attachmentDisplayName(file, index + 1))),
-    )
-      .then((attachments) => {
-        if (!isAttachmentScopeCurrent()) return;
-        setAttachment(attachments);
-      })
-      .catch(() => {
-        if (isAttachmentScopeCurrent()) reportError('Could not read the attachment.');
-      });
   };
   const setParentActivity = (agentId: string, status: string) => {
     setAgents((current) =>

@@ -1,100 +1,17 @@
 import { optimizeAvatar } from '../../app/avatar';
 import type { AgentToolbarProps } from './AgentToolbar';
 import { providerOptionLabel } from './ProviderModelFields';
-import { secureUuid } from '../../app/secureUuid';
-import { retainedOperation, completeOperation } from '../../app/durableOperation';
+import { agentIdFromName } from './setupOperation';
+import { useFirstRunWorkflow } from './useFirstRunWorkflow';
 import { AccessibleModal } from '../../app/AccessibleModal';
 import React, { useEffect, useRef, useState } from 'react';
 import type { SavedProvider } from '../../app/types';
-import { api, importExport, type RuntimeModel } from '../../app/api';
+import { api } from '../../app/api';
 import type { OpenAiOAuthConnection } from './modelConnectionsApi';
-import { useClaudeCodeLoginFlow } from './useClaudeCodeLoginFlow';
-import { useOpenAiOAuthConnectionFlow } from './useOpenAiOAuthConnectionFlow';
-
-const profileDocumentKinds = [
-  'SOUL',
-  'RULES',
-  'ORIENTATION',
-  'PREFERENCES',
-  'TOOLS',
-  'DREAM_MEMORY',
-] as const;
-
-const selectedRuntimeModels = (models: Array<string | RuntimeModel> = []): RuntimeModel[] =>
-  models.map((model) => {
-    if (typeof model === 'string') return { id: model, selected: true, acceptedInput: ['text'] };
-    return {
-      ...model,
-      selected: model.selected ?? true,
-      acceptedInput: model.acceptedInput ?? model.discoveredInput ?? ['text'],
-    };
-  });
-
-const savedProviderFromConnection = (connection: OpenAiOAuthConnection): SavedProvider => {
-  const models = selectedRuntimeModels(connection.models);
-  return {
-    id: connection.id,
-    provider: connection.provider ?? 'OpenAI',
-    apiType: connection.apiType ?? 'openai-responses',
-    url: connection.baseUrl ?? 'https://chatgpt.com/backend-api',
-    apiKey: '',
-    models: models.filter((model) => model.selected !== false).map((model) => model.id),
-    manualModels: Object.fromEntries(
-      models.filter((model) => model.manual).map((model) => [model.id, true]),
-    ),
-    modelLabels: Object.fromEntries(
-      models.filter((model) => model.displayName).map((model) => [model.id, model.displayName!]),
-    ),
-    modelEfforts: Object.fromEntries(
-      models
-        .filter((model) => model.reasoningEfforts?.length)
-        .map((model) => [model.id, model.reasoningEfforts!]),
-    ),
-    defaultEfforts: Object.fromEntries(
-      models
-        .filter((model) => model.defaultReasoningEffort)
-        .map((model) => [model.id, model.defaultReasoningEffort!]),
-    ),
-    modelContextWindows: Object.fromEntries(
-      models
-        .filter((model) => model.contextWindow)
-        .map((model) => [model.id, model.contextWindow!]),
-    ),
-    modelDiscoveredInputs: Object.fromEntries(
-      models
-        .filter((model) => model.discoveredInput?.length)
-        .map((model) => [model.id, model.discoveredInput!]),
-    ),
-    modelInputOverrides: Object.fromEntries(
-      models
-        .filter((model) => model.acceptedInputOverride?.length)
-        .map((model) => [model.id, model.acceptedInputOverride!]),
-    ),
-    modelDiscoveredOutputs: Object.fromEntries(
-      models
-        .filter((model) => model.discoveredOutput?.length)
-        .map((model) => [model.id, model.discoveredOutput!]),
-    ),
-    modelOutputOverrides: Object.fromEntries(
-      models
-        .filter((model) => model.acceptedOutputOverride?.length)
-        .map((model) => [model.id, model.acceptedOutputOverride!]),
-    ),
-  };
-};
-
-const agentIdFromName = (name: string) =>
-  name
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-const importErrorMessage = (cause: unknown) =>
-  cause instanceof Error && cause.message === 'import_password_required'
-    ? 'Password required.'
-    : cause instanceof Error
-      ? `Could not import export: ${cause.message}`
-      : 'Could not import export.';
+import {
+  savedProviderFromConnection,
+  useWizardOAuthProvisioning,
+} from './useWizardOAuthProvisioning';
 
 const openAiLoginStatusLabel = (status?: string) => {
   switch (status) {
@@ -167,14 +84,6 @@ export function FirstRunSetup({
   onFirstRunComplete,
   onSetupComplete,
 }: AgentToolbarProps) {
-  const setupOwner = useRef<object>({});
-  useEffect(
-    () => () => {
-      setupOwner.current = {};
-    },
-    [],
-  );
-  const setupBusy = useRef(false);
   const [showNewAgent, setShowNewAgent] = useState(false);
   const onFirstRunCompleteRef = useRef(onFirstRunComplete);
   const [step, setStep] = useState<1 | 2 | 3 | 4 | 5>(1);
@@ -188,136 +97,56 @@ export function FirstRunSetup({
   const [model, setModel] = useState('');
   const [providers, setProviders] = useState<SavedProvider[]>([]);
   const [celebrating, setCelebrating] = useState(false);
-  const [importing, setImporting] = useState(false);
-  const [imported, setImported] = useState(false);
-  const [importPayload, setImportPayload] = useState('');
-  const [importPassword, setImportPassword] = useState('');
-  const importInput = useRef<HTMLInputElement>(null);
-  const [state, setState] = useState<'idle' | 'creating'>('idle');
   const [error, setError] = useState('');
   const avatarInput = useRef<HTMLInputElement>(null);
   const operatorAvatarInput = useRef<HTMLInputElement>(null);
-  const [oauthProvider, setOauthProvider] = useState<'openai' | 'anthropic' | null>(null);
-  const wizardOAuthConnection = useRef<OpenAiOAuthConnection | null>(null);
-  const saveWizardConnection = async (connection: OpenAiOAuthConnection) => {
-    if (!connection.id || !connection.provider || !connection.apiType || !connection.baseUrl)
-      throw new Error('OAuth completed, but the connection details were incomplete.');
-
-    // The OAuth callback can report authorized before the saved connection has a model list.
-    // Discover only after that authorization state, using its freshly stored OAuth credentials.
-    const discovered = await api<{ models: RuntimeModel[] }>(
-      '/api/settings/model-connections/discover',
-      {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          id: connection.id,
-          provider: connection.provider,
-          apiType: connection.apiType,
-          baseUrl: connection.baseUrl,
-        }),
-      },
-    );
-    const models = selectedRuntimeModels(discovered.models).map((item) => ({
-      ...item,
-      selected: true,
-    }));
-    if (!models.length)
-      throw new Error('OAuth completed, but did not return any available models.');
-    await api('/api/settings/model-connections', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        id: connection.id,
-        provider: connection.provider,
-        apiType: connection.apiType,
-        baseUrl: connection.baseUrl,
-        models,
-      }),
-    });
-    const result = await api<{ connections: OpenAiOAuthConnection[] }>(
-      '/api/settings/model-connections',
-    );
-    setProviders((result.connections ?? []).map(savedProviderFromConnection));
-    setConnectionId(connection.id);
-    setModel(models[0]?.id ?? '');
-  };
-  const receiveWizardOAuthConnection = (connection: OpenAiOAuthConnection) => {
-    wizardOAuthConnection.current = connection;
-  };
-  const completeWizardOAuth = async () => {
-    if (!wizardOAuthConnection.current)
-      throw new Error('OAuth completed, but the connection details were unavailable.');
-    await saveWizardConnection(wizardOAuthConnection.current);
-    setOauthProvider(null);
-  };
   const {
-    login: openAiLogin,
-    code: openAiOAuthCode,
-    setCode: setOpenAiOAuthCode,
-    requestState: openAiOAuthState,
-    error: openAiOAuthError,
-    start: startOpenAiOAuth,
-    submit: submitOpenAiOAuth,
-    reset: resetOpenAiOAuth,
-  } = useOpenAiOAuthConnectionFlow({
-    onConnection: receiveWizardOAuthConnection,
-    onAuthorized: completeWizardOAuth,
-  });
+    oauthProvider,
+    setOauthProvider,
+    openAiLogin,
+    claudeLogin,
+    oauthBusy,
+    oauthError,
+    oauthCode,
+    setOauthCode,
+    startWizardOAuth,
+    submitWizardOAuth,
+    resetWizardOAuth,
+  } = useWizardOAuthProvisioning({ setProviders, setConnectionId, setModel });
   const {
-    login: claudeLogin,
-    code: claudeOAuthCode,
-    setCode: setClaudeOAuthCode,
-    requestState: claudeOAuthState,
-    error: claudeOAuthError,
-    start: startClaudeOAuth,
-    submit: submitClaudeOAuth,
-    reset: resetClaudeOAuth,
-  } = useClaudeCodeLoginFlow({
-    onConnection: receiveWizardOAuthConnection,
-    onImported: completeWizardOAuth,
-    autoImport: true,
+    importing,
+    imported,
+    importPayload,
+    importPassword,
+    setImportPassword,
+    importInput,
+    state,
+    finish,
+    readImportFile,
+    submitProtectedImport,
+    resetWorkflow,
+  } = useFirstRunWorkflow({
+    onSelect,
+    onAgentsChanged,
+    onModelConnectionsChanged,
+    onOperatorProfileChanged,
+    onSetupComplete,
+    operatorName,
+    operatorAvatar,
+    name,
+    avatar,
+    soul,
+    connectionId,
+    model,
+    setError,
+    setCelebrating,
   });
-  const oauthBusy =
-    oauthProvider === 'openai'
-      ? openAiOAuthState
-      : oauthProvider === 'anthropic'
-        ? claudeOAuthState
-        : 'idle';
-  const oauthError =
-    oauthProvider === 'openai'
-      ? openAiOAuthError
-      : oauthProvider === 'anthropic'
-        ? claudeOAuthError
-        : '';
-  const oauthCode = oauthProvider === 'openai' ? openAiOAuthCode : claudeOAuthCode;
-  const setOauthCode = (code: string) => {
-    if (oauthProvider === 'openai') setOpenAiOAuthCode(code);
-    else setClaudeOAuthCode(code);
-  };
-  const startWizardOAuth = async (kind: 'openai' | 'anthropic') => {
-    setOauthProvider(kind);
-    wizardOAuthConnection.current = null;
-    resetOpenAiOAuth();
-    resetClaudeOAuth();
-    if (kind === 'openai') await startOpenAiOAuth();
-    else await startClaudeOAuth();
-  };
-  const submitWizardOAuth = async () => {
-    if (oauthProvider === 'openai') await submitOpenAiOAuth();
-    else if (oauthProvider === 'anthropic') await submitClaudeOAuth();
-  };
   const reset = () => {
-    setupOwner.current = {};
-    wizardOAuthConnection.current = null;
-    setOauthProvider(null);
-    resetOpenAiOAuth();
-    resetClaudeOAuth();
+    resetWorkflow();
+    resetWizardOAuth();
     setCelebrating(false);
     setShowNewAgent(false);
     setStep(1);
-    setImportPayload('');
-    setImportPassword('');
     setOperatorName('');
     setOperatorAvatar('');
     setOperatorAvatarFileName('');
@@ -327,9 +156,6 @@ export function FirstRunSetup({
     setConnectionId('');
     setModel('');
     setError('');
-    setImporting(false);
-    setImported(false);
-    if (importInput.current) importInput.current.value = '';
   };
   const open = async () => {
     setShowNewAgent(true);
@@ -420,134 +246,7 @@ export function FirstRunSetup({
     setError('');
     if (avatarInput.current) avatarInput.current.value = '';
   };
-  const markSetupComplete = async () => {
-    await onSetupComplete?.();
-  };
-  const finish = async () => {
-    if (setupBusy.current) return;
-    const key = 'hc.setupOperation';
-    if (!localStorage.getItem(key) && (!operatorName.trim() || !agentIdFromName(name.trim()))) {
-      setError('Operator and agent names are required.');
-      return;
-    }
-    const owner = setupOwner.current;
-    const current = () => setupOwner.current === owner;
-    setupBusy.current = true;
-    setState('creating');
-    setError('');
-    let attempted = false;
-    try {
-      const payload = retainedOperation(key, () => ({
-        operationId: secureUuid(),
-        operator: { name: operatorName.trim(), avatar: operatorAvatar },
-        agent: { id: agentIdFromName(name.trim()), name: name.trim(), enabled: true },
-        agentIdentity: { avatar },
-        documents: profileDocumentKinds.map((kind) => ({
-          kind,
-          markdown: kind === 'SOUL' ? soul : '',
-        })),
-        ...(connectionId && model ? { modelSelection: { connectionId, model } } : {}),
-      }));
-      // Only repair the known pre-fix five-kind submission. The backend rejects it
-      // transactionally before recording an operation, so its durable ID is reusable.
-      // Complete submissions (including lost responses) must remain byte-for-byte intact.
-      const legacyKinds = profileDocumentKinds.filter((kind) => kind !== 'PREFERENCES');
-      if (
-        Array.isArray(payload.documents) &&
-        payload.documents.length === legacyKinds.length &&
-        legacyKinds.every(
-          (kind) => payload.documents.filter((doc) => doc.kind === kind).length === 1,
-        )
-      ) {
-        const documents = [...payload.documents];
-        documents.splice(documents.findIndex((doc) => doc.kind === 'ORIENTATION') + 1, 0, {
-          kind: 'PREFERENCES',
-          markdown: '',
-        });
-        const repaired = { ...payload, documents };
-        localStorage.setItem(key, JSON.stringify(repaired));
-        payload.documents = documents;
-      }
-      attempted = true;
-      const result = await api<{ agent: { id: string } }>('/api/setup/operation', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      completeOperation(key, payload.operationId);
-      if (!current()) return;
-      onOperatorProfileChanged?.(payload.operator);
-      await Promise.all([onModelConnectionsChanged(), onAgentsChanged()]);
-      if (!current()) return;
-      await markSetupComplete();
-      if (!current()) return;
-      onSelect(result.agent.id);
-      setCelebrating(true);
-    } catch (cause) {
-      if (current())
-        setError(
-          `Could not finish first-run setup: ${cause instanceof Error ? cause.message : 'Unknown error'}.${attempted ? ' Retry to recover the original submission.' : ''}`,
-        );
-    } finally {
-      setupBusy.current = false;
-      if (current()) setState('idle');
-    }
-  };
   const provider = providers.find((item) => item.id === connectionId);
-  const readImportFile = async (file?: File) => {
-    if (!file) return;
-    setError('');
-    setImporting(true);
-    try {
-      let binary = '';
-      new Uint8Array(await file.arrayBuffer()).forEach((byte) => {
-        binary += String.fromCharCode(byte);
-      });
-      const payload = btoa(binary);
-      setImportPayload(payload);
-      setImportPassword('');
-      const preview = await importExport({ payload }, true);
-      if (preview.requiresPassword === true || preview.encrypted === true) {
-        setImporting(false);
-        return;
-      }
-      await importExport({ payload, confirm: true, conflictPolicy: 'replace' });
-      await Promise.all([onModelConnectionsChanged(), onAgentsChanged()]);
-      await markSetupComplete();
-      setImported(true);
-      setCelebrating(true);
-    } catch (cause) {
-      setError(importErrorMessage(cause));
-    } finally {
-      setImporting(false);
-    }
-  };
-  const submitProtectedImport = async () => {
-    if (!importPayload || !importPassword.trim()) {
-      setError('Enter the password for this export.');
-      return;
-    }
-    setError('');
-    setImporting(true);
-    try {
-      await importExport({
-        payload: importPayload,
-        password: importPassword,
-        confirm: true,
-        conflictPolicy: 'replace',
-      });
-      await Promise.all([onModelConnectionsChanged(), onAgentsChanged()]);
-      await markSetupComplete();
-      setImported(true);
-      setImportPassword('');
-      setImportPayload('');
-      setCelebrating(true);
-    } catch (cause) {
-      setError(importErrorMessage(cause));
-    } finally {
-      setImporting(false);
-    }
-  };
   return (
     <>
       {showNewAgent && (
