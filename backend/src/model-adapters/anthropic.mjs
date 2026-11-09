@@ -60,21 +60,23 @@ function compactAnthropicContentParts(parts = []) {
   });
 }
 
-function anthropicContentParts(content) {
+function anthropicContentParts(content, { toolResult = false } = {}) {
   if (Array.isArray(content)) {
     return compactAnthropicContentParts(content.map((part) => {
       if (typeof part === 'string') return { type: 'text', text: part };
       if (part?.type === 'text') return { type: 'text', text: String(part.text || '') };
-      if (part?.type === 'tool_use') return { type: 'tool_use', id: String(part.id || randomUUID()), name: String(part.name || ''), input: parseArguments(part.input || {}) };
-      if (part?.type === 'thinking') return { type: 'thinking', thinking: String(part.thinking || ''), ...('signature' in part ? { signature: String(part.signature ?? '') } : {}) };
-      if (part?.type === 'redacted_thinking') return { type: 'redacted_thinking', ...('data' in part ? { data: String(part.data ?? '') } : {}), ...('signature' in part ? { signature: String(part.signature ?? '') } : {}) };
+      if (!toolResult && part?.type === 'tool_use') return { type: 'tool_use', id: String(part.id || randomUUID()), name: String(part.name || ''), input: parseArguments(part.input || {}) };
+      if (!toolResult && part?.type === 'thinking') return { type: 'thinking', thinking: String(part.thinking || ''), ...('signature' in part ? { signature: String(part.signature ?? '') } : {}) };
+      if (!toolResult && part?.type === 'redacted_thinking') return { type: 'redacted_thinking', ...('data' in part ? { data: String(part.data ?? '') } : {}), ...('signature' in part ? { signature: String(part.signature ?? '') } : {}) };
       if (part?.type === 'image_url') {
         const url = part.image_url?.url || part.url || '';
         const m = /^data:([^;]+);base64,(.*)$/i.exec(url);
         if (m) return { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } };
+        if (/^https?:\/\//i.test(url)) return { type: 'image', source: { type: 'url', url } };
       }
       if (part?.type === 'image' && part.source) return part;
-      return { type: 'text', text: boundedText(typeof part === 'string' ? part : JSON.stringify(part || {}), MAX_MODEL_TEXT_CHARS) };
+      const fallback = JSON.stringify(part || {});
+      return { type: 'text', text: toolResult ? fallback : boundedText(fallback, MAX_MODEL_TEXT_CHARS) };
     }));
   }
   return compactAnthropicContentParts([{ type: 'text', text: String(content || '') }]);
@@ -88,16 +90,10 @@ function anthropicMessages(messages = [], prompt = '') {
     const role = message?.role === 'assistant' ? 'assistant' : message?.role === 'system' ? 'system' : 'user';
     if (role === 'system') { system.push(String(message.content || '')); continue; }
     if (message?.role === 'tool') {
+      // Tool results use the same image conversion as user content; keep the
+      // result nested under its paired tool_use_id.
       const resultContent = Array.isArray(message.content)
-        ? message.content.map((part) => {
-          if (part?.type === 'image_url') {
-            const url = part.image_url?.url || part.url || '';
-            const m = /^data:([^;]+);base64,(.*)$/i.exec(url);
-            if (m) return { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } };
-          }
-          if (part?.type === 'text') return { type: 'text', text: String(part.text || '') };
-          return { type: 'text', text: typeof part === 'string' ? part : JSON.stringify(part || {}) };
-        })
+        ? anthropicContentParts(message.content, { toolResult: true })
         : String(message.content || '');
       converted.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: String(message.tool_call_id || message.id || 'tool-call'), content: resultContent }] });
       continue;
@@ -132,9 +128,60 @@ function anthropicCacheableSystem(system = '') {
   return blocks;
 }
 
+// Anthropic rejects composition keywords on the input_schema root. This is a
+// descriptive wire projection, NOT a replacement for the source/IPC validator.
+// Keep nested constraints visible; exact cross-field branch validation remains
+// with the original runtime schema, not this descriptive wire projection.
+function anthropicObjectProjection(schema) {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return { properties: {}, required: [] };
+  const properties = { ...(schema.properties || {}) };
+  const required = new Set(schema.required || []);
+  for (const key of ['allOf', 'oneOf', 'anyOf']) {
+    const branches = schema[key];
+    if (!Array.isArray(branches) || !branches.length) continue;
+    const projected = branches.map(anthropicObjectProjection);
+    const branchRequired = key === 'allOf'
+      ? new Set(projected.flatMap(branch => branch.required))
+      : new Set(projected[0].required.filter(name => projected.every(branch => branch.required.includes(name))));
+    for (const name of branchRequired) required.add(name);
+    const names = new Set(projected.flatMap(branch => Object.keys(branch.properties)));
+    for (const name of names) {
+      const definitions = projected.map(branch => branch.properties[name] || {});
+      // Composition is supported below the root. Keep each argument's complete
+      // schema (especially the native mod bridge's arguments) visible to Claude.
+      const alternatives = [...new Map(definitions.map(value => [JSON.stringify(value), value])).values()];
+      const combined = alternatives.length === 1 ? alternatives[0] : { [key === 'allOf' ? 'allOf' : 'anyOf']: alternatives };
+      if (!Object.hasOwn(properties, name)) properties[name] = combined;
+      else if (JSON.stringify(properties[name]) !== JSON.stringify(combined)) {
+        properties[name] = { allOf: [properties[name], combined] };
+      }
+    }
+  }
+  return { properties, required: [...required] };
+}
+
+function anthropicWireInputSchema(schema) {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema;
+  if (!['oneOf', 'anyOf', 'allOf'].some(key => Object.hasOwn(schema, key))) return schema;
+  const { oneOf, anyOf, allOf, ...plain } = schema;
+  const { properties, required } = anthropicObjectProjection(schema);
+  return { ...plain, type: 'object', properties, ...(required.length ? { required } : {}) };
+}
+
+function anthropicOperationGuidance(schema) {
+  const branches = schema?.oneOf || schema?.anyOf;
+  if (!Array.isArray(branches)) return '';
+  const operations = branches.map(branch => {
+    const operation = branch?.properties?.operation?.const;
+    return typeof operation === 'string' ? `${operation}: ${[...(branch.required || [])].filter(key => key !== 'operation').join(', ') || 'no other required fields'}` : null;
+  });
+  return operations.every(Boolean) ? ` Operations (required fields by operation): ${operations.join('; ')}. Follow the original operation-specific constraints.` : '';
+}
+
 function anthropicTool(tool = {}) {
   const fn = tool.function || tool;
-  return { name: fn.name || tool.name, description: fn.description || tool.description || '', input_schema: fn.parameters || tool.input_schema || tool.inputSchema || { type: 'object', properties: {} } };
+  const schema = fn.parameters || tool.input_schema || tool.inputSchema || { type: 'object', properties: {} };
+  return { name: fn.name || tool.name, description: (fn.description || tool.description || '') + anthropicOperationGuidance(schema), input_schema: anthropicWireInputSchema(schema) };
 }
 
 function anthropicCacheableTools(tools = []) {
@@ -205,7 +252,7 @@ function safeAnthropicAssistantBlocks(content = []) {
   return content.map((part) => {
     if (!part || typeof part !== 'object') return null;
     if (part.type === 'text') return { type: 'text', text: boundedText(part.text || '', MAX_MODEL_TEXT_CHARS) };
-    if (part.type === 'tool_use') return { type: 'tool_use', id: boundedText(part.id || '', 256), name: boundedText(part.name || '', 256), input: parseArguments(part.input || {}) };
+    if (part.type === 'tool_use') return { type: 'tool_use', id: boundedText(part.id || '', 256), name: boundedText(part.name || '', 256), input: Object.hasOwn(part, 'input') ? part.input : {} };
     // Anthropic signs the complete opaque thinking block. These fields are
     // protocol material, not display text: changing even one byte makes a
     // valid tool-use continuation unverifiable.
@@ -300,7 +347,7 @@ function anthropicAssistantMessageFromChoice(choice = {}) {
 function normalizeAnthropicChoice(data = {}) {
   const content = Array.isArray(data.content) ? data.content : [];
   const text = boundedText(content.filter((part) => part?.type === 'text').map((part) => part.text || '').join(''), MAX_MODEL_TEXT_CHARS);
-  const toolCalls = content.filter((part) => part?.type === 'tool_use').map((part, index) => normalizeToolCall({ id: part.id || `tool-call-${index}`, name: part.name, arguments: part.input || {} }, index));
+  const toolCalls = content.filter((part) => part?.type === 'tool_use').map((part, index) => normalizeToolCall({ id: part.id || `tool-call-${index}`, name: part.name, arguments: Object.hasOwn(part, 'input') ? part.input : {} }, index));
   const assistantBlocks = safeAnthropicAssistantBlocks(content);
   return { index: 0, finishReason: data.stop_reason || null, message: { role: 'assistant', content: text }, text, toolCalls, anthropic: assistantBlocks.length ? { assistantBlocks } : null };
 }
@@ -331,7 +378,7 @@ function mergeAnthropicStreamEvent(state, event) {
   }
 }
 
-async function readAnthropicSse(response, { maxBytes = DEFAULT_MAX_RESPONSE_BYTES, onTextDelta = null, onThoughtDelta = null, onToolDelta = null } = {}) {
+async function readAnthropicSse(response, { maxBytes = DEFAULT_MAX_RESPONSE_BYTES, onTextDelta = null, onThoughtDelta = null, onToolDelta = null, signal = null } = {}) {
   const limit = Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0 ? Number(maxBytes) : DEFAULT_MAX_RESPONSE_BYTES;
   const state = { message: {}, blocks: [] };
   const eventSequence = [];
@@ -366,16 +413,17 @@ async function readAnthropicSse(response, { maxBytes = DEFAULT_MAX_RESPONSE_BYTE
     let event;
     try { event = JSON.parse(payload); }
     catch (error) {
+      if (sawMessageStop) return;
       fail('model_stream_malformed_event', { eventType: boundedText(declaredType || 'unknown', 64), message: boundedText(error?.message || 'invalid JSON event payload', 500) });
       return;
     }
     sawEvent = true;
     const type = recordEvent(event, declaredType);
+    if (sawMessageStop) return; // Completion is sticky; trailing metadata cannot undo it.
     if (declaredType && event?.type && declaredType !== event.type) {
       fail('model_stream_event_type_mismatch', { eventType: boundedText(declaredType, 64), payloadType: boundedText(event.type, 64) });
       return;
     }
-    if (sawMessageStop) return; // Completion is sticky; trailing ping/metadata cannot undo it.
     if (type === 'message_stop') sawMessageStop = true;
     if (event?.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
       const delta = event.delta.text || '';
@@ -429,19 +477,33 @@ async function readAnthropicSse(response, { maxBytes = DEFAULT_MAX_RESPONSE_BYTE
   const decoder = new TextDecoder();
   if (response?.body?.getReader) {
     const reader = response.body.getReader();
-    while (!failure) {
-      const { value, done } = await readProviderChunk(reader);
-      if (done) break;
-      bytes += value?.byteLength || 0;
-      if (bytes > limit) { try { await reader.cancel(); } catch {} fail('provider_response_too_large', { maxBytes: limit }); break; }
-      const decoded = decoder.decode(value, { stream: true });
-      text += decoded;
-      await consumeText(decoded);
-    }
-    if (!failure) {
-      const tail = decoder.decode();
-      text += tail;
-      await consumeText(tail, true);
+    let ended = false;
+    let onAbort;
+    const aborted = signal && new Promise((_, reject) => {
+      onAbort = () => reject(signal.reason || new DOMException('Aborted', 'AbortError'));
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    });
+    try {
+      while (!failure && !sawMessageStop) {
+        const { value, done } = await (aborted ? Promise.race([readProviderChunk(reader), aborted]) : readProviderChunk(reader));
+        if (done) { ended = true; break; }
+        bytes += value?.byteLength || 0;
+        if (bytes > limit) { fail('provider_response_too_large', { maxBytes: limit }); break; }
+        const decoded = decoder.decode(value, { stream: true });
+        text += decoded;
+        await consumeText(decoded);
+      }
+      signal?.throwIfAborted();
+      if (!failure && !sawMessageStop) {
+        const tail = decoder.decode();
+        text += tail;
+        await consumeText(tail, true);
+      }
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+      if (!ended) { try { Promise.resolve(reader.cancel()).catch(() => {}); } catch {} }
+      try { reader.releaseLock(); } catch {}
     }
   } else {
     text = String((typeof response?.text === 'function' ? await readProviderText(response) : '') || '');
@@ -473,12 +535,9 @@ async function readAnthropicSse(response, { maxBytes = DEFAULT_MAX_RESPONSE_BYTE
     return markProviderEnvelopeFailure({ ok: false, text, bytes, data: null, error: boundedText(state.error.message || 'model_stream_failed', 500), errorDetails: details, eventSequence }, state.error);
   }
   const data = { ...(state.message || {}), content: state.blocks.filter(Boolean) };
-  const stopReason = String(data.stop_reason || '');
-  const hasContent = data.content.length > 0;
   if (!sawEvent) return markProviderStreamTruncated({ ok: false, text, bytes, data: null, error: 'model_stream_empty', errorDetails: { status: response?.status || null }, eventSequence });
   if (!sawMessageStop) return markProviderStreamTruncated({ ok: false, text, bytes, data, error: 'model_stream_truncated', errorDetails: { lastEventType: eventSequence.at(-1) || null }, eventSequence });
-  if (stopReason === 'max_tokens' && !hasContent) return { ok: false, text, bytes, data, error: 'model_stream_max_tokens_empty', eventSequence };
-  if (!stopReason) return { ok: false, text, bytes, data, error: 'model_stream_missing_stop_reason', eventSequence };
+  if (!data.stop_reason) return { ok: false, text, bytes, data, error: 'model_stream_missing_stop_reason', eventSequence };
   return { ok: true, text, bytes, data, eventSequence };
 }
 
@@ -550,14 +609,14 @@ export function createAnthropicMessagesModelAdapter({ config = {}, fetchImpl = g
       const stablePrefixHash = serializedMessageHash({ system: body.system || null, tools: body.tools || [] });
       await providerDiagnostic(() => traceLogger?.model?.({ stage: 'model-request', providerTiming: timing.projected, ...timing.ownership, requestId, modelCall, provider: 'anthropic', api: 'anthropic-messages', model, url, headers: redactHeaders(headers), messageCount: body.messages.length, promptChars, bodyChars: serializedBody.length, continuation: false, toolCount: resolvedTools?.length || 0, toolNames: resolvedTools?.map((tool) => tool.name).filter(Boolean) || [], providerMessageManifest, stablePrefixHash, promptCaching, thinking: thinking.enabled ? { mode: thinking.mode, effort: thinking.effort || null, budgetTokens: thinking.budgetTokens || null } : null, providerRequestArtifact, ts: clock() }));
       const response = await invokeProviderFetch(fetchImpl, url, { method: 'POST', headers, body: serializedBody, ...(signal ? { signal } : {}) }, { traceLogger, requestId, provider: 'anthropic', api: 'anthropic-messages', model, modelCall, recoveryContext, clock, timing });
-      const responseBody = streaming ? await readAnthropicSse(response, { maxBytes: config.maxResponseBytes, onTextDelta: timing.wrap(onTextDelta, 'text'), onThoughtDelta: timing.wrap(onThoughtDelta, 'thought'), onToolDelta: () => { try { timing.stream('tool'); } catch {} } }) : await readResponseTextBounded(response, config.maxResponseBytes);
+      const responseBody = streaming ? await readAnthropicSse(response, { signal, maxBytes: config.maxResponseBytes, onTextDelta: timing.wrap(onTextDelta, 'text'), onThoughtDelta: timing.wrap(onThoughtDelta, 'thought'), onToolDelta: () => { try { timing.stream('tool'); } catch {} } }) : await readResponseTextBounded(response, config.maxResponseBytes);
       let data = streaming ? responseBody.data : null;
       if (!streaming) {
         try { data = responseBody.ok ? (responseBody.text ? JSON.parse(responseBody.text) : {}) : { error: { message: responseBody.error } }; }
         catch { data = { raw: responseBody.text }; }
       }
       const providerErrorEnvelope = responseBody.ok ? data?.error : null;
-      const envelopeError = !streaming ? anthropicEnvelopeError(data) : null;
+      const envelopeError = responseBody.ok ? anthropicEnvelopeError(data) : null;
       if (envelopeError) data = { ...data, error: { message: envelopeError } };
       const ok = Boolean(response.ok) && responseBody.ok && !envelopeError;
       const candidateChoice = ok ? normalizeAnthropicChoice(data) : null;

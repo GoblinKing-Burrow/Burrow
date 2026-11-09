@@ -2,7 +2,7 @@
 
 
 !!! note "Current source review"
-    This page was reconciled against current development source on **2026-11-01**. Historical public-source links retain their original revisions and do not establish that a public mirror or installed runtime contains current behavior. This is static documentation/source review, not an application, provider, database or security test.
+    This page was reconciled against current development source on **2026-11-08**. Historical public-source links retain their original revisions and do not establish that a public mirror or installed runtime contains current behavior. This is static documentation/source review, not an application, provider, database or security test.
 
 BURROW stores operator-managed configuration in PostgreSQL. The service environment supplies deployment paths, database connectivity, encryption keys and optional overrides. The retained `loadBurrowConfig()` function is inert: it does not read or write `burrow.json`.
 ## Choose the right configuration surface
@@ -23,7 +23,8 @@ BURROW stores operator-managed configuration in PostgreSQL. The service environm
 | Retention | Saved trace policy; separate CLI session-retention policy | Settings → General → Trace retention; deliberate CLI maintenance |
 | Brains | Agent-owned saved memories; optional embedding settings | Brains; Settings → General → Continuity |
 | Database, listener, process paths, encryption key | Service environment and installer/container configuration | Service environment file or deployment configuration |
-| Theme, rail layout, drafts, cached conversations | Browser-local storage/state | UI appearance and navigation |
+| Theme, rail layout and other allowlisted display choices | Home-server operator-wide `ui_preferences`, with browser cache/retry journal | Restored after authentication; not per-user settings |
+| Drafts and cached conversations | Browser-local storage/state | Not synchronized by the UI preference API |
 
 These are separate ownership domains. Copying a workspace directory does not copy all application settings; exporting selected categories is not a complete backup. See [storage](../architecture/persistence.md), [backup and recovery](../operations/backup-recovery.md), and [browser state](../concepts/interface.md).
 ## Resolution and overrides
@@ -95,7 +96,7 @@ Unknown fields are discarded. This format does not define executable tools, gran
 
 ## Targeted source review
 
-The current page was statically reconciled on **2026-11-01** against Backend `8b5889115680bcdbf698f1b93126254e1cf4d2e6` and relevant UI/assembly source. The links below remain historical public evidence, not current private-source links. No live deployment or application test was performed.
+The current page was statically reconciled on **2026-11-08** against Backend `6b682eae6cd0dc6efa79e173b7d819fb219443b3` and relevant UI/assembly source. The links below remain historical public evidence, not current private-source links. No live deployment or application test was performed.
 
 - [backend/src/config.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/config.mjs)
 - [backend/src/postgres-application-schema.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/postgres-application-schema.mjs)
@@ -105,3 +106,4 @@ The current page was statically reconciled on **2026-11-01** against Backend `8b
 ## 29 October development delta
 
 Changed contracts above were checked statically against Backend `4057b50a5d5a9b14d36bb3b70f35781c4b29a9b9` on **2026-10-29**. This is not a runtime, provider or collector test, nor a revalidation of unchanged historical sections. See [source coverage](../project/source-map.md).
+

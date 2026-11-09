@@ -2,7 +2,7 @@
 
 
 !!! note "Implementation and historical evidence"
-    Reviewed against current implementation on **1 November 2026**. Historical commit links and explicitly dated examples remain historical evidence; they do not identify the current development source or certify your installed version. See [source coverage](../project/source-map.md). This is static source reconciliation, not a live application or provider test.
+    Reviewed against current implementation on **8 November 2026**. Historical commit links and explicitly dated examples remain historical evidence; they do not identify the current development source or certify your installed version. See [source coverage](../project/source-map.md). This is static source reconciliation, not a live application or provider test.
 
 Start with the installed version, exact error, expected deployment shape, and relevant agent/session/run ID. Avoid changing several settings at once or retrying an operation that may still be running.
 
@@ -219,7 +219,7 @@ Include build version/source pins, deployment shape, sanitized exact error, rele
 
 ## Targeted source review
 
-The full page was reconciled statically on **1 November 2026** against the current source pins in [source coverage](../project/source-map.md). Links below retain historical revision evidence. No application, database, provider or collector test was run.
+The full page was reconciled statically on **8 November 2026** against the current source pins in [source coverage](../project/source-map.md). Links below retain historical revision evidence. No application, database, provider or collector test was run.
 
 - [backend/docs/openapi.json](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/docs/openapi.json)
 - [backend/scripts/burrow-ui.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/scripts/burrow-ui.mjs)
@@ -271,7 +271,7 @@ Background Chat refreshes and another send no longer erase a reported error. Rea
 Checked **6 November 2026**:
 
 - If `/context` reports no captured request, send a normal message and try again. Both context commands read captured evidence, not current settings. A mismatched request meter is unavailable rather than guessed.
-- At the inclusive five-hour 5% headroom floor, a pool member is ineligible even if it owns a continuation. A portable continuation may move to an eligible alternate; signed/account-bound history cannot. Long quota-reset waits terminate bounded recovery. Inspect the original provider explanation and separate failover blocker before resubmitting work.
+- At the inclusive five-hour 5% headroom floor, new work and portable handoffs prefer eligible capacity. A nonportable continuation can remain on its required owner while it is otherwise usable; an existing portable continuation can retain that owner as a last resort. Actual exhaustion, cooldowns, exclusions and missing usage still block it. Proven Anthropic replay removes opaque thinking only from the outbound copy; account-bound images/files remain nonportable. Long quota-reset waits terminate bounded recovery. Inspect the original provider explanation and separate failover blocker before resubmitting work.
 - Use **Load older messages** to inspect compacted chat within the current reset generation, or Archive for reset history. An invalidated cursor requires a fresh newest-page read. A loading conversation is not an empty conversation.
 - A stopped chat may still receive its requested Forge artifact after generation finishes. Inspect job success and `delivery.status` separately. Retry delivery with the original identity/key when appropriate rather than creating another paid job; a reset prevents delivery into the replacement generation.
 - Historical recall backfill now prepares projections before acquiring source/session locks and publishes under a separate 250ms cancellation budget. It uses a 60-second page preparation budget and shrinks timed-out pages, then grows after four full committed pages. Database cancellation/rollback can exceed the nominal publication budget; do not edit checksums or delete history to bypass progress.
@@ -286,3 +286,7 @@ Checked **7 November 2026**:
 - **Continuation recap fails:** `continuation_summary_invalid` means the summary could not be safely used. `context_preparation_prompt_over_budget` means the irreducible request still cannot fit. These are not evidence that original conversation history was deleted.
 - **Schedule disabled after an invalid occurrence:** inspect its failed schedule receipt and correct the schedule deliberately. Other valid jobs continue; missed occurrences are not replayed.
 - **Mod disabled/uninstalled but skill sync warns:** inspect the completed mod transition separately from managed-skill health. A synchronization failure no longer implies rollback.
+
+## Workspace preferences do not restore or synchronize
+
+Checked **9 November 2026**: **Couldn't restore your workspace** means the bootstrap read/migration failed; existing local settings are not automatically replaced. Choose **Retry**, or **Use this browser only** for a visibly unsynchronized fallback. **UI changes haven't synced to Burrow yet** means pending edits remain locally for retry. Preserve site data until those edits are reconciled. Check the authenticated home-server preference endpoint, not a selected-node or mod API. Credentials, drafts and conversation caches are outside this synchronization contract.

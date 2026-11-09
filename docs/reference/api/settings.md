@@ -2,7 +2,7 @@
 
 
 !!! note "Source-reviewed API reference"
-    This reference was reconciled against current development source on **2026-11-01**. Historical public-source links below remain pinned to their stated revision; they are not proof that a public mirror or your installation has caught up. Start with the [current operator guide](../../guide/installation.md) for installation. This is static source review, not a live API compatibility test.
+    This reference was reconciled against current development source on **2026-11-08**. Historical public-source links below remain pinned to their stated revision; they are not proof that a public mirror or your installation has caught up. Start with the [current operator guide](../../guide/installation.md) for installation. This is static source review, not a live API compatibility test.
 
 
 These are privileged operator routes. They share the normal interactive authentication gate; `diagnostics:read` Bearer tokens do not authorize them. Stored settings, environment overrides and effective runtime behavior are explained in [configuration](../configuration.md).
@@ -37,6 +37,12 @@ Provider login endpoints are distinct from UI OIDC authentication:
 - Claude CLI credential status/import: explicit integration with locally available credentials
 
 These flows can establish ongoing provider access. Handle credentials through the supported operator flow, never diagnostic tokens, and do not log raw callback content. Capability/provider-specific details are in [models](../../concepts/models.md).
+### Replacing existing OpenAI OAuth tokens
+
+For an existing direct OpenAI OAuth connection, model-connection POST may carry an `oauthTokens` object with only string `id_token`, `access_token` and `refresh_token` fields. Omitted or blank fields preserve existing values. This is credential replacement, not a new sign-in or token-validation endpoint; never include actual tokens in logs, examples or support messages. Do not combine this patch with `auth` or a nonblank `apiKey`, and do not send it to a logical pool.
+
+A replacement access token must contain a parseable JWT payload with a finite positive numeric `exp`. Its expiry and account metadata replace the prior access token's values. Reading JWT metadata is not cryptographic verification or proof the provider will authorize it. Invalid token patches fail without saving the replacement; use the supported provider login flow when establishing a new connection.
+
 ### Native OAuth provider pools
 
 Pools are saved through the existing model-connection POST route, not a separate pool API. Use `apiType: "openai-lb"` or `"anthropic-lb"` and a `pool` object with boolean `enabled`, nonempty `memberConnectionIds`, optional `sticky` (default true), and optional `preferEarlierReset` (default false). Member IDs are normalized and deduplicated. Pools use existing saved OAuth connections; they are not a credential upload or account-registration flow.
@@ -158,7 +164,7 @@ Methods are significant. Braced segments are placeholders; URL-encode identifier
 
 ## Targeted source review
 
-The full page was reconciled on **2026-11-01** against Backend commit `8b5889115680bcdbf698f1b93126254e1cf4d2e6`. No live API or provider calls were performed. The links below are retained historical public references, not links to the current development source.
+The full page was reconciled on **2026-11-08** against Backend commit `6b682eae6cd0dc6efa79e173b7d819fb219443b3`. No live API or provider calls were performed. The links below are retained historical public references, not links to the current development source.
 
 - [backend/scripts/ui/settings-routes.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/scripts/ui/settings-routes.mjs)
 - [backend/scripts/ui/general-settings-routes.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/scripts/ui/general-settings-routes.mjs)
@@ -180,3 +186,11 @@ Changed contracts above were checked statically against Backend `4057b50a5d5a9b1
 ## Automatic expiring reset preference
 
 Checked **7 November 2026**: model-connection writes accept `autoUseExpiringResets`, returned on reads and defaulting to `false`. Only literal `true` enables it, and only for a direct OpenAI OAuth connection, not a logical load-balancer pool. The backend polls at startup and every minute for an available credit expiring within ten minutes. It requires stable account identity and a durable claim, then pins the exact credit/expiry. Definite rejection or `nothing_to_reset` may retry that same credit after one minute; ambiguous transport/provider outcomes preserve an account-wide unknown fence. See [operator controls and recovery](../../guide/models.md#automatically-use-expiring-resets). This is not a new HTTP route or a request to edit reset tables.
+
+## Operator UI preferences
+
+Checked **9 November 2026**: `GET /api/settings/ui-preferences` returns `{ "values": {} }` when no preferences are stored. `PATCH` accepts `{ "values": { "hc.theme": "dark", "hc.leftSplit": null }, "seedOnly": false }` and returns the complete merged `{values}`. String values are opaque browser-storage representations; null removes a key and omitted keys remain unchanged. `seedOnly: true` fills missing keys without overwriting or deleting existing entries. Concurrent first writes use the same atomic boundary. Empty patches are valid.
+
+Allowed keys are `hc.theme`, `hc.selectedAgentId`, `hc.leftCollapsed`, `hc.rightCollapsed`, `hc.leftSplit`, `hc.rightSplit`, `hc.leftTopPanel`, `hc.leftBottomPanel`, `hc.rightTopPanel`, `hc.rightBottomPanel`, `hc.leftRailLayout`, `hc.rightRailLayout`, `hc.leftSinglePanel`, `hc.rightSinglePanel`, `hc.rightPanelDefaultsVersion`, `hc.agentRailPreferences`, `hc.groupChatTabs`, `hc.settingsUtilityPanelOpen`, and `hc.accountStatusOrder`.
+
+Unknown keys, unknown top-level fields, malformed bodies, nonboolean `seedOnly`, and values other than string/null return `400 invalid_ui_preferences` without mutation. The home server owns one operator-wide `settings_meta` record named `ui_preferences`, under the existing authentication boundary. This is not per-user or selected-node storage. Credentials, drafts and caches are excluded. See [workspace restoration](../../concepts/interface.md#workspace-preference-synchronization).

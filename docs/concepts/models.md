@@ -2,7 +2,7 @@
 
 
 !!! note "Source review and historical material"
-    This technical reference was reconciled statically with current implementation on **1 November 2026**. Explicit historical examples, screenshots and pinned public links remain historical; they are not evidence of current runtime acceptance. Start with the [current operator guide](../guide/installation.md) for installation and check your installed build before using newer capabilities.
+    This technical reference was reconciled statically with current implementation on **8 November 2026**. Explicit historical examples, screenshots and pinned public links remain historical; they are not evidence of current runtime acceptance. Start with the [current operator guide](../guide/installation.md) for installation and check your installed build before using newer capabilities.
 
 Model selection is explicit configuration. A connection describes the provider endpoint and credential source; a model identifies the configured capability to use through that connection. The connection ID is durable identity. A display label is presentation.
 
@@ -126,3 +126,13 @@ Provider quota indicators and their polling were removed from the bottom status 
 ## 3 November development delta
 
 The changed context and host contracts above were checked statically against Backend `32dde3266a231777ddfec6dba141d6b9972a21fd` on **2026-11-03**. No application, provider or database tests were run; unchanged historical sections retain their earlier qualifications. See [source coverage](../project/source-map.md).
+
+## Streaming completion boundaries
+
+Current Anthropic streaming ends at `message_stop` and still validates the terminal envelope and stop reason. Gemini tracks terminal finish evidence for every observed candidate, then permits only a short, bounded metadata drain for trailing usage. Late malformed metadata cannot rewrite a completed answer. Both streaming readers respond to caller cancellation and release their reader ownership; EOF without the required terminal evidence remains a truncated response, not success. These adapter-specific checks do not establish a universal compatibility guarantee for every endpoint.
+
+## Anthropic tool schema and image conversion
+
+Checked **9 November 2026**: the Anthropic wire adapter projects root-level `oneOf`, `anyOf` and `allOf` tool schemas into an object-root description and preserves nested argument constraints. Operation-specific required fields are described to the model; the original runtime/IPC validator still enforces exact branch and cross-field rules. This projection does not grant tool authority or relax runtime validation. Malformed native mod-tool arguments retain both generic argument and mod-envelope diagnostics.
+
+User and tool-result image parts support data URLs and HTTP(S) image URLs. Tool-result images stay paired with their `tool_use_id`; invalid native input types are not silently replaced by an empty object. These static contracts are not an end-to-end compatibility test. Pool replay and headroom continuation exceptions are described in [account pools](../guide/models.md#native-oauth-account-pools).

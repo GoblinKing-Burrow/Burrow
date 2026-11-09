@@ -2,7 +2,7 @@
 
 
 !!! note "Source review and historical material"
-    This technical reference was reconciled statically with current implementation on **1 November 2026**. Explicit historical examples, screenshots and pinned public links remain historical; they are not evidence of current runtime acceptance. Start with the [current operator guide](../guide/installation.md) for installation and check your installed build before using newer capabilities.
+    This technical reference was reconciled statically with current implementation on **8 November 2026**. Explicit historical examples, screenshots and pinned public links remain historical; they are not evidence of current runtime acceptance. Start with the [current operator guide](../guide/installation.md) for installation and check your installed build before using newer capabilities.
 
 A normal chat turn is coordinated by `runAskChat`. Its contract requires a root, a message, and composed PostgreSQL application stores. Transport adapters supply trusted agent context separately from serialized request arguments.
 
@@ -141,7 +141,7 @@ Recovery is therefore reconciliation, not blind replay. It must inspect already-
 
 ## Targeted source review
 
-The immutable links below record earlier public evidence. Current contracts were reconciled against the [1 November implementation baseline](../project/source-map.md); static inspection is not a live deployment test.
+The immutable links below record earlier public evidence. Current contracts were reconciled against the [8 November implementation baseline](../project/source-map.md); static inspection is not a live deployment test.
 
 - [backend/src/app-runtime.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/app-runtime.mjs)
 - [backend/src/session-admission.mjs](https://github.com/GoblinKing-Burrow/Burrow/blob/aa5a30da683a3a8ea919025f107ff53f182ef8d6/backend/src/session-admission.mjs)
@@ -166,7 +166,7 @@ The changed preference, recall, embedding or shared-guidance contracts above wer
 
 Checked **6 November 2026**: immutable provider dispatch snapshots remain evidence of the original request. Later replay drops only runtime-provenance-tagged historical support messages and preserves original user/image content; current support is assembled once. It does not strip user text by headings or rewrite the evidence.
 
-Pool eligibility now constrains required owners as well as new turns. Proven portable text/tool continuations can select an eligible alternate before dispatch; signed or otherwise account-bound history stops if its required owner cannot serve. A failed account's `Retry-After` does not delay a healthy alternate. If every destination is blocked, a known short availability deadline can extend the usual recovery delay up to the 30-second cap. Longer or unknown unavailability stops the live request instead of repeatedly probing. These rules retain the original provider failure and existing physical attempt budgets.
+Pool hard eligibility failures constrain required owners as well as new turns. The five-hour headroom floor alone permits an otherwise usable required owner to finish a nonportable continuation; an existing portable continuation may retain its owner only as a last resort. Proven portable text/tool continuations can select an eligible alternate before dispatch. Anthropic replay proves the original transcript before omitting opaque thinking from only its outbound copy; account-bound images/files and missing proof remain blockers. A failed account's `Retry-After` does not delay a healthy alternate. If every destination is blocked, a known short availability deadline can extend the usual recovery delay up to the 30-second cap. Longer or unknown unavailability stops the live request instead of repeatedly probing. These rules retain the original provider failure and existing physical attempt budgets.
 
 ## Active-run continuation compaction
 
@@ -175,3 +175,4 @@ Checked **7 November 2026**: under configured context pressure, native Chat Comp
 Tool calls/results follow a separate protocol-safe budget projection, preserving paired rounds and receipt-backed recovery references. They are not semantically summarized by the recap model. Summarization can make additional tool-free model calls, including multiple chunks, adding usage and latency. Recaps are not verified execution evidence. Without a usable summary adapter/chunk budget, dialogue is retained and ordinary protocol projection is attempted. Adapter errors and cancellation propagate; invalid summary responses fail with `continuation_summary_invalid`, and irreducible requests fail with `context_preparation_prompt_over_budget` rather than silently dropping authoritative state.
 
 Provider budget inspection also distinguishes shared input/output windows from separate input limits. A discovered public OpenAI total window reserves the request's output allowance; Anthropic and Google native input limits are not reduced by output twice. Image payload bytes are not treated as prose tokens. Unknown capacity stays unknown, while a known zero remaining input allowance fails closed. Loaded-skill and delegation receipts remain atomic through protocol projection rather than being clipped into misleading instruction or ownership fragments.
+

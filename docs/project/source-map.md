@@ -1,15 +1,15 @@
 # Source and coverage
 
-The operator guide follows inspected current development implementation, without waiting for the daily public-source mirror. The Sunday reconciliation on **1 November 2026** compared every Burrow and Skills page with source for its setup, configuration, API, operations, troubleshooting, and historical scope. This is static documentation reconciliation, not a runtime acceptance test.
+The operator guide follows inspected current development implementation, without waiting for the daily public-source mirror. The Sunday reconciliation on **8 November 2026** compared every Burrow and Skills page with source for its setup, configuration, API, operations, troubleshooting, and historical scope. This is static documentation reconciliation, not a runtime acceptance test.
 
 ## Current implementation baseline
 
 | Component | Inspected revision |
 |---|---|
-| Assembled Burrow, build `2026.11.07.5` | `c057b5e4369c9c2758c8a8ead784d59ff2e1a5db` |
-| Core / Backend | `f0b17efdadc57c856eb3c5cf5272a3fff2268ad1` |
-| UI | `9e53442cdb1c8bbb882195d9f3de10419938a6b2` |
-| Skills | `11ad645e8f893affcb7f500a8db23835b6563ca9` |
+| Assembled Burrow, build `2026.11.08.19` | `20523845840bb4763e0fe137d603a7f54d8c5a9d` |
+| Core / Backend | `a799735c9b0d7fbdeb49dcebfc7acb798356d476` |
+| UI | `a7c081019a91f91c038ec2ed65b9b1ab3a50f666` |
+| Skills | `b9fe974a5c831b23565c567385a4cad3d1b545c1` |
 
 The assembly's `SOURCE_VERSIONS` matches those Backend/UI pins. Private source links are intentionally not published. Older public commit links below remain historical evidence and are not silently repointed to claim current compatibility. Check your installed health/build identity before using a newer capability.
 
@@ -121,3 +121,19 @@ No runtime tests, live provider calls, migrations or installed-package checks we
 Inspected assembly **2026.11.07.5**, commit `c057b5e4369c9c2758c8a8ead784d59ff2e1a5db`, records Core `f0b17efdadc57c856eb3c5cf5272a3fff2268ad1` and UI `9e53442cdb1c8bbb882195d9f3de10419938a6b2`. This pass reconciles enforced A2A default-session preferences, interrupted child admission, active continuation recaps, opt-in expiring OAuth resets and durable outcomes, mod completion/activity metadata, scheduler recovery, UI ownership/refresh warnings and application migrations 97–99. Managed-skill failure no longer undoes a completed mod disable/uninstall.
 
 Unchanged sections inherit the **1 November** full review. Source and test definitions were inspected statically; no application tests, provider calls, database migrations, runtime changes or release promotions were performed. Public mirrors and installed versions may lag these source pins. Menagerie now has a separately maintained public-release guide; older dated placeholder statements describe their original review date only.
+
+## Sunday full reconciliation: 8 November 2026
+
+The full Core guide set was compared with assembly **2026.11.08.4** (`1f77c9d0277585bfe1963ce3ab3d2cdf35f16b9a`), Core `6b682eae6cd0dc6efa79e173b7d819fb219443b3` and UI `d337e5a61667335cfaaff5b23b36c052ac6e71bb`. Review covered setup, configuration, routing, API contracts, operations, troubleshooting and cross-guide consistency. Corrections include Parked tasks and dispatch eligibility, enforced default A2A routing, reusable Forge image references, depth-aware Minion cleanup, current schema/API inventory and recovery/export boundaries.
+
+This is static implementation reconciliation and documentation validation, not executed application/provider testing, a live installation or restore, a release promotion, or proof that an installed/public build already has the behavior. Earlier dated review sections and public-source links remain historical. Approved illustrations, layout and card order are preserved.
+
+### Publication-time source check
+
+Before publication, the additional changes in assembly **2026.11.08.7** (`79c4346acf461ddbb16fe94d85d1a387df3ddc80`), Core `f7ab762d49b9e65ea3e071ba762dfcea16e0e01a` and UI `e51eaf1e1ebb65c9eee60690643746619a4a549b` were inspected. They tighten malformed native-tool argument rejection, provider streaming completion/cancellation and stale Chat paging after reset. The full review above remains the base; this final static delta preserves concurrent runtime changes and adds no application/provider test claim.
+
+## 9 November ordinary delta review
+
+Compared the successful 8 November source baseline through assembly **2026.11.08.19** (`20523845840bb4763e0fe137d603a7f54d8c5a9d`), Core `a799735c9b0d7fbdeb49dcebfc7acb798356d476` and UI `a7c081019a91f91c038ec2ed65b9b1ab3a50f666`. This pass reconciles operator-wide workspace preference persistence/retry, confirmed group-room deletion and retained participant history, mod-owned initial-session repair, Anthropic schema/image conversion and provider-pool continuation headroom/replay, plus code-block copying behavior.
+
+Unchanged pages retain the **8 November** full-review evidence. Source and test definitions were inspected statically; no application tests, live model/chat calls, migrations, runtime changes or release promotion were performed. Installed/public builds may lag development implementation. Historical screenshots and private-source-link exclusions are preserved.

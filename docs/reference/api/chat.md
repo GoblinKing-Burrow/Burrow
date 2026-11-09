@@ -2,7 +2,7 @@
 
 
 !!! note "Source-reviewed API reference"
-    This reference was reconciled against current development source on **2026-11-01**. Historical public-source links below remain pinned to their stated revision; they are not proof that a public mirror or your installation has caught up. Start with the [current operator guide](../../guide/installation.md) for installation. This is static source review, not a live API compatibility test.
+    This reference was reconciled against current development source on **2026-11-08**. Historical public-source links below remain pinned to their stated revision; they are not proof that a public mirror or your installation has caught up. Start with the [current operator guide](../../guide/installation.md) for installation. This is static source review, not a live API compatibility test.
 
 
 `POST /api/chat` submits one user-visible turn. Select an existing agent; its configured model and tools determine what the turn can do. A request can incur provider charges and execute granted tools.
@@ -135,7 +135,7 @@ Methods are significant. Braced segments are placeholders; URL-encode identifier
 
 ## Source review
 
-Reconciled on **2026-11-01** against Backend commit `8b5889115680bcdbf698f1b93126254e1cf4d2e6`; static source inspection only, with no live API or provider calls.
+Reconciled on **2026-11-08** against Backend commit `6b682eae6cd0dc6efa79e173b7d819fb219443b3`; static source inspection only, with no live API or provider calls.
 
 ## 27 October delta review
 
@@ -162,3 +162,9 @@ Only the backend compatibility projection interprets old `[model_error: …]` te
 Checked **6 November 2026**: optional `modelFailure.message` preserves an observed upstream explanation, credential-redacted before a 2,048-character limit. Classification and retry eligibility do not depend on this prose. Known credentials and recognizable secret patterns are removed, but arbitrary unlabeled secrets cannot be exhaustively inferred; review before sharing. Missing explanations use generic UI fallback. Terminal streaming, persisted/reloaded assistant metadata, child results and side-question `ChatInput.result` preserve the field. Side-question results also carry `chatResultVersion:2` and `terminalStatus`.
 
 `GET /api/chat/runs/active?agentId=...&sessionId=...` can include `pendingForgeDeliveries` for that exact destination. The Chat client refreshes while delivery is pending and once when it settles, including after a cancelled model run. A pending job is not an active model run, and this does not refresh unrelated idle conversations. See [native Forge delivery](artifacts.md#native-chat-completion-and-delivery).
+
+## Delete a group channel
+
+Checked **9 November 2026**: `DELETE /api/group-channels/{channelId}` returns `200 {"ok":true,"id":"<channelId>"}` on success, `404 group_channel_not_found` for an absent room, or `400 group_channel_id_invalid` for an invalid ID (including `.` and `..`). It cancels active room replies, removes metadata and deletes only the shared `group-channel` transcript identity. Individual/participant sessions remain.
+
+Admission, shared transcript appends and deletion share a per-room serialized boundary in the UI server. A send admitted after deletion cannot launch replies or recreate its history. Database failure leaves metadata in place for retry, although active replies have already been cancelled. Scheduled jobs are not removed; subsequent integration-routed deliveries to the missing room fail. The native scheduler has no group-channel destination field. This is a destructive room action, not closing a browser tab or resetting one participant's session.
