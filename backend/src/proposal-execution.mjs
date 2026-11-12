@@ -89,7 +89,11 @@ export async function executeReviewedProposalActions({ conversationStore = null,
     // Recheck at the concrete executor boundary. Supplied allowed reviews are
     // useful receipts, but they are not trusted authority; a stale/forged
     // allowed review must not bypass operator hard blocks or parser errors.
-    const executionReview = reviewProposalActions({ actions: [action], workspaceRoot: executionRoot, executionContext }).reviews[0] || suppliedReview;
+    const executionReview = (await reviewProposalActions({ actions: [action], workspaceRoot: executionRoot, executionContext, signal: abortSignal })).reviews[0];
+    if (abortSignal?.aborted) {
+      skipped.push({ index: action.index, tool: action.tool, toolCallId: action.toolCallId || null, status: 'cancelled' });
+      continue;
+    }
     if (executionReview?.status !== 'allowed') {
       skipped.push({ index: action.index, tool: action.tool, status: executionReview?.status || 'blocked', ...((executionReview?.blockers || []).length ? { blockers: executionReview.blockers } : {}) });
       continue;
@@ -114,8 +118,8 @@ export async function executeReviewedProposalActions({ conversationStore = null,
         skipped.push({ index: action.index, tool: action.tool, status: 'blocked', blockers: ['mod_agent_unavailable'] });
         continue;
       }
-      const currentReview = reviewProposalActions({ actions: [action], workspaceRoot: executionRoot,
-        executionContext: { ...executionContext, agentId: current.agentId, agentRuntime: current } }).reviews[0];
+      const currentReview = (await reviewProposalActions({ actions: [action], workspaceRoot: executionRoot,
+        executionContext: { ...executionContext, agentId: current.agentId, agentRuntime: current }, signal: abortSignal })).reviews[0];
       if (currentReview?.status !== 'allowed') {
         skipped.push({ index: action.index, tool: action.tool, status: 'blocked', blockers: currentReview?.blockers || ['mod_agent_tool_not_allowed'] });
         continue;
@@ -250,10 +254,10 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       let result;
       try {
         const args = action.tool === 'forge_create_job'
-          ? { mode: action.forgeMode, connectionId: action.forgeConnectionId || action.connectionId, modelId: action.forgeModelId || action.modelId, prompt: action.forgePrompt || action.prompt, idempotencyKey: action.forgeIdempotencyKey || action.idempotencyKey, useAgentReferenceImage: action.useAgentReferenceImage, useOperatorReferenceImage: action.useOperatorReferenceImage, referenceAgentIds: action.referenceAgentIds }
+          ? { mode: action.forgeMode, connectionId: action.forgeConnectionId || action.connectionId, modelId: action.forgeModelId || action.modelId, prompt: action.forgePrompt || action.prompt, idempotencyKey: action.forgeIdempotencyKey || action.idempotencyKey, useAgentReferenceImage: action.useAgentReferenceImage, useOperatorReferenceImage: action.useOperatorReferenceImage, referenceAgentIds: action.referenceAgentIds, referenceArtifacts: action.referenceArtifacts, imageOptions: action.imageOptions }
           : action.tool === 'forge_inspect_job' ? { jobId: action.jobId }
           : action.tool === 'forge_attach_artifact' ? { jobId: action.jobId, artifactId: action.artifactId } : {};
-        result = await executeForgeTool(action.tool, args, { agentId, sessionId: sessionId || executionContext?.sessionId, conversationId: resolvedConversationId, signal: abortSignal });
+        result = await executeForgeTool(action.tool, args, { agentId, sessionId: sessionId || executionContext?.sessionId, conversationId: resolvedConversationId, runId: executionContext?.parentRunId || traceLogger?.runId || null, signal: abortSignal });
       } catch (error) { result = forgeFailure(error); }
       toolResults.push({ tool: action.tool, ...result });
       continue;

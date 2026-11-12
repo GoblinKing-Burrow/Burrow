@@ -1,3 +1,4 @@
+import { compactSubagentEvidence, evidenceDeliveryCounts } from './subagent-evidence.mjs';
 import path from 'node:path';
 
 // Runtime ownership rule:
@@ -85,6 +86,10 @@ function deliveryFromToolResult(toolResult = {}) {
     truncated: sourceDelivery.truncated ?? (deliveredBytes < rawReturnedBytes || Boolean(toolResult.truncated)),
     nextOffsetBytes: sourceDelivery.nextOffsetBytes ?? (offsetBytes + deliveredBytes),
   };
+}
+
+function compactChildEvidence(toolResult) {
+  return toolResult.evidence.slice(0, RECEIPT_TEXT_LIMITS.evidence).map(item => item.omitted ? { ...item } : compactSubagentEvidence(item, { listLimit: RECEIPT_TEXT_LIMITS.list, textLimit: RECEIPT_TEXT_LIMITS.content, stdoutLimit: RECEIPT_TEXT_LIMITS.stdout }));
 }
 
 export function summarizeToolResults(toolResults = []) {
@@ -208,6 +213,7 @@ export function summarizeToolResults(toolResults = []) {
     provider: typeof toolResult.provider === 'string' ? compactText(toolResult.provider, 120) : undefined,
     connectionId: toolResult.tool === 'mcp_call' ? undefined : (typeof toolResult.connectionId === 'string' ? compactText(toolResult.connectionId, 120) : undefined),
     mcpToolName: typeof toolResult.mcpToolName === 'string' ? compactText(toolResult.mcpToolName, 240) : undefined,
+    modToolName: toolResult.tool === 'mod_agent_tool' && typeof toolResult.modToolName === 'string' ? compactText(toolResult.modToolName, 240) : undefined,
     nextCursor: typeof toolResult.nextCursor === 'string' ? compactText(toolResult.nextCursor, 120) : undefined,
     totalCount: Number.isFinite(Number(toolResult.totalCount)) ? Number(toolResult.totalCount) : undefined,
     providers: Array.isArray(toolResult.providers)
@@ -275,6 +281,10 @@ export function summarizeToolResults(toolResults = []) {
     stdoutTruncated: toolResult.stdoutTruncated === true || undefined,
     stderrTruncated: toolResult.stderrTruncated === true || undefined,
     verificationCheck: toolResult.verificationCheck === true || undefined,
+    verificationExecution: toolResult.verificationExecution,
+    evidenceTraceDir: toolResult.evidenceTraceDir,
+    omittedToolResults: toolResult.omittedToolResults,
+    evidenceDelivery: Array.isArray(toolResult.evidence) ? evidenceDeliveryCounts(compactChildEvidence(toolResult), toolResult.evidenceDelivery?.originalCount ?? toolResult.evidence.length) : toolResult.evidenceDelivery,
     // Artifact paths are references to tool-owned raw output, not copies.
     artifacts: Array.isArray(toolResult.artifacts)
       ? toolResult.artifacts.slice(0, RECEIPT_TEXT_LIMITS.evidence).map((artifact) => ({ type: artifact?.type || null, path: typeof artifact?.path === 'string' ? compactText(artifact.path, RECEIPT_TEXT_LIMITS.command) : null }))
@@ -307,7 +317,7 @@ export function summarizeToolResults(toolResults = []) {
     // Child evidence is itself converted to receipts. Never retain an opaque
     // provider/child envelope or recursively copy its original evidence graph.
     evidence: Array.isArray(toolResult.evidence)
-      ? summarizeToolResults(toolResult.evidence.slice(0, RECEIPT_TEXT_LIMITS.evidence))
+      ? compactChildEvidence(toolResult)
       : undefined,
   }));
 }

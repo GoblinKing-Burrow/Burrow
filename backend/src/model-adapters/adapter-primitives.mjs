@@ -317,12 +317,12 @@ function nativeToolReceipt(result = {}) {
     brain_update: ['agentId', 'result'],
     brain_remove: ['agentId', 'result'],
     agents_list: ['agents', 'resultCount', 'query', 'includeDisabled', 'totalCount', 'nextCursor'],
-    scheduled_jobs_list: ['jobs'],
+    scheduled_jobs_list: ['jobs', 'resultCount', 'totalCount', 'hasMore', 'nextCursor'],
     scheduled_jobs_read: ['job'],
     scheduled_jobs_create: ['job'],
     scheduled_jobs_update: ['job'],
     scheduled_jobs_delete: ['job'],
-    scheduled_job_runs: ['job', 'runs'],
+    scheduled_job_runs: ['job', 'runs', 'resultCount', 'totalCount', 'hasMore', 'nextCursor'],
     scheduled_jobs_run_now: ['job', 'run'],
     memory_working_search: ['project', 'agentId', 'results'],
     memory_rolling_search: ['project', 'agentId', 'owner', 'entersPrompt', 'results'],
@@ -431,7 +431,9 @@ function messageContentChars(content) {
 
 async function readResponseBytesBounded(response, maxBytes = DEFAULT_MAX_RESPONSE_BYTES) {
   const limit = Number(maxBytes);
-  if (!Number.isSafeInteger(limit) || limit < 0) {
+  // Generated media explicitly opts out of a byte budget with Infinity.
+  // Omitted limits on other callers retain their existing response default.
+  if (limit !== Infinity && (!Number.isSafeInteger(limit) || limit < 0)) {
     await response?.body?.cancel?.();
     return { ok: false, data: Buffer.alloc(0), bytes: 0, error: 'invalid_model_response_budget' };
   }

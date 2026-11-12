@@ -1,4 +1,5 @@
 import { googleNativeApi, googleMediaKind } from './model-adapters/google-native-catalog.mjs';
+import { createGoogleVideoAdapter, googleVideoSupported } from './model-adapters/google-video.mjs';
 import { createGoogleMediaAdapter } from './model-adapters/google-media.mjs';
 import { normalizePostgresPool } from './postgres-foundation.mjs';
 import { PostgresAlbdruckStore } from './postgres-albdruck-store.mjs';
@@ -7,7 +8,7 @@ import { buildSessionEntry } from './session-entry.mjs';
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { createHash, randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { constants as fsConstants, promises as fs } from "node:fs";
 import {
   createOpenAIGeneratedArtifactAdapter,
   generatedArtifactKind,
@@ -29,8 +30,9 @@ import {
   withPostgresTransaction,
 } from "./postgres-foundation.mjs";
 import { forgeCatalog } from "./forge-store.mjs";
+import { normalizeImageOptions, withImageOptions } from './model-adapters/image-generation-options.mjs';
 import { mediaBudgets } from './model-adapters/generated-media-budgets.mjs';
-import { referenceImageCapability, validatedSourceImages } from "./model-adapters/reference-image-capability.mjs";
+import { REFERENCE_IMAGE_MAX_BYTES, referenceImageCapability, validatedSourceImages } from "./model-adapters/reference-image-capability.mjs";
 
 const fail = (error, statusCode = 400) => {
   throw Object.assign(new Error(error), { statusCode });
@@ -50,6 +52,8 @@ const stable = (value) => {
   return JSON.stringify(value);
 };
 const sameRequest = (a, b, current) => {
+  // Options must match even for legacy/default/reference-image replay paths.
+  if (stable(a?.imageOptions ?? null) !== stable(current.imageOptions ?? null)) return false;
   if (stable(a) === stable(b)) return true;
   // New multi-reference identities bind ordered digests, actor and Mod owner.
   // Saved-default retries may keep their admitted model when the configured
@@ -150,6 +154,7 @@ export class PostgresForgeStore {
     referenceImages,
     adapterFactory = createOpenAIGeneratedArtifactAdapter,
     googleAdapterFactory = createGoogleLyriaAdapter,
+    videoAdapterFactory = createGoogleVideoAdapter,
     ownerId = randomUUID(),
   } = {}) {
     if (!pool?.query || !pool?.connect)
@@ -169,6 +174,7 @@ export class PostgresForgeStore {
     this.referenceImages = referenceImages;
     this.adapterFactory = adapterFactory;
     this.googleAdapterFactory = googleAdapterFactory;
+    this.videoAdapterFactory = videoAdapterFactory;
     this.ownerId = ownerId;
     this.pending = new Set();
     this.backgroundFailures = new Map();
@@ -269,6 +275,33 @@ export class PostgresForgeStore {
       }
     }
     return snapshots;
+  }
+  async artifactReferenceSnapshot({ jobId, artifactId }) {
+    const { job, artifact, resolved } = await this.artifact(jobId, artifactId);
+    if (job.modOwnerId || job.status !== 'succeeded' || job.kind !== 'image')
+      fail('forge_reference_artifact_invalid', 409);
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(artifact.mimeType) ||
+        !resolved.stat.isFile() || resolved.stat.size < 1 || resolved.stat.size > REFERENCE_IMAGE_MAX_BYTES)
+      fail('forge_reference_artifact_invalid', 409);
+    let handle;
+    try {
+      handle = await fs.open(resolved.filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size < 1 || stat.size > REFERENCE_IMAGE_MAX_BYTES ||
+          stat.dev !== resolved.stat.dev || stat.ino !== resolved.stat.ino) fail('forge_reference_artifact_invalid', 409);
+      const buffer = Buffer.alloc(stat.size + 1);
+      let bytesRead = 0;
+      while (bytesRead < buffer.length) {
+        const part = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+        if (!part.bytesRead) break;
+        bytesRead += part.bytesRead;
+      }
+      if (bytesRead !== stat.size) fail('forge_reference_artifact_invalid', 409);
+      const bytes = buffer.subarray(0, bytesRead);
+      const sourceImages = validatedSourceImages([{ bytes, mimeType: artifact.mimeType, name: artifact.name }]);
+      return { sourceImages, referenceImage: Object.freeze({ jobId, artifactId, name: artifact.name,
+        mimeType: artifact.mimeType, sizeBytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') }) };
+    } finally { await handle?.close(); }
   }
   async selections() {
     const r = await this.pool.query(
@@ -458,6 +491,8 @@ export class PostgresForgeStore {
       "useAgentReferenceImage",
       "useOperatorReferenceImage",
       "referenceAgentIds",
+      "referenceArtifacts",
+      "imageOptions",
     ];
     if (
       Object.keys(body).some((k) => !keys.includes(k)) ||
@@ -480,13 +515,19 @@ export class PostgresForgeStore {
     if (body.referenceAgentIds != null && (!Array.isArray(body.referenceAgentIds) ||
       body.referenceAgentIds.some(id => typeof id !== 'string' || !id.trim() || id !== id.trim()))) fail('forge_request_invalid');
     const referenceAgentIds = body.referenceAgentIds ?? [];
+    if (body.referenceArtifacts != null && (!Array.isArray(body.referenceArtifacts) ||
+      body.referenceArtifacts.some(ref => !ref || Array.isArray(ref) || typeof ref !== 'object' ||
+        Object.keys(ref).length !== 2 || ['jobId', 'artifactId'].some(k => typeof ref[k] !== 'string' || !ref[k].trim() || ref[k] !== ref[k].trim())))) fail('forge_request_invalid');
+    const artifactReferences = body.referenceArtifacts ?? [];
+    if (artifactReferences.length && body.mode && body.mode !== 'video') fail('forge_reference_artifacts_video_only');
+    if (privateReferences && artifactReferences.length) fail('forge_request_invalid');
     if (privateReferences != null && (!ownerModId || !Array.isArray(privateReferences) || !privateReferences.length ||
       privateReferences.some(ref => !ref || Array.isArray(ref) || typeof ref !== 'object' ||
         Object.keys(ref).some(key => !['key', 'id', 'name'].includes(key)) ||
         ['key', 'id', 'name'].some(key => typeof ref[key] !== 'string' || !ref[key].trim())))) fail('forge_request_invalid');
     if (privateReferences && (useOperatorReferenceImage || useAgentReferenceImage || referenceAgentIds.length || body.referenceAgentIds != null)) fail('forge_request_invalid');
-    const hasReferences = useOperatorReferenceImage || useAgentReferenceImage || referenceAgentIds.length > 0 || Boolean(privateReferences);
-    if (hasReferences && body.mode && body.mode !== 'image') fail('agent_reference_image_image_only');
+    const hasReferences = useOperatorReferenceImage || useAgentReferenceImage || referenceAgentIds.length > 0 || Boolean(privateReferences) || artifactReferences.length > 0;
+    if (hasReferences && body.mode && !['image', 'video'].includes(body.mode)) fail('agent_reference_image_image_only');
     const explicit =
       body.connectionId !== undefined || body.modelId !== undefined;
     if (
@@ -506,12 +547,6 @@ export class PostgresForgeStore {
       (x) =>
         x.connectionId === saved.connectionId && x.modelId === saved.modelId,
     );
-    if (
-      explicit &&
-      body.mode &&
-      (!model || !this.selectionMatches(body.mode, model, catalog))
-    )
-      fail("forge_model_unavailable", 409);
     if (ownerModId !== null && (typeof ownerModId !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(ownerModId))) fail('forge_request_invalid');
     let referenceConfig, referenceConfigurationUnavailable = false;
     if (hasReferences && model?.available && model.agentReferenceImage?.available) {
@@ -535,20 +570,26 @@ export class PostgresForgeStore {
     }
     // Preserve the self-only identity/prompt for existing callers. New explicit
     // lists (even one other agent), and Theater-owned refs use ordered snapshots.
-    const legacySelf = useAgentReferenceImage && !useOperatorReferenceImage && !referenceAgentIds.length && !privateReferences;
+    const legacySelf = useAgentReferenceImage && !useOperatorReferenceImage && !referenceAgentIds.length && !privateReferences && !artifactReferences.length;
     const snapshots = legacySelf ? [await this.referenceImageSnapshot(agentId)] : hasReferences
       ? await this.referenceSnapshots({ agentId, referenceAgentIds, useAgentReferenceImage, useOperatorReferenceImage, catalog, ownerModId, privateReferences, maxBytes: snapshotMaxBytes }) : [];
+    if (artifactReferences.length && snapshots.length + artifactReferences.length > 6) fail('google_video_reference_image_limit_exceeded');
+    for (const ref of artifactReferences) {
+      const snapshot = await this.artifactReferenceSnapshot(ref);
+      snapshots.push(snapshot);
+      if (snapshots.reduce((total, item) => total + item.sourceImages.reduce((n, image) => n + image.bytes.length, 0), 0) > snapshotMaxBytes) fail('reference_images_too_large', 413);
+    }
     const referenceImage = legacySelf ? snapshots[0].referenceImage : null;
     const multiReferences = hasReferences && !legacySelf ? snapshots.map(({ referenceImage: ref }) => privateReferences
       ? { key: ref.key, id: ref.id, name: ref.name, mimeType: ref.mimeType, sizeBytes: ref.sizeBytes, sha256: ref.sha256 }
       : ref) : null;
     const dispatch = snapshots.length ? { sourceImages: snapshots.flatMap(snapshot => snapshot.sourceImages) } : null;
-    if (dispatch && multiReferences) {
+    if (dispatch && multiReferences && multiReferences.some(ref => !ref.jobId)) {
       // Keep the selected identities aligned with the adapter's image order.
       // Only the provider prompt gets this mapping; the job's caller prompt
       // stays unchanged and no single-self exact prompt changes.
-      dispatch.prompt = `${body.prompt}\n\nUse the supplied reference images as canonical character identities: preserve each character's face, species, build and distinctive features. Do not blend identities; depict only the characters called for by the scene.\nReference images (in the order supplied):\n${multiReferences.map((ref, index) =>
-        `${index + 1}. Image ${index + 1} depicts ${JSON.stringify(ref.name)}${ref.agentId ? ` (agent ${JSON.stringify(ref.agentId)})` : ref.operatorId ? ' (operator)' : ''}.`).join('\n')}`;
+      dispatch.prompt = `${body.prompt}\n\nUse the supplied portrait reference images as canonical character identities: preserve each character's face, species, build and distinctive features. Do not blend identities; depict only the characters called for by the scene.\nReference images (in the order supplied):\n${multiReferences.map((ref, index) =>
+        ref.jobId ? `${index + 1}. Image ${index + 1} is the Forge source image ${JSON.stringify(ref.name)}; follow the scene instructions for this image.` : `${index + 1}. Image ${index + 1} depicts ${JSON.stringify(ref.name)}${ref.agentId ? ` (agent ${JSON.stringify(ref.agentId)})` : ref.operatorId ? ' (operator)' : ''}.`).join('\n')}`;
     }
     // Config resolution may borrow this same pool. Resolve before holding the
     // claim transaction (including max-one pools), but defer admission errors
@@ -557,7 +598,9 @@ export class PostgresForgeStore {
       dispatch.config = referenceConfig;
       dispatch.configurationUnavailable = referenceConfigurationUnavailable;
     }
+    const imageOptions = normalizeImageOptions(body.imageOptions, { mode: body.mode ?? 'image', validateSupport: false });
     const request = {
+      ...(imageOptions ? { imageOptions } : {}),
       mode: body.mode ?? null,
       connectionId: saved.connectionId,
       modelId: saved.modelId,
@@ -590,7 +633,7 @@ export class PostgresForgeStore {
         if (matching) {
           const job = parse(matching.record);
           if (chatDelivery) {
-            if (job.chatDelivery && (job.chatDelivery.agentId !== chatDelivery.agentId || job.chatDelivery.sessionId !== chatDelivery.sessionId || job.chatDelivery.resetGeneration !== chatDelivery.resetGeneration)) fail('idempotency_conflict', 409);
+            if (job.chatDelivery && (job.chatDelivery.agentId !== chatDelivery.agentId || job.chatDelivery.sessionId !== chatDelivery.sessionId || job.chatDelivery.resetGeneration !== chatDelivery.resetGeneration || (job.chatDelivery.runId || null) !== (chatDelivery.runId || null))) fail('idempotency_conflict', 409);
             if (!job.chatDelivery) {
               if (['queued', 'running'].includes(job.status)) fail('idempotency_conflict', 409);
               job.chatDelivery = { ...chatDelivery, status: 'pending' };
@@ -599,13 +642,20 @@ export class PostgresForgeStore {
           }
           return { job: publicJob(job), replayed: true };
         }
-        if (!model?.available) fail("forge_model_unavailable", 409);
+        if (!model?.available || (explicit && body.mode && !this.selectionMatches(body.mode, model, catalog))) fail("forge_model_unavailable", 409);
+        if (imageOptions) {
+          if (model.kind !== 'image' || !model.imageOptions?.outputFormats.includes(imageOptions.outputFormat)) fail('generation_options_unsupported');
+          // Shape/bounds were normalized before claiming; support comes from
+          // the same configured-output catalog exposed to UI and agents.
+        }
+        if (artifactReferences.length && (model.kind !== 'video' || !model.referenceArtifacts?.available)) fail('forge_reference_artifacts_unsupported', 409);
         if (dispatch) {
           if (dispatch.sourceImages.reduce((total, image) => total + image.bytes.length, 0) > maxReferenceBytes) fail('reference_images_too_large', 413);
-          if (model.kind !== 'image') fail('agent_reference_image_image_only');
+          if (!['image', 'video'].includes(model.kind)) fail('agent_reference_image_image_only');
           if (!model.agentReferenceImage?.available) fail('agent_reference_image_unsupported', 409);
           if (dispatch.configurationUnavailable) fail('forge_model_unavailable', 409);
           if (!referenceImageCapability(dispatch.config).available) fail('agent_reference_image_unsupported', 409);
+          if (model.kind === 'video' && dispatch.sourceImages.length > 6) fail('google_video_reference_image_limit_exceeded');
         }
         const job = {
           id: randomUUID(),
@@ -650,7 +700,7 @@ export class PostgresForgeStore {
       );
       if (!matching) fail("idempotency_conflict", 409);
       const job = parse(matching.record);
-      if (chatDelivery && (!job.chatDelivery || job.chatDelivery.agentId !== chatDelivery.agentId || job.chatDelivery.sessionId !== chatDelivery.sessionId || job.chatDelivery.resetGeneration !== chatDelivery.resetGeneration)) fail('idempotency_conflict', 409);
+      if (chatDelivery && (!job.chatDelivery || job.chatDelivery.agentId !== chatDelivery.agentId || job.chatDelivery.sessionId !== chatDelivery.sessionId || job.chatDelivery.resetGeneration !== chatDelivery.resetGeneration || (job.chatDelivery.runId || null) !== (chatDelivery.runId || null))) fail('idempotency_conflict', 409);
       result = { job: publicJob(job), replayed: true };
     }
     if (!result.replayed) {
@@ -675,13 +725,13 @@ export class PostgresForgeStore {
   }
   // Native chat calls wait here, not in a model tool loop. The destination is
   // committed with the paid claim, so cancelling the caller cannot lose it.
-  async createAndDeliver(body, { agentId, sessionId, signal } = {}) {
+  async createAndDeliver(body, { agentId, sessionId, runId = null, signal } = {}) {
     if (typeof agentId !== 'string' || !agentId || typeof sessionId !== 'string' || !sessionId) fail('forge_context_unavailable', 409);
     signal?.throwIfAborted();
     await this.attachmentDestination({ agentId, sessionId });
     const metadata = await new PostgresSessionStore({ pool: this.pool }).getMetadata({ agentId, sessionId });
     const resetGeneration = Number(metadata?.resetGeneration || 0);
-    const created = await this.create(body, { agentId, chatDelivery: { agentId, sessionId, resetGeneration } });
+    const created = await this.create(body, { agentId, chatDelivery: { agentId, sessionId, runId, resetGeneration } });
     const job = await this.waitForCompletion(created.job.id, { signal });
     if (job.status !== 'succeeded') return { ...created, ok: false, error: job.error || 'generation_interrupted', job: this.public(job) };
     const attachments = await this.deliverChat(job.id);
@@ -700,18 +750,18 @@ export class PostgresForgeStore {
   async deliverChat(id) {
     const job = await this.get(id);
     if (!job.chatDelivery || job.status !== 'succeeded') fail('forge_job_not_succeeded', 409);
-    const { agentId, sessionId, resetGeneration } = job.chatDelivery;
+    const { agentId, sessionId, runId = null, resetGeneration } = job.chatDelivery;
     try {
       const attachments = [];
-      for (const artifact of job.artifacts) attachments.push(await this.attach(id, { agentId, sessionId, artifactId: artifact.id }, { role: 'assistant', expectedResetGeneration: resetGeneration }));
+      for (const artifact of job.artifacts) attachments.push(await this.attach(id, { agentId, sessionId, artifactId: artifact.id }, { role: 'assistant', runId, expectedResetGeneration: resetGeneration }));
       if (!attachments.length) fail('forge_artifact_not_found', 404);
-      await this.pool.query("UPDATE forge_jobs SET record=jsonb_set(record,'{chatDelivery}',$2::jsonb) WHERE id=$1", [id, JSON.stringify({ agentId, sessionId, resetGeneration, status: 'delivered', completedAt: at() })]);
+      await this.pool.query("UPDATE forge_jobs SET record=jsonb_set(record,'{chatDelivery}',$2::jsonb) WHERE id=$1", [id, JSON.stringify({ agentId, sessionId, runId, resetGeneration, status: 'delivered', completedAt: at() })]);
       return attachments;
     } catch {
       // A delivery failure is NOT a generation failure. Keep generated bytes
       // and the original destination for idempotent recovery, without retrying
       // the paid provider operation or exposing private driver diagnostics.
-      await this.pool.query("UPDATE forge_jobs SET record=jsonb_set(record,'{chatDelivery}',$2::jsonb) WHERE id=$1 AND record->'chatDelivery'->>'status' IS DISTINCT FROM 'delivered'", [id, JSON.stringify({ agentId, sessionId, resetGeneration, status: 'failed', error: 'forge_delivery_failed' })]);
+      await this.pool.query("UPDATE forge_jobs SET record=jsonb_set(record,'{chatDelivery}',$2::jsonb) WHERE id=$1 AND record->'chatDelivery'->>'status' IS DISTINCT FROM 'delivered'", [id, JSON.stringify({ agentId, sessionId, runId, resetGeneration, status: 'failed', error: 'forge_delivery_failed' })]);
       fail('forge_delivery_failed', 409);
     }
   }
@@ -729,7 +779,7 @@ export class PostgresForgeStore {
     return { delivered, failed };
   }
   async attachmentDestination(body) {
-    if (typeof body.agentId !== 'string' || !body.agentId || typeof body.sessionId !== 'string' || !/^[A-Za-z0-9._-]{1,120}$/.test(body.sessionId) || ['.', '..'].includes(body.sessionId) || body.sessionId.startsWith('-') || body.sessionId.endsWith('-')) fail('forge_request_invalid');
+    if (typeof body.agentId !== 'string' || !body.agentId || typeof body.sessionId !== 'string' || !body.sessionId.trim()) fail('forge_request_invalid');
     const destination = await this.resolveAgent(body.agentId);
     if (!destination?.agentWorkspaceRoot || destination.agentId !== body.agentId) fail('session_not_found', 404);
     if (!(await new PostgresSessionStore({ pool: this.pool }).getMetadata(body))) fail('session_not_found', 404);
@@ -755,16 +805,20 @@ export class PostgresForgeStore {
       config = dispatch?.config ?? await this.resolveConfig(job.connectionId, job.modelId);
       if ((job.useAgentReferenceImage || job.referenceImages?.length) && (!dispatch?.sourceImages?.length || !referenceImageCapability(config).available))
         throw new Error('agent_reference_image_snapshot_unavailable');
+      const video = job.kind === 'video' && googleVideoSupported(config);
       const nativeGoogle = googleNativeApi(config) && googleMediaKind(config) === job.kind;
       const google = job.kind === "audio" && googleLyriaSupported(config) && googleMediaKind(config) === "audio";
       if (
         !config ||
-        (!google && !nativeGoogle &&
+        (!video && !google && !nativeGoogle &&
           (generatedArtifactKind(config) !== job.kind ||
             !/^openai-/.test(config.api)))
       )
         throw new Error("unavailable");
-      const adapter = nativeGoogle
+      config = withImageOptions(config, job.imageOptions);
+      const adapter = video
+        ? this.videoAdapterFactory({ config })
+        : nativeGoogle
         ? createGoogleMediaAdapter({ config })
         : google
         ? this.googleAdapterFactory({ config })
@@ -859,7 +913,7 @@ export class PostgresForgeStore {
     if (!resolved) fail("forge_artifact_not_found", 404);
     return { owner, job, artifact, resolved };
   }
-  async attach(id, body, { role = 'user', expectedResetGeneration } = {}) {
+  async attach(id, body, { role = 'user', runId = null, expectedResetGeneration } = {}) {
     if (!['user', 'assistant'].includes(role)) fail('forge_request_invalid');
     if (
       !body ||
@@ -868,11 +922,7 @@ export class PostgresForgeStore {
       ) ||
       ["agentId", "sessionId", "artifactId"].some(
         (k) => typeof body[k] !== "string" || !body[k],
-      ) ||
-      !/^[A-Za-z0-9._-]{1,120}$/.test(body.sessionId) ||
-      [".", ".."].includes(body.sessionId) ||
-      body.sessionId.startsWith("-") ||
-      body.sessionId.endsWith("-")
+      )
     )
       fail("forge_request_invalid");
     const destination = await this.attachmentDestination(body);
@@ -882,9 +932,19 @@ export class PostgresForgeStore {
     );
     if (job.status !== "succeeded") fail("forge_job_not_succeeded", 409);
     const conversations = new PostgresSessionStore({ pool: this.pool });
-    // Serialize delivery by job/destination. Retries reuse both the existing turn
-    // and its attachment file, not merely the underlying generated artifact.
-    const key = role === 'assistant' ? `forge:assistant:${job.id}:${artifact.id}` : `forge:${job.id}:${artifact.id}`;
+    // Assistant delivery belongs to the current turn, not the whole conversation.
+    // Manual/no-run attachment keeps its existing conversation-scoped identity.
+    const legacyKey = role === 'assistant' ? `forge:assistant:${job.id}:${artifact.id}` : `forge:${job.id}:${artifact.id}`;
+    const turnScoped = role === 'assistant' && typeof runId === 'string' && runId.length > 0;
+    const key = turnScoped ? `${legacyKey}:run:${runId}` : legacyKey;
+    const replay = async client => {
+      const prior = await findSessionReplay(client, body.agentId, body.sessionId, null, key);
+      if (prior || !turnScoped) return prior;
+      // Upgrades must not redeliver an already-linked legacy attachment in the
+      // same run, but an earlier run must never swallow an explicit resend.
+      const legacy = await findSessionReplay(client, body.agentId, body.sessionId, null, legacyKey);
+      return legacy?.entry.runId === runId ? legacy : null;
+    };
     let copiedPath;
     let entry;
     try {
@@ -894,23 +954,22 @@ export class PostgresForgeStore {
         if (!live.rowCount) fail('forge_job_not_found', 404);
         const session = await client.query('SELECT metadata FROM conversation_sessions WHERE agent_id=$1 AND session_id=$2 FOR UPDATE',[body.agentId,body.sessionId]);
         if (!session.rowCount || (expectedResetGeneration !== undefined && Number(session.rows[0].metadata?.resetGeneration || 0) !== expectedResetGeneration)) fail('session_not_found', 404);
-        const prior = await findSessionReplay(client, body.agentId, body.sessionId, null, key);
+        const prior = await replay(client);
         if (prior) return prior.entry;
         const bytes = await fs.readFile(resolved.filePath);
         const [stored] = await persistChatAttachments({ retentionDays: (await new PostgresAlbdruckStore({ pool: postgresTransactionContext(client), resolveOriginal: ref => conversations.resolveOriginal(ref), searchHistory: input => conversations.history(input) }).readRetention()).attachmentDays, agentWorkspaceRoot: destination.agentWorkspaceRoot, attachments: [{ name: artifact.name, type: artifact.mimeType, content: `data:${artifact.mimeType};base64,${bytes.toString('base64')}` }] });
         const { content, ...metadata } = stored;
         copiedPath = path.join(destination.agentWorkspaceRoot, metadata.artifactPath);
-        const value = buildSessionEntry({sessionId:body.sessionId,type:'message',role,content:'',metadata:{attachments:[metadata],idempotencyKey:key}});
-        await client.query('SELECT 1 FROM conversation_sessions WHERE agent_id=$1 AND session_id=$2 FOR UPDATE',[body.agentId,body.sessionId]);
-        await client.query('INSERT INTO conversation_entries(agent_id,session_id,entry_id,idempotency_key,entry,created_at) VALUES($1,$2,$3,$4,$5::json,$6)',[body.agentId,body.sessionId,value.id,key,JSON.stringify(value),value.ts]);
-        await client.query('UPDATE conversation_sessions SET updated_at=$3 WHERE agent_id=$1 AND session_id=$2',[body.agentId,body.sessionId,value.ts]);
-        return value;
+        const value = { ...buildSessionEntry({sessionId:body.sessionId,type:'message',role,runId,content:'',metadata:{attachments:[metadata],idempotencyKey:key}}), sessionId: body.sessionId };
+        // Use the normal append authority so exact-run live/archive indexes are
+        // updated atomically with delivery (including background recovery).
+        return conversations.appendLocked(client, { agentId: body.agentId, sid: body.sessionId, entry: value, idempotencyKey: key, now: value.ts });
       });
     } catch (error) {
-      let replay;
-      try { replay = await findSessionReplay(this.pool, body.agentId, body.sessionId, null, key); }
+      let committed;
+      try { committed = await replay(this.pool); }
       catch { throw error; } // Unknown commit state: don't delete potentially linked bytes.
-      if (replay) entry = replay.entry;
+      if (committed) entry = committed.entry;
       else {
         if (copiedPath) await fs.unlink(copiedPath).catch(() => {});
         throw error;
