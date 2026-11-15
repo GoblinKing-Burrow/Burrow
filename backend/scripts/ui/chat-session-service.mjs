@@ -1,3 +1,4 @@
+import { classifyModelFailure } from '../../src/model-failure.mjs';
 import { performance } from 'node:perf_hooks';
 import { chatResultMetadata } from '../../src/chat-result-metadata.mjs';
 import { createChatStreamDelta } from '../../src/chat-stream-delta.mjs';
@@ -469,14 +470,17 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
       if (streaming) { writeNdjson(res, { type: 'run.cancelled', runId, sessionId, ts: new Date().toISOString(), data: { response } }); return res.end(); }
       return sendJson(res, 499, response);
     }
+    const modelFailure = classifyModelFailure(error);
+    const failureMetadata = chatResultMetadata({ ok: false, decision: 'failed', modelFailure });
     const errorResponse = chatTurnErrorResponse(error);
     if (errorResponse) {
-      if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: { ...errorResponse.body, ...chatResultMetadata({ ok: false, decision: 'failed' }) } } }, { status: errorResponse.status }); return res.end(); }
-      return sendJson(res, errorResponse.status, { ...errorResponse.body, ...chatResultMetadata({ ok: false, decision: 'failed' }) });
+      const response = { ...errorResponse.body, ...failureMetadata };
+      if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response } }, { status: errorResponse.status }); return res.end(); }
+      return sendJson(res, errorResponse.status, response);
     }
     recordHttpFailure(res, { error, status: 500, event: 'run_failed', errorCode: 'chat_run_failed' });
-    if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: { ...chatResultMetadata({ ok: false, decision: 'failed' }), ok: false, error: String(error?.message || error), runId } } }); return res.end(); }
-    throw error;
+    if (streaming) { writeNdjson(res, { type: 'run.failed', runId, sessionId, ts: new Date().toISOString(), data: { response: { ...failureMetadata, ok: false, error: modelFailure.message || modelFailure.code, runId } } }); return res.end(); }
+    return sendJson(res, 500, { ...failureMetadata, ok: false, error: modelFailure.message || modelFailure.code, runId });
   } finally {
     if (activeChatRuns.get(activeChatRunKey(agentRuntime.agentId, runId)) === record) activeChatRuns.delete(activeChatRunKey(agentRuntime.agentId, runId));
   }

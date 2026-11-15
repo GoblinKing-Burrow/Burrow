@@ -209,6 +209,16 @@ export function chatAnswerText(value: unknown): string | undefined {
   return undefined;
 }
 
+const runtimeLabels: Record<string, string> = {
+  context_compression_failed: 'Conversation compaction failed.',
+  context_compression_unavailable: 'Conversation compaction is unavailable.',
+  context_preparation_prompt_over_budget:
+    'The prepared conversation still exceeds the model’s context budget.',
+  context_preparation_uncovered_history:
+    'Conversation preparation could not safely include all required history.',
+  CONTEXT_BOUNDARY_VIOLATION: 'Conversation context failed a runtime boundary check.',
+};
+
 const labels: Record<string, string> = {
   provider_rate_limited: 'The model provider is rate limiting requests.',
   provider_unavailable: 'The model provider is temporarily unavailable.',
@@ -241,9 +251,10 @@ export function chatTerminalDiagnostic(metadata: ChatTerminalMetadata): {
       failure.code === 'provider_unavailable' ||
       (failure.code === `provider_http_${failure.status}` &&
         (failure.status === 429 || failure.status === 503)));
-  const message =
-    upstream && failure.message?.trim()
-      ? failure.message
+  const message = failure?.message?.trim()
+    ? failure.message
+    : failure?.origin === 'burrow' && Object.hasOwn(runtimeLabels, failure.code)
+      ? `${runtimeLabels[failure.code]} (code: ${failure.code})`
       : upstream && failure.status && failure.code === `provider_http_${failure.status}`
         ? failure.status === 429
           ? 'The model provider is rate limiting requests (HTTP 429).'

@@ -2,11 +2,12 @@ import { useConfirm } from '../../app/ConfirmDialog';
 import { rovingKeys } from '../../app/keyboardWidgets';
 import { useOwnedApi } from '../../app/useOwnedApi';
 import { ImagePreview } from '../../app/ImagePreview';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 import type { Agent, SavedProvider } from '../../app/types';
 import './forge.css';
 import './forge-motion.css';
+import { ForgeGallery } from './ForgeGallery';
 import { useForgeMotion } from './useForgeMotion';
 import {
   defaultImageDraft,
@@ -96,7 +97,7 @@ async function copyReference(text: string): Promise<boolean> {
   textarea.value = text;
   textarea.setAttribute('readonly', '');
   textarea.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
-  document.body.append(textarea);
+  (previous?.closest('[role="dialog"]') ?? document.body).append(textarea);
   textarea.select();
   try {
     return document.execCommand('copy');
@@ -206,8 +207,10 @@ function artifactPath(url: string): string {
 export function ArtifactOutput({
   artifact,
   fetchMedia,
+  viewerFooter,
 }: {
   artifact: Artifact;
+  viewerFooter?: (close: () => void) => ReactNode;
   fetchMedia: ReturnType<typeof useOwnedApi>['fetch'];
 }) {
   const [src, setSrc] = useState('');
@@ -310,7 +313,7 @@ export function ArtifactOutput({
           Loading preview…
         </div>
       ) : artifact.kind === 'image' ? (
-        <ImagePreview src={src} alt={artifact.name} />
+        <ImagePreview src={src} alt={artifact.name} viewerFooter={viewerFooter} />
       ) : artifact.kind === 'video' ? (
         <video controls src={src} />
       ) : artifact.kind === 'audio' ? (
@@ -358,6 +361,7 @@ export function Forge({
   const api = owned.api;
   const [mode, setMode] = useState<'image' | 'video' | 'audio' | 'music'>('image');
   const [showRecents, setShowRecents] = useState(false);
+  const [showGallery, setShowGallery] = useState(false);
   const [models, setModels] = useState<ForgeModel[]>([]);
   const [catalog, setCatalog] = useState<ForgeCatalog | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -503,7 +507,8 @@ export function Forge({
     setArtifactReferenceState(null);
   }, [videoReferenceScope]);
   const useArtifactReference = (job: Job, artifact: Artifact) => {
-    if (!artifactReferencesAvailable || !eligibleVideoReference(job, artifact) || busy) return;
+    if (!artifactReferencesAvailable || !eligibleVideoReference(job, artifact) || busy)
+      return false;
     const exists = artifactReferences.some(
       (ref) => ref.jobId === job.id && ref.artifactId === artifact.id,
     );
@@ -514,7 +519,7 @@ export function Forge({
       setError(
         `Video supports up to ${videoReferenceLimit} reference images. Remove a reference to continue.`,
       );
-      return;
+      return false;
     }
     setArtifactReferenceState({
       scope: videoReferenceScope,
@@ -523,10 +528,12 @@ export function Forge({
         : [...artifactReferences, { jobId: job.id, artifactId: artifact.id }],
     });
     setMode('video');
+    setShowGallery(false);
     setShowRecents(false);
     setSelectedJobId('');
     setError('');
     setNotice('');
+    return true;
   };
   const imageCapability = mode === 'image' ? activeModel?.imageOptions : undefined;
   const imageScope = JSON.stringify([mode, selectedModel, imageCapability]);
@@ -590,8 +597,21 @@ export function Forge({
       window.clearInterval(timer);
     };
   }, [jobs]);
-  const scopedJobs = showRecents ? jobs : jobs.filter((job) => jobMode(job) === mode);
-  const recentJobs = showRecents ? scopedJobs : scopedJobs.slice(0, 5);
+  const [recentNow, setRecentNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!showRecents) return;
+    setRecentNow(Date.now());
+    const timer = window.setInterval(() => setRecentNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [showRecents]);
+  const orderedJobs = [...jobs].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  const scopedJobs = showRecents
+    ? orderedJobs.filter((job) => {
+        const age = Math.max(recentNow, Date.now()) - Date.parse(job.createdAt);
+        return age >= 0 && age <= 24 * 60 * 60 * 1000;
+      })
+    : orderedJobs.filter((job) => jobMode(job) === mode).slice(0, 5);
+  const recentJobs = scopedJobs;
   const selectedJob = scopedJobs.find((job) => job.id === selectedJobId) ?? scopedJobs[0];
   const motion = useForgeMotion(machineRef, selectedJob, submittedJobRef.current, () => {
     const output = machineRef.current?.querySelector('.forge-output-content');
@@ -709,12 +729,14 @@ export function Forge({
       setDeleting(false);
     }
   };
-  const attach = async (artifact: Artifact) => {
+  const attach = async (jobId: string, artifact: Artifact) => {
     const agentAtStart = selectedAgentId;
-    if (!selectedJob || !sessionId || !agentAtStart) return;
+    if (!sessionId || !agentAtStart) return;
+    setError('');
+    setNotice('');
     try {
       const resourceAgentId = agentAtStart;
-      await api(`/api/forge/jobs/${encodeURIComponent(selectedJob.id)}/attach`, {
+      await api(`/api/forge/jobs/${encodeURIComponent(jobId)}/attach`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ agentId: resourceAgentId, sessionId, artifactId: artifact.id }),
@@ -726,6 +748,53 @@ export function Forge({
         setError(`Could not attach artifact: ${(e as Error).message}`);
     }
   };
+  const renderMediaActions = (jobId: string, artifact: Artifact, close?: () => void) => {
+    const job = jobs.find((item) => item.id === jobId);
+    return (
+      <div className="forge-media-actions">
+        {artifactReferencesAvailable && job && eligibleVideoReference(job, artifact) && (
+          <button
+            type="button"
+            className="forge-reference-action"
+            disabled={busy || selectionSaving}
+            onClick={() => {
+              if (useArtifactReference(job, artifact)) close?.();
+            }}
+          >
+            Use as video reference
+          </button>
+        )}
+        {['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(
+          artifact.mimeType?.toLowerCase(),
+        ) &&
+          artifact.sizeBytes <= 20 * 1024 * 1024 && (
+            <button
+              type="button"
+              onClick={async () => {
+                const copied = await copyReference(`[forge:${jobId}:${artifact.id}]`);
+                setNotice(copied ? 'Reference copied.' : '');
+                setError(copied ? '' : 'Could not copy reference. Try again.');
+              }}
+            >
+              Copy reference
+            </button>
+          )}
+        <button type="button" onClick={() => void attach(jobId, artifact)} disabled={!sessionId}>
+          Attach to conversation
+        </button>
+      </div>
+    );
+  };
+  const feedback = (
+    <>
+      {error && (
+        <p role="alert" className="forge-error">
+          {error}
+        </p>
+      )}
+      {notice && <p role="status">{notice}</p>}
+    </>
+  );
   return (
     <main ref={machineRef} className="forge-page forge-machine">
       <header className="forge-heading">
@@ -743,10 +812,11 @@ export function Forge({
             <button
               key={item}
               role="tab"
-              tabIndex={!showRecents && mode === item ? 0 : -1}
-              aria-selected={!showRecents && mode === item}
-              className={!showRecents && mode === item ? 'active' : ''}
+              tabIndex={!showGallery && !showRecents && mode === item ? 0 : -1}
+              aria-selected={!showGallery && !showRecents && mode === item}
+              className={!showGallery && !showRecents && mode === item ? 'active' : ''}
               onClick={() => {
+                setShowGallery(false);
                 setMode(item);
                 setShowRecents(false);
               }}
@@ -757,15 +827,50 @@ export function Forge({
           ))}
           <button
             role="tab"
-            aria-selected={showRecents}
-            className={showRecents ? 'active' : ''}
-            onClick={() => setShowRecents(true)}
+            tabIndex={!showGallery && showRecents ? 0 : -1}
+            aria-selected={!showGallery && showRecents}
+            className={!showGallery && showRecents ? 'active' : ''}
+            onClick={() => {
+              setShowGallery(false);
+              setShowRecents(true);
+            }}
           >
             ◷<span>Recents</span>
           </button>
+          <button
+            role="tab"
+            tabIndex={showGallery ? 0 : -1}
+            aria-selected={showGallery}
+            className={showGallery ? 'active' : ''}
+            onClick={() => setShowGallery(true)}
+          >
+            ▧<span>Gallery</span>
+          </button>
         </div>
       </header>
-      <div className={`forge-grid${showRecents ? ' forge-recents-grid' : ''}`}>
+      {showGallery && (
+        <>
+          {feedback}
+          <ForgeGallery
+            renderArtifact={(artifact, jobId) => (
+              <>
+                <ArtifactOutput
+                  artifact={artifact}
+                  fetchMedia={owned.fetch}
+                  viewerFooter={(close) => (
+                    <>
+                      {renderMediaActions(jobId, artifact, close)}
+                      {feedback}
+                    </>
+                  )}
+                />
+                {artifact.kind !== 'image' && renderMediaActions(jobId, artifact)}
+              </>
+            )}
+          />
+        </>
+      )}
+      <div hidden={showGallery} className={`forge-grid${showRecents ? ' forge-recents-grid' : ''}`}>
         <canvas className="forge-seam-sparks" aria-hidden="true" />
         <section className="forge-studio" hidden={showRecents}>
           <div className="forge-panel-head">
@@ -1121,43 +1226,7 @@ export function Forge({
                       />
                       <footer>
                         <strong>{artifact.name}</strong>
-                        <div>
-                          {artifactReferencesAvailable &&
-                            eligibleVideoReference(selectedJob, artifact) && (
-                              <button
-                                type="button"
-                                className="forge-reference-action"
-                                disabled={busy || selectionSaving}
-                                onClick={() => useArtifactReference(selectedJob, artifact)}
-                              >
-                                Use as video reference
-                              </button>
-                            )}
-                          {['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(
-                            artifact.mimeType?.toLowerCase(),
-                          ) &&
-                            artifact.sizeBytes <= 20 * 1024 * 1024 && (
-                              <button
-                                type="button"
-                                onClick={async () => {
-                                  const copied = await copyReference(
-                                    `[forge:${selectedJob.id}:${artifact.id}]`,
-                                  );
-                                  setNotice(copied ? 'Reference copied.' : '');
-                                  setError(copied ? '' : 'Could not copy reference. Try again.');
-                                }}
-                              >
-                                Copy reference
-                              </button>
-                            )}
-                          <button
-                            type="button"
-                            onClick={() => void attach(artifact)}
-                            disabled={!sessionId}
-                          >
-                            Attach to conversation
-                          </button>
-                        </div>
+                        {renderMediaActions(selectedJob.id, artifact)}
                       </footer>
                     </article>
                   ))}
@@ -1203,7 +1272,7 @@ export function Forge({
           <div className="forge-panel-head">
             <div>
               <span className="eyebrow">HISTORY</span>
-              <h2>{showRecents ? `Recent creations (${jobs.length})` : 'Recent creations'}</h2>
+              <h2>{showRecents ? `Last 24 hours (${recentJobs.length})` : 'Recent creations'}</h2>
             </div>
             <button type="button" disabled={loading || selectionSaving} onClick={() => void load()}>
               Refresh
@@ -1236,7 +1305,7 @@ export function Forge({
               {loading
                 ? 'Loading creations…'
                 : showRecents
-                  ? 'No recent creations.'
+                  ? 'No creations in the last 24 hours.'
                   : `No recent ${modeLabels[mode].toLowerCase()} creations.`}
             </p>
           )}

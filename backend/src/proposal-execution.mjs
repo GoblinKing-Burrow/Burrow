@@ -254,7 +254,7 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       let result;
       try {
         const args = action.tool === 'forge_create_job'
-          ? { mode: action.forgeMode, connectionId: action.forgeConnectionId || action.connectionId, modelId: action.forgeModelId || action.modelId, prompt: action.forgePrompt || action.prompt, idempotencyKey: action.forgeIdempotencyKey || action.idempotencyKey, useAgentReferenceImage: action.useAgentReferenceImage, useOperatorReferenceImage: action.useOperatorReferenceImage, referenceAgentIds: action.referenceAgentIds, referenceArtifacts: action.referenceArtifacts, imageOptions: action.imageOptions }
+          ? { mode: action.forgeMode, connectionId: action.forgeConnectionId || action.connectionId, modelId: action.forgeModelId || action.modelId, prompt: action.forgePrompt || action.prompt, idempotencyKey: action.forgeIdempotencyKey || action.idempotencyKey, useAgentReferenceImage: action.useAgentReferenceImage, useOperatorReferenceImage: action.useOperatorReferenceImage, referenceAgentIds: action.referenceAgentIds, referenceAttachmentIds: action.referenceAttachmentIds, referenceArtifacts: action.referenceArtifacts, imageOptions: action.imageOptions }
           : action.tool === 'forge_inspect_job' ? { jobId: action.jobId }
           : action.tool === 'forge_attach_artifact' ? { jobId: action.jobId, artifactId: action.artifactId } : {};
         result = await executeForgeTool(action.tool, args, { agentId, sessionId: sessionId || executionContext?.sessionId, conversationId: resolvedConversationId, runId: executionContext?.parentRunId || traceLogger?.runId || null, signal: abortSignal });
@@ -447,7 +447,7 @@ export async function executeReviewedProposalActions({ conversationStore = null,
     }
 
     if (action.tool === 'spawn_subagent') {
-      const started = await traceLogger?.toolStart?.({ tool: 'spawn_subagent', label: action.label || null, task: action.task || action.purpose || action.reason || null, model: action.model || null, modelProfile: action.modelProfile || null, target: action.target || null });
+      const started = await traceLogger?.toolStart?.({ tool: 'spawn_subagent', harness: action.harness || null, label: action.label || null, task: action.task || action.purpose || action.reason || null, model: action.model || null, modelProfile: action.modelProfile || null, target: action.target || null });
       let result;
       try {
         result = await executeSpawnSubagentTool({
@@ -455,6 +455,7 @@ export async function executeReviewedProposalActions({ conversationStore = null,
           arguments: {
             task: action.task || action.purpose || action.reason,
             label: action.label,
+            harness: action.harness,
             model: action.model,
             modelProfile: action.modelProfile,
             timeoutMs: action.timeoutMs,

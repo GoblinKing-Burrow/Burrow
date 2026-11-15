@@ -28,6 +28,9 @@ export type AccountUsageCard = {
   accountStatus?: OpenAiAccountStatus;
   clock?: ServerClock | null;
   error?: string;
+  sample?: { ageMs: number; receivedAt: number } | null;
+  rateLimited?: boolean;
+  retry?: { afterMs: number; receivedAt: number } | null;
 };
 
 const oauthConfigured = (provider: SavedProvider) =>
@@ -137,11 +140,63 @@ export function openAiBars(usage: OpenAiUsage | null): UsageBar[] {
     }));
 }
 
-// Session-only last successful values keep remounts from flashing empty cards.
+const ACCOUNT_REFRESH_MS = 30_000;
+
+// Session-only display state retains the original sample age and cooldown across remounts.
+// Retained percentages never establish model-pool eligibility.
 const usageCardCache = new Map<string, AccountUsageCard>();
 const accountCacheKey = (id: string, vendor: AccountVendor) => `${vendor}:${id}`;
 
-export function useAccountUsage(providers: SavedProvider[], refreshMs = 300_000, revision = 0) {
+type AnthropicUsageResponse = {
+  ok?: boolean;
+  usage?: AnthropicUsage | null;
+  fetchedAt?: string | null;
+  serverTime?: string;
+  sampleAgeMs?: number | null;
+  lastSuccess?: { fetchedAt: string; usage: AnthropicUsage } | null;
+  lastError?: { status: number; error: string } | null;
+  retryAfterMs?: number;
+  error?: string;
+};
+
+function anthropicCard(base: AccountUsageCard, result: AnthropicUsageResponse): AccountUsageCard {
+  const receivedAt = performance.now();
+  const serverMs = result.serverTime ? Date.parse(result.serverTime) : NaN;
+  const clock = Number.isFinite(serverMs) ? { serverMs, receivedAt } : base.clock;
+  const fetchedAt = result.fetchedAt ?? result.lastSuccess?.fetchedAt;
+  const derivedAge = fetchedAt && clock ? clock.serverMs - Date.parse(fetchedAt) : NaN;
+  const age = 'sampleAgeMs' in result ? (result.sampleAgeMs ?? NaN) : derivedAge;
+  const usage = result.usage ?? result.lastSuccess?.usage;
+  const failed = base.state === 'error' || result.ok === false;
+  return {
+    ...base,
+    clock,
+    state: failed ? 'error' : 'ready',
+    bars: usage ? anthropicBars(usage) : 'lastSuccess' in result ? [] : base.bars,
+    sample:
+      Number.isFinite(age) && age >= 0
+        ? { ageMs: age, receivedAt }
+        : 'lastSuccess' in result
+          ? null
+          : (base.sample ?? null),
+    rateLimited:
+      failed &&
+      (result.lastError?.status === 429 || result.error === 'anthropic_oauth_usage_failed:429'),
+    retry:
+      typeof result.retryAfterMs === 'number' &&
+      Number.isFinite(result.retryAfterMs) &&
+      result.retryAfterMs > 0
+        ? { afterMs: result.retryAfterMs, receivedAt }
+        : null,
+    error: result.error ?? base.error,
+  };
+}
+
+export function useAccountUsage(
+  providers: SavedProvider[],
+  refreshMs = ACCOUNT_REFRESH_MS,
+  revision = 0,
+) {
   const accounts = useMemo(() => oauthAccounts(providers), [providers]);
   const signature = accounts.map((entry) => `${entry.provider.id}:${entry.vendor}`).join('|');
   const [cards, setCards] = useState<AccountUsageCard[]>([]);
@@ -180,19 +235,27 @@ export function useAccountUsage(providers: SavedProvider[], refreshMs = 300_000,
             plan: null as string | null,
           };
           let clock: ServerClock | null = null;
+          let failedBody: Promise<AnthropicUsageResponse | null> | undefined;
           const options = {
             onResponse: (response: Response) => {
               clock = responseClock(response);
+              if (vendor === 'Anthropic' && !response.ok) {
+                // api() intentionally throws on HTTP errors; retain the additive usage metadata.
+                failedBody = response
+                  .clone()
+                  .json()
+                  .catch(() => null);
+              }
             },
           };
           try {
             if (vendor === 'Anthropic') {
-              const result = await api<{ usage?: AnthropicUsage | null }>(
+              const result = await api<AnthropicUsageResponse>(
                 `/api/anthropic/oauth/usage?connectionId=${encodeURIComponent(provider.id)}`,
                 {},
                 options,
               );
-              next = { ...base, clock, state: 'ready', bars: anthropicBars(result.usage ?? null) };
+              next = anthropicCard({ ...base, clock, state: 'ready', bars: [] }, result);
             } else {
               const result = await api<{ usage?: OpenAiUsage | null }>(
                 `/api/openai/oauth/usage?connectionId=${encodeURIComponent(provider.id)}`,
@@ -209,16 +272,26 @@ export function useAccountUsage(providers: SavedProvider[], refreshMs = 300_000,
               };
             }
           } catch (error) {
+            const previous = usageCardCache.get(key);
             next = {
               ...base,
-              plan: usageCardCache.get(key)?.plan ?? null,
+              ...previous,
               state: 'error',
-              bars: usageCardCache.get(key)?.bars ?? [],
+              bars: previous?.bars ?? [],
               error: error instanceof Error ? error.message : 'Usage unavailable',
             };
+            if (vendor === 'Anthropic') {
+              const metadata = await failedBody;
+              if (metadata && typeof metadata === 'object') {
+                next = anthropicCard({ ...next, clock: clock ?? next.clock }, metadata);
+              } else {
+                // A network failure cannot renew a sample or a cooldown.
+                next.rateLimited = false;
+              }
+            }
           }
           if (cancelled) return;
-          if (next.state === 'ready') usageCardCache.set(key, next);
+          usageCardCache.set(key, next);
           setCards((current) =>
             current.map((card) =>
               card.id === provider.id && card.vendor === vendor ? next : card,
@@ -246,7 +319,8 @@ export function accountUsageStatus(
   elapsed = performance.now(),
 ): { label: string; tone: 'active' | 'paused' | 'quota-exceeded'; detail?: string } {
   if (card.state === 'loading') return { label: 'Checking', tone: 'paused' };
-  if (card.state === 'error') return { label: 'Usage unavailable', tone: 'paused' };
+  // A failed meter refresh is not an account restriction. Use the last reported
+  // account evidence; transport errors/cooldowns must not replace its status.
   if (card.vendor !== 'OpenAI') {
     const known = card.bars.filter((bar) => bar.remainingPercent !== null);
     if (!known.length) return { label: 'Unknown', tone: 'paused' };
@@ -316,10 +390,10 @@ export function orderAccountStatusCards(cards: AccountUsageCard[], order: string
 
 export function AccountStatus({ providers }: { providers: SavedProvider[] }) {
   const [revision, setRevision] = useState(0);
-  const cards = useAccountUsage(providers, 300_000, revision);
+  const cards = useAccountUsage(providers, ACCOUNT_REFRESH_MS, revision);
   const [now, setNow] = useState(performance.now());
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(performance.now()), 30_000);
+    const timer = window.setInterval(() => setNow(performance.now()), ACCOUNT_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, []);
   const [order, setOrder] = useState(() => readAccountOrder(accountStatusOrderKey));
@@ -401,9 +475,6 @@ export function AccountStatus({ providers }: { providers: SavedProvider[] }) {
               onDragEnd={clearDrag}
             >
               {card.state === 'loading' && <small className="hint">Loading usage</small>}
-              {card.state === 'error' && (
-                <small className="hint">{card.error ?? 'Usage unavailable'}</small>
-              )}
               {card.state === 'ready' && !card.bars.length && (
                 <small className="hint">No usage windows reported.</small>
               )}

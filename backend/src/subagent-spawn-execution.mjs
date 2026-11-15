@@ -1,7 +1,8 @@
 import { compactSubagentEvidence, evidenceDeliveryCounts } from './subagent-evidence.mjs';
+import { CODEX_SELECTION_ACTIONS, validateCodexModelSelection } from './codex-model-selection.mjs';
 import { projectModelRecoveryMetadata } from './model-recovery-projection.mjs';
 import { createHash, randomUUID } from 'node:crypto';
-import { canSpawnMinion, nextMinionDepth, resolveTurnMinionDepth } from './minion-depth.mjs';
+import { canSpawnMinion, nextMinionDepth, resolveTurnMinionDepth, readMinionSettings } from './minion-depth.mjs';
 import { withTraceGuard } from './trace-guard.mjs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -73,7 +74,7 @@ function normalizeTaskForSpawnRequest(value) {
   return compactString(value).replace(/\s+/g, ' ');
 }
 
-function spawnRequestIdentity({ parentSessionId, parentConversationId, parentRunId, targetRoot, capability, model, resolvedModel, resolvedConnectionId, modelProfile, task } = {}) {
+function spawnRequestIdentity({ parentSessionId, parentConversationId, parentRunId, targetRoot, capability, model, resolvedModel, resolvedConnectionId, modelProfile, harness = 'burrow', task } = {}) {
   // Transparent deterministic identity from explicit request fields. This is
   // deliberately mechanical: it must not infer semantic task equivalence.
   return JSON.stringify({
@@ -81,6 +82,7 @@ function spawnRequestIdentity({ parentSessionId, parentConversationId, parentRun
     parentConversationId: compactString(parentConversationId) || null,
     parentRunId: compactString(parentRunId) || null,
     targetRoot: compactString(targetRoot) || null,
+    harness,
     capability: compactString(capability) || 'spawn_subagent',
     model: compactString(model) || null,
     resolvedModel: compactString(resolvedModel) || null,
@@ -95,6 +97,7 @@ function reusedSubagentResult({ record, task, target, request } = {}) {
   const child = result.child || {};
   return {
     tool: 'spawn_subagent',
+    harness: record.harness || 'burrow',
     ok: Boolean(result.ok),
     spawned: false,
     reused: true,
@@ -214,13 +217,26 @@ export async function executeSpawnSubagentTool({
   }
   const task = compactString(args.task || args.purpose || args.reason);
   const blockers = [];
+  const settings = await readMinionSettings(executionContext?.stores?.metadata, executionContext?.agentId);
+  const harness = args.harness ?? settings.defaultHarness;
+  if (!['burrow', 'codex'].includes(harness)) blockers.push('subagent_harness_invalid');
   if (!task) blockers.push('subagent_task_required');
   if (!dataRoot) blockers.push('subagent_data_root_required');
-  if (!modelConfig) blockers.push('subagent_model_config_required');
+  if (harness !== 'codex' && !modelConfig) blockers.push('subagent_model_config_required');
 
   const requestedModel = compactString(args.model || args.modelId || args.model_id) || null;
-  let childModelConfig = modelConfig;
-  if (modelConfig?.resolveChildModel) {
+  let childModelConfig = harness === 'codex' ? null : modelConfig;
+  if (harness === 'codex') {
+    try {
+      childModelConfig = await validateCodexModelSelection(executionContext?.stores?.models, settings.codexModel);
+      if (requestedModel && requestedModel !== childModelConfig.model) {
+        childModelConfig = null;
+        blockers.push('codex_model_override_unsupported');
+      }
+    } catch (error) {
+      blockers.push(error?.statusCode === 400 ? error.message : 'codex_model_selection_unavailable');
+    }
+  } else if (modelConfig?.resolveChildModel) {
     try { childModelConfig = await modelConfig.resolveChildModel(requestedModel); } catch { childModelConfig = null; blockers.push(`subagent_model_unavailable:${requestedModel || 'default'}`); }
   } else if (requestedModel) blockers.push(`subagent_model_unavailable:${requestedModel}`);
   const requestedModelProfile = compactString(args.modelProfile || args.model_profile || args.profile) || null;
@@ -265,6 +281,8 @@ export async function executeSpawnSubagentTool({
       availableModels: Array.isArray(modelConfig?.availableModels) ? modelConfig.availableModels.map((item) => item.id) : [],
       resolvedModelProfile: modelSelection.resolvedProfile,
       resolvedModel: modelSelection.resolvedModel,
+      ...(harness === 'codex' && blockers.some(code => CODEX_SELECTION_ACTIONS[code])
+        ? { summary: blockers.map(code => CODEX_SELECTION_ACTIONS[code]).filter(Boolean).join(' ') } : {}),
       blockers,
       warnings: [],
       evidence: [],
@@ -285,6 +303,7 @@ export async function executeSpawnSubagentTool({
     parentConversationId,
     parentRunId,
     targetRoot: target.root,
+    harness,
     capability,
     model: requestedModel,
     resolvedModel: modelSelection.resolvedModel,
@@ -326,7 +345,7 @@ export async function executeSpawnSubagentTool({
     const existing = await findSubagentBySpawnRequestKey({ dataRoot, key: spawnRequest.key });
     if (existing && existing.status !== 'queued') return { existing };
     const queued = existing || await createSubagentRecord({
-      dataRoot, id, owner, minionDepth, purpose: task, label, scope, permissions,
+      dataRoot, id, owner, minionDepth, purpose: task, label, harness, scope, permissions,
       status: 'queued', trace: { runId: id, childSessionId, traceDir },
       spawnRequest, model: modelSelection,
       provenance: ['spawn-subagent-tool', 'context:isolated'],
@@ -334,7 +353,7 @@ export async function executeSpawnSubagentTool({
     const admittedId = queued.id;
     const admittedSessionId = queued.trace.childSessionId || subagentChildSessionId(admittedId);
     const admittedTraceDir = queued.trace.traceDir || null;
-    await startSubagentChildSession({ dataRoot, id: admittedId, workerProfile: 'spawn_subagent', purpose: task,
+    await startSubagentChildSession({ dataRoot, id: admittedId, harness: queued.harness, workerProfile: 'spawn_subagent', purpose: task,
       owner: queued.owner, minionDepth: queued.minionDepth,
       trace: { runId: admittedId, childSessionId: admittedSessionId, traceDir: admittedTraceDir },
       model: queued.model, conversationStore });
@@ -358,7 +377,7 @@ export async function executeSpawnSubagentTool({
   const childId = admittedId;
   const childSession = admittedSessionId;
   const childTrace = admittedTraceDir;
-  const childModelSelection = queued.model || modelSelection;
+  let childModelSelection = queued.model || modelSelection;
   const childTarget = queued.scope?.target || target;
   const childTask = queued.purpose || task;
   const childOwner = queued.owner;
@@ -380,8 +399,13 @@ export async function executeSpawnSubagentTool({
   let childRun;
   try {
     abortSignal?.throwIfAborted();
-    if (remoteExecution && typeof childRunner !== 'function') throw new Error('subagent_child_runner_required');
-    childRun = remoteExecution || childRunner
+    if (harness !== 'codex' && remoteExecution && typeof childRunner !== 'function') throw new Error('subagent_child_runner_required');
+    // Load the composed worker only at dispatch: it depends on proposal-execution.
+    const runCodexChild = harness === 'codex'
+      ? (await import('./subagent-worker-runner.mjs')).runSpawnSubagentChild : null;
+    childRun = harness === 'codex'
+      ? { ok: true, spawned: true, exitCode: 0, durationMs: null, result: await runCodexChild({ harness, id: childId, task: childTask, target: childTarget, dataRoot, childSessionId: childSession, owner: childOwner, minionDepth: childDepth, modelConfig: childModelConfig, traceDir: childTrace, executionPolicy, parentExecutionContext: childParentExecutionContext, signal: abortSignal }) }
+      : remoteExecution || childRunner
       ? { ok: true, spawned: true, exitCode: 0, durationMs: null, result: await childRunner({ id: childId, task: childTask, target: childTarget, dataRoot, childSessionId: childSession, owner: childOwner, minionDepth: childDepth, modelConfig: childModelConfig, traceDir: childTrace, executionPolicy, parentExecutionContext: childParentExecutionContext, signal: abortSignal }) }
       : await runSubagentProcess({ args: { id: childId, task: childTask, target: childTarget, dataRoot, childSessionId: childSession, owner: childOwner, minionDepth: childDepth, modelConfig: childModelConfig, traceDir: childTrace, executionPolicy, executionBoundaries: executionContext?.executionBoundaries || null, traceContext: parentTraceContext, otelConfiguration: executionContext?.telemetry?.remoteConfiguration?.(parentRunId) || null }, signal: abortSignal });
   } catch (error) {
@@ -394,7 +418,16 @@ export async function executeSpawnSubagentTool({
       result: { ok: false, summary: 'Minion child failed to start or dispatch.', blockers: [`subagent_child_dispatch_failed:${code}`], warnings: [], evidence: [], artifacts: [], changedFiles: [], memoryWrites: [], sideEffectsApplied: false },
     };
   }
+  if (harness === 'codex') {
+    childRun.spawned = Boolean(childRun.result?.spawned);
+    childRun.cancelled = Boolean(childRun.result?.cancelled);
+  }
   let childResult = childRun.result || { ok: false, summary: 'Minion returned no result.', blockers: ['subagent_result_missing'], warnings: [], evidence: [], artifacts: [], changedFiles: [], memoryWrites: [], sideEffectsApplied: false };
+  if (harness === 'codex' && childResult.model) {
+    childModelSelection = { ...childModelSelection, requestedModel: childModelConfig.model,
+      resolvedModel: childResult.model.actual, resolvedConnectionId: childResult.model.connectionId,
+      logicalConnectionId: childModelConfig.connectionId };
+  }
   // Dispatch/process cancellation can lose the IPC terminal payload. Recover
   // only persisted tool outcomes, and disclose every delivery budget omission.
   if (!childResult.evidence?.length && (!childRun.ok || !childResult.ok || abortSignal?.aborted)) {
@@ -406,7 +439,7 @@ export async function executeSpawnSubagentTool({
   const receiptRef = childTrace ? path.join(childTrace, 'receipt.json') : null;
   if (receiptRef) {
     await fs.mkdir(path.dirname(receiptRef), { recursive: true });
-    await fs.writeFile(receiptRef, `${JSON.stringify({ id: childId, parentSessionId, parentConversationId, parentRunId, childSessionId: childSession, status, target: childTarget, model: childModelSelection, spawned: Boolean(childRun.spawned), exitCode: childRun.exitCode ?? null, evidenceCount: childResult.evidence?.length || 0 }, null, 2)}\n`, 'utf8');
+    await fs.writeFile(receiptRef, `${JSON.stringify({ id: childId, harness, parentSessionId, parentConversationId, parentRunId, childSessionId: childSession, status, target: childTarget, model: childModelSelection, spawned: Boolean(childRun.spawned), exitCode: childRun.exitCode ?? null, evidenceCount: childResult.evidence?.length || 0 }, null, 2)}\n`, 'utf8');
   }
   const child = childFrom({ parentSessionId, parentConversationId, parentRunId, childSessionId: childSession, receiptRefs: receiptRef ? [receiptRef] : [], dataRoot });
   const result = {
@@ -429,10 +462,11 @@ export async function executeSpawnSubagentTool({
   };
   const finished = await updateSubagentStatus({ dataRoot, id: childId, status, phase: 'idle', trace: { runId: childId, childSessionId: childSession, traceDir: childTrace }, model: childModelSelection, result, provenance: { source: 'spawn-subagent-tool', reason: status } });
   await finishSubagentChildSession({ dataRoot, sessionId: childSession, id: childId, workerProfile: 'spawn_subagent', owner: childOwner, trace: { runId: childId, childSessionId: childSession, traceDir: childTrace }, status, result, model: childModelSelection, conversationStore });
-  await (traceLogger?.toolEnd || traceLogger?.tool)?.({ tool: 'spawn_subagent', ...(activityId ? { activityId } : {}), ok: result.ok, id: childId, childSessionId: childSession, status, spawned: Boolean(childRun.spawned), exitCode: childRun.exitCode ?? null, spawnRequestKey: spawnRequest.key, record: subagentVisibilitySummary(finished.record) });
+  await (traceLogger?.toolEnd || traceLogger?.tool)?.({ tool: 'spawn_subagent', ...(activityId ? { activityId } : {}), ok: result.ok, harness, id: childId, childSessionId: childSession, status, spawned: Boolean(childRun.spawned), exitCode: childRun.exitCode ?? null, spawnRequestKey: spawnRequest.key, record: subagentVisibilitySummary(finished.record) });
 
   return {
     tool: 'spawn_subagent',
+    harness,
     ok: result.ok,
     spawned: Boolean(childRun.spawned),
     reused: false,

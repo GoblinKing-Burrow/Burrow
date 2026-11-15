@@ -1,3 +1,4 @@
+import { classifyModelFailure } from '../../src/model-failure.mjs';
 import { artifactResponseHeaders } from '../../src/artifact-response-policy.mjs';
 import { promises as fs } from 'node:fs';
 export function createForgeRoutes({ store, readJsonBody, sendJson }) {
@@ -6,6 +7,16 @@ export function createForgeRoutes({ store, readJsonBody, sendJson }) {
     try {
       const forge = store();
       if (req.method === 'GET' && url.pathname === '/api/archive/forge') sendJson(res, 200, { records: await forge.archive() });
+      else if (req.method === 'GET' && url.pathname === '/api/forge/gallery') sendJson(res, 200, { ok: true, ...await forge.gallery() });
+      else if (req.method === 'POST' && url.pathname === '/api/forge/gallery/folders') sendJson(res, 201, { ok: true, folder: await forge.createGalleryFolder(await readJsonBody(req)) });
+      else if (req.method === 'PUT' && /^\/api\/forge\/gallery\/images\/[^/]+\/[^/]+$/.test(url.pathname)) {
+        const [, , , , , jobId, artifactId] = url.pathname.split('/');
+        sendJson(res, 200, { ok: true, ...await forge.moveGalleryImage(decodeURIComponent(jobId), decodeURIComponent(artifactId), await readJsonBody(req)) });
+      }
+      else if (req.method === 'DELETE' && /^\/api\/forge\/gallery\/images\/[^/]+\/[^/]+$/.test(url.pathname)) {
+        const [, , , , , jobId, artifactId] = url.pathname.split('/');
+        sendJson(res, 200, { ok: true, ...await forge.deleteGalleryImage(decodeURIComponent(jobId), decodeURIComponent(artifactId)) });
+      }
       else if (req.method === 'GET' && url.pathname === '/api/forge/catalog') sendJson(res, 200, await forge.catalog());
       else if (req.method === 'GET' && url.pathname === '/api/forge/selections') sendJson(res, 200, { ok: true, selections: await forge.selections() });
       else if (req.method === 'PUT' && url.pathname === '/api/forge/selections') sendJson(res, 200, { ok: true, selections: await forge.setSelection(await readJsonBody(req)) });
@@ -21,7 +32,7 @@ export function createForgeRoutes({ store, readJsonBody, sendJson }) {
         else if (req.method === 'GET' && action === 'artifacts' && artifactId) { const { artifact, resolved } = await forge.artifact(id, artifactId); const bytes = await fs.readFile(resolved.filePath); res.writeHead(200, { 'content-type': artifact.mimeType, 'content-length': bytes.length, ...artifactResponseHeaders({ name: artifact.name, mimeType: artifact.mimeType, download: url.searchParams.get('download') === '1' }) }); res.end(bytes); }
         else sendJson(res, 405, { ok: false, error: 'method_not_allowed' });
       }
-    } catch (error) { sendJson(res, error.statusCode || 500, { ok: false, error: error.statusCode ? error.message : 'forge_unavailable' }); }
+    } catch (error) { sendJson(res, error.statusCode || 500, { ok: false, error: error.statusCode ? classifyModelFailure(error).message : 'forge_unavailable', message: classifyModelFailure(error).message }); }
     return true;
   };
 }

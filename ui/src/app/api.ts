@@ -73,6 +73,8 @@ export type RuntimeAgent = {
   } | null;
 };
 
+export type MinionHarness = 'burrow' | 'codex';
+
 /** Runtime-owned lineage; a child keeps its spawn-time depth budget. */
 export type MinionAncestry = {
   runId?: string | null;
@@ -85,6 +87,7 @@ export type MinionAncestry = {
 };
 
 export type AgentStatus = MinionAncestry & {
+  harness?: MinionHarness;
   sessionId: string;
   label?: string;
   status?: string;
@@ -209,10 +212,11 @@ export type ProviderPool = {
   enabled: boolean;
   memberConnectionIds: string[];
   sticky?: true;
-  preferEarlierReset?: false;
+  preferEarlierReset?: boolean;
 };
 
 export type ModelConnection = {
+  codexEligible?: boolean;
   autoUseExpiringResets?: boolean;
   id: string;
   provider: string;
@@ -290,6 +294,8 @@ export type ToolActivityItem = {
   id: string;
   label: string;
   detail?: string;
+  /** Backend-sanitized failure diagnostic, separate from the tool target. */
+  errorDetail?: string;
   status?: 'pending' | 'ok' | 'error';
 };
 export type ToolActivity = {
@@ -305,6 +311,7 @@ export type SessionToolActivity = {
   items: Array<{
     label: string;
     detail?: string;
+    errorDetail?: string;
     status: 'pending' | 'ok' | 'error';
     count?: number;
   }>;
@@ -353,6 +360,7 @@ export type ActiveSubagentActivity = {
   counts?: Record<string, unknown> | null;
 };
 export type ActiveSubagent = MinionAncestry & {
+  harness?: MinionHarness;
   id: string;
   status?: string | null;
   phase?: string | null;
@@ -727,7 +735,7 @@ export async function api<T>(
   }
 }
 
-async function parseApiResponse<T>(response: Response): Promise<T> {
+export async function parseApiResponse<T>(response: Response): Promise<T> {
   if (response.status === 204) return undefined as T;
 
   // A 401 only represents an expired UI session when this tab has established Basic credentials.
@@ -756,15 +764,30 @@ async function parseApiResponse<T>(response: Response): Promise<T> {
     (body && typeof body === 'object' && (body as { ok?: unknown }).ok === false)
   ) {
     const rawError = body && typeof body === 'object' ? (body as { error?: unknown }).error : body;
+    const diagnostic =
+      body && typeof body === 'object' ? (body as { message?: unknown }).message : undefined;
     const message =
+      typeof diagnostic === 'string' && diagnostic.trim()
+        ? diagnostic
+        : typeof rawError === 'string'
+          ? rawError
+          : rawError && typeof rawError === 'object'
+            ? (rawError as { message?: unknown; error?: unknown }).message ||
+              (rawError as { error?: unknown }).error ||
+              JSON.stringify(rawError)
+            : `HTTP ${response.status}`;
+    const error = new Error(String(message)) as Error & {
+      status?: number;
+      code?: string;
+      details?: unknown;
+    };
+    const code =
       typeof rawError === 'string'
         ? rawError
         : rawError && typeof rawError === 'object'
-          ? (rawError as { message?: unknown; error?: unknown }).message ||
-            (rawError as { error?: unknown }).error ||
-            JSON.stringify(rawError)
-          : `HTTP ${response.status}`;
-    const error = new Error(String(message)) as Error & { status?: number; details?: unknown };
+          ? (rawError as { code?: unknown }).code
+          : undefined;
+    if (typeof code === 'string') error.code = code;
     error.status = response.status;
     error.details =
       rawError && typeof rawError === 'object'
@@ -788,11 +811,7 @@ export async function downloadExport(
     body: JSON.stringify({ categories, ...(password ? { password } : {}) }),
   });
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    const rawError = body?.error;
-    const message =
-      typeof rawError === 'string' ? rawError : rawError?.message || `HTTP ${response.status}`;
-    throw new Error(message);
+    await parseApiResponse(response);
   }
   const disposition = response.headers.get('content-disposition') || '';
   const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || 'burrow-export.bin';

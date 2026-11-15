@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { AgentsPanel } from '../../src/features/workspace/WorkspaceRail';
 import { Settings } from '../../src/features/settings/SettingsPage';
 import { ConfirmProvider } from '../../src/app/ConfirmDialog';
 import { UnsavedChangesProvider } from '../../src/app/UnsavedChanges';
@@ -105,6 +106,7 @@ const mcpConnections = [
     name: 'GitHub MCP',
     transport: 'http',
     baseUrl: 'https://github-mcp.invalid',
+    verifyTls: true,
     command: null,
     args: [],
     enabled: true,
@@ -116,6 +118,7 @@ const mcpConnections = [
     name: 'Documentation MCP',
     transport: 'http',
     baseUrl: 'https://docs-mcp.invalid',
+    verifyTls: false,
     command: null,
     args: [],
     enabled: true,
@@ -368,6 +371,7 @@ const requests: { path: string; method: string }[] = [];
 const errors: string[] = [];
 window.addEventListener('error', (event) => errors.push(event.message));
 window.addEventListener('unhandledrejection', (event) => errors.push(String(event.reason)));
+const minionSettings: Record<string, { maxDepth: number; defaultHarness: string }> = {};
 window.fetch = (async (input, init) => {
   const path = String(input),
     method = init?.method ?? 'GET',
@@ -494,8 +498,15 @@ window.fetch = (async (input, init) => {
     };
   else if (path.match(/\/api\/agents\/[^/]+$/))
     data = { agent: agents.find((agent) => agent.id === decodeURIComponent(path.split('/')[3])) };
-  else if (path.endsWith('/minion-settings')) data = { ok: true, maxDepth: 1 };
-  else if (path.endsWith('/minion-model-selection')) data = { ok: true, selection: null };
+  else if (path.endsWith('/minion-settings')) {
+    const settings = (minionSettings[path] ??= { maxDepth: 1, defaultHarness: 'burrow' });
+    if (method === 'PUT') {
+      if (new URLSearchParams(location.search).has('minion-fail'))
+        return Response.json({ error: 'Synthetic minion save unavailable' }, { status: 503 });
+      Object.assign(settings, body);
+    }
+    data = { ok: true, ...settings };
+  } else if (path.endsWith('/minion-model-selection')) data = { ok: true, selection: null };
   else if (path === '/api/settings/curator')
     data = { ok: true, configured: false, selection: null, available: false };
   else if (path.startsWith('/api/operator/reference-image/content?')) {
@@ -589,8 +600,25 @@ window.fetch = (async (input, init) => {
         },
       ],
     };
-  else if (path === '/api/settings/mcp-connections') data = { connections: mcpConnections };
-  else if (path.endsWith('/mcp-tools')) {
+  else if (path === '/api/settings/mcp-connections') {
+    if (method === 'POST') {
+      if (new URLSearchParams(location.search).has('mcp-save-error'))
+        return Response.json({ error: 'Synthetic MCP save unavailable' }, { status: 503 });
+      const id = body.id ?? `fixture-mcp-${mcpConnections.length + 1}`;
+      const index = mcpConnections.findIndex((connection) => connection.id === id);
+      const connection = {
+        ...(mcpConnections[index] ?? { tools: [], apiKeyConfigured: false }),
+        ...body,
+        id,
+        verifyTls: body.verifyTls !== false,
+      };
+      if (index < 0) mcpConnections.push(connection);
+      else mcpConnections[index] = connection;
+    }
+    data = { connections: mcpConnections };
+  } else if (path === '/api/settings/mcp-connections/discover') {
+    data = { connection: mcpConnections.find((connection) => connection.id === body.connectionId) };
+  } else if (path.endsWith('/mcp-tools')) {
     const agentId = decodeURIComponent(path.split('/')[3]);
     if (method === 'PUT') grantsByAgent[agentId] = body.tools;
     data = { ok: true, agentId, tools: grantsByAgent[agentId] ?? [] };
@@ -811,7 +839,56 @@ export const fixtureRoot = createRoot(document.getElementById('root')!);
 fixtureRoot.render(
   <ConfirmProvider>
     <UnsavedChangesProvider>
-      <Fixture />
+      {new URLSearchParams(location.search).has('minion-rail') ? (
+        <div style={{ width: 280, height: '100vh', borderRight: '1px solid var(--line)' }}>
+          <AgentsPanel
+            agents={[
+              {
+                ...agents[0],
+                avatar: 'H',
+                activity: 'Working',
+                context: 25,
+                subagents: [
+                  {
+                    id: 'burrow-child',
+                    name: 'Review existing styles',
+                    avatar: '',
+                    activity: 'Working',
+                    context: null,
+                    stream: 'burrow-child',
+                  },
+                  {
+                    id: 'codex-child',
+                    name: 'Codex implementation',
+                    harness: 'codex',
+                    avatar: '',
+                    activity: 'Working',
+                    context: null,
+                    stream: 'codex-child',
+                  },
+                  {
+                    id: 'nested-child',
+                    parentSessionId: 'codex-child',
+                    name: 'Check responsive layout',
+                    harness: 'codex',
+                    avatar: '',
+                    activity: 'Incomplete',
+                    context: null,
+                    stream: 'nested-child',
+                  },
+                ],
+              },
+            ]}
+            selectedStreamId="hatchet"
+            expandedAgents={new Set(['hatchet'])}
+            onSelectAgent={() => {}}
+            onToggleAgent={() => {}}
+            onSelectSubagent={() => {}}
+          />
+        </div>
+      ) : (
+        <Fixture />
+      )}
     </UnsavedChangesProvider>
   </ConfirmProvider>,
 );

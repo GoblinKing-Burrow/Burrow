@@ -129,6 +129,7 @@ function normalizeSpawnRequest(spawnRequest = null) {
     parentConversationId: compactString(spawnRequest.parentConversationId) || null,
     parentRunId: compactString(spawnRequest.parentRunId) || null,
     targetRoot: compactString(spawnRequest.targetRoot) || null,
+    harness: spawnRequest.harness === 'codex' ? 'codex' : 'burrow',
     capability: compactString(spawnRequest.capability) || null,
     model: compactString(spawnRequest.model) || null,
     resolvedModel: compactString(spawnRequest.resolvedModel) || null,
@@ -145,7 +146,8 @@ function normalizeModelSelection(model = null) {
   const requestedProfile = compactString(model.requestedProfile) || null;
   const resolvedProfile = compactString(model.resolvedProfile) || null;
   const resolvedModel = compactString(model.resolvedModel) || null;
-  return requestedModel || requestedProfile || resolvedProfile || resolvedModel ? { requestedModel, resolvedConnectionId, requestedProfile, resolvedProfile, resolvedModel } : null;
+  return requestedModel || requestedProfile || resolvedProfile || resolvedModel ? { requestedModel, resolvedConnectionId, requestedProfile, resolvedProfile, resolvedModel,
+    ...(Object.hasOwn(model, 'logicalConnectionId') ? { logicalConnectionId: compactString(model.logicalConnectionId) || null } : {}) } : null;
 }
 
 function normalizeActivity(activity = null) {
@@ -217,6 +219,7 @@ export function createSubagentContract({
   minionDepth = null,
   purpose,
   label = null,
+  harness = 'burrow',
   scope = {},
   permissions = {},
   status = 'queued',
@@ -235,6 +238,7 @@ export function createSubagentContract({
   const contract = {
     contractVersion: SUBAGENT_CONTRACT_VERSION,
     kind: SUBAGENT_KIND,
+    harness: harness === 'codex' ? 'codex' : 'burrow',
     id: subagentId(id),
     owner: normalizeOwner(owner),
     ...(minionDepth ? { minionDepth: normalizeMinionDepth(minionDepth) } : {}),

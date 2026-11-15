@@ -585,7 +585,7 @@
             "name": "limit",
             "in": "query",
             "required": false,
-            "description": "Maximum display transcript turns per page (1\u2013500; default 200).",
+            "description": "Maximum display transcript turns per page (1–500; default 200).",
             "schema": {
               "type": "integer",
               "minimum": 1,
@@ -1595,7 +1595,7 @@
             "$ref": "#/components/responses/ErrorResponse"
           }
         },
-        "description": "List retained active/archived conversations and independent reset documents. Date and session-calendar discovery match retained visible message occurrence days (including compacted generations in the document\u2019s canonical generation window), plus catalog update/reset-creation dates. Unknown message clocks are not inferred. Date-filtered rows include matchedDate in the requested timezone; clients must retain these matches even when the catalog timestamp differs. Search matches identity, names, titles and human-facing summaries, not internal run evidence. Opaque cursors preserve exact catalog ordering and must keep filters unchanged."
+        "description": "List retained active/archived conversations and independent reset documents. Date and session-calendar discovery match retained visible message occurrence days (including compacted generations in the document’s canonical generation window), plus catalog update/reset-creation dates. Unknown message clocks are not inferred. Date-filtered rows include matchedDate in the requested timezone; clients must retain these matches even when the catalog timestamp differs. Search matches identity, names, titles and human-facing summaries, not internal run evidence. Opaque cursors preserve exact catalog ordering and must keep filters unchanged."
       }
     },
     "/api/archive/sessions/{agentId}/{sessionId}": {
@@ -1621,7 +1621,7 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Page size (clamped to 1\u2013500, default 100).",
+            "description": "Page size (clamped to 1–500, default 100).",
             "schema": {
               "type": "integer",
               "minimum": 1,
@@ -3828,7 +3828,7 @@
             "name": "limit",
             "in": "query",
             "required": false,
-            "description": "Maximum rows in this page (1\u2013500, default 100). Invalid or out-of-range values return 400 archive_limit_invalid.",
+            "description": "Maximum rows in this page (1–500, default 100). Invalid or out-of-range values return 400 archive_limit_invalid.",
             "schema": {
               "type": "integer",
               "minimum": 1,
@@ -4294,7 +4294,7 @@
           "Agents"
         ],
         "summary": "Read bulk agent UI overview",
-        "description": "Return registered agents with identities, requested-session/descendant status, context usage, and model selections in one request. The optional sessions map selects each agent\u2019s session. Status uses the same runtime-owned ancestry as /api/agent-status, including metadata-only live descendants and honest orphans. Context inspection is bounded to the requested session plus 12 descendants per agent; contextHydration.truncated reports omitted contexts, not a truncated status tree. Opt in to agent-wide minions with minionScope: agent (session is the default). status.minionScope: agent confirms a successful all-origin scan for that agent; disabled/error entries do not claim coverage. The anchor session and its activity remain independent. Ordinary unrelated chats are not minions; requested child anchors retain depth and appear once. Depth-two orphans without root metadata keep unknown roots. Context hydration remains bounded to the anchor plus 12 distinct minion sessions; session recovery and cancellation stay scoped.",
+        "description": "Return registered agents with identities, requested-session/descendant status, context usage, and model selections in one request. The optional sessions map selects each agent’s session. Status uses the same runtime-owned ancestry as /api/agent-status, including metadata-only live descendants and honest orphans. Context inspection is bounded to the requested session plus 12 descendants per agent; contextHydration.truncated reports omitted contexts, not a truncated status tree. Opt in to agent-wide minions with minionScope: agent (session is the default). status.minionScope: agent confirms a successful all-origin scan for that agent; disabled/error entries do not claim coverage. The anchor session and its activity remain independent. Ordinary unrelated chats are not minions; requested child anchors retain depth and appear once. Depth-two orphans without root metadata keep unknown roots. Context hydration remains bounded to the anchor plus 12 distinct minion sessions; session recovery and cancellation stay scoped.",
         "operationId": "getAgentOverview",
         "requestBody": {
           "required": true,
@@ -7065,9 +7065,9 @@
         "tags": [
           "Settings"
         ],
-        "summary": "Read an agent minion depth setting",
+        "summary": "Read agent minion settings",
         "operationId": "getAgentMinionSettings",
-        "description": "Read the per-agent maximum nesting depth (integer 0\u20132, default 1). This is independent of minion model selection. Zero disables spawning, one permits direct children, and two also permits grandchildren. Requires an enabled registered agent.",
+        "description": "Read per-agent maxDepth, defaultHarness, and independent codexModel selection. Requires an enabled registered agent.",
         "parameters": [
           {
             "$ref": "#/components/parameters/PathAgentId"
@@ -7075,7 +7075,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The agent\u2019s durable minion depth setting; defaults to one when unset.",
+            "description": "Durable minion settings; defaults: maxDepth 1, defaultHarness burrow, codexModel null.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7083,7 +7083,9 @@
                 },
                 "example": {
                   "ok": true,
-                  "maxDepth": 1
+                  "maxDepth": 1,
+                  "defaultHarness": "burrow",
+                  "codexModel": null
                 }
               }
             }
@@ -7145,9 +7147,9 @@
         "tags": [
           "Settings"
         ],
-        "summary": "Save an agent minion depth setting",
+        "summary": "Save agent minion settings",
         "operationId": "updateAgentMinionSettings",
-        "description": "Persist maxDepth for this agent only. maxDepth is required and must be a JSON integer 0, 1 or 2; missing, null, strings, booleans, fractions and out-of-range values are rejected without changing saved settings. This operation does not change model selection or expose any additional minion settings. Child status retains the saved spawn-time budget; root status reports the current setting.",
+        "description": "Persist any nonempty subset of maxDepth, defaultHarness, codexModel. Omitted fields retain saved values; codexModel is a complete direct OpenAI OAuth connection/enabled model pair, or null to clear. Invalid combined updates write nothing. Burrow minion/parent model selections and saved child lineage remain unchanged.",
         "parameters": [
           {
             "$ref": "#/components/parameters/PathAgentId"
@@ -7161,14 +7163,16 @@
                 "$ref": "#/components/schemas/AgentMinionSettingsUpdate"
               },
               "example": {
-                "maxDepth": 1
+                "maxDepth": 1,
+                "defaultHarness": "burrow",
+                "codexModel": null
               }
             }
           }
         },
         "responses": {
           "200": {
-            "description": "The agent\u2019s durable minion depth setting; defaults to one when unset.",
+            "description": "Durable minion settings; defaults: maxDepth 1, defaultHarness burrow, codexModel null.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7176,13 +7180,15 @@
                 },
                 "example": {
                   "ok": true,
-                  "maxDepth": 1
+                  "maxDepth": 1,
+                  "defaultHarness": "burrow",
+                  "codexModel": null
                 }
               }
             }
           },
           "400": {
-            "description": "Invalid maxDepth or malformed JSON. Saved settings are unchanged.",
+            "description": "Invalid depth, harness, Codex connection/model, empty update, or malformed JSON. Saved settings are unchanged.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7201,6 +7207,37 @@
                       "ok": false,
                       "status": 400,
                       "error": "invalid_json"
+                    }
+                  },
+                  "minion_default_harness_invalid": {
+                    "value": {
+                      "ok": false,
+                      "status": 400,
+                      "error": "minion_default_harness_invalid"
+                    }
+                  },
+                  "codex_model_selection_invalid": {
+                    "value": {
+                      "ok": false,
+                      "error": "codex_model_selection_invalid"
+                    }
+                  },
+                  "codex_connection_not_found": {
+                    "value": {
+                      "ok": false,
+                      "error": "codex_connection_not_found"
+                    }
+                  },
+                  "codex_openai_oauth_required": {
+                    "value": {
+                      "ok": false,
+                      "error": "codex_openai_oauth_required"
+                    }
+                  },
+                  "codex_model_not_enabled": {
+                    "value": {
+                      "ok": false,
+                      "error": "codex_model_not_enabled"
                     }
                   }
                 }
@@ -9026,6 +9063,246 @@
             }
           }
         }
+      }
+    },
+    "/api/forge/gallery": {
+      "get": {
+        "tags": [
+          "Forge"
+        ],
+        "operationId": "getForgeGallery",
+        "summary": "List generated image and video gallery with folders",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForgeGallery"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          },
+          "404": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          },
+          "503": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          }
+        }
+      }
+    },
+    "/api/forge/gallery/folders": {
+      "post": {
+        "tags": [
+          "Forge"
+        ],
+        "operationId": "createForgeGalleryFolder",
+        "summary": "Create folder or subfolder",
+        "responses": {
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "folder": {
+                      "$ref": "#/components/schemas/ForgeGalleryFolder"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          },
+          "404": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          },
+          "503": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "parentId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/forge/gallery/images/{jobId}/{artifactId}": {
+      "put": {
+        "tags": [
+          "Forge"
+        ],
+        "operationId": "moveForgeGalleryImage",
+        "summary": "Move generated image or video to folder or root without modifying source job",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "jobId": {
+                      "type": "string"
+                    },
+                    "artifactId": {
+                      "type": "string"
+                    },
+                    "folderId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          },
+          "404": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          },
+          "503": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "folderId"
+                ],
+                "properties": {
+                  "folderId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "artifactId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Forge"
+        ],
+        "operationId": "deleteForgeGalleryImage",
+        "summary": "Permanently delete one generated image or video, preserving job and Archive history",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "jobId": {
+                      "type": "string"
+                    },
+                    "artifactId": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          },
+          "404": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          },
+          "503": {
+            "description": "Invalid request, unavailable owner, or missing gallery image/folder"
+          },
+          "409": {
+            "description": "Original Archive receipt missing"
+          }
+        },
+        "parameters": [
+          {
+            "name": "jobId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "artifactId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
       }
     }
   },
@@ -11680,6 +11957,11 @@
               "maxLength": 8192
             },
             "description": "HTTP headers, encrypted and never returned. Omit to preserve all; supplied map defines retained names; null preserves an existing case-insensitive name (error if absent); {} clears. Names are case-insensitive and duplicates rejected; values reject CR/LF/NUL and are limited to 8192 UTF-8 bytes. Explicit Authorization overrides legacy Bearer apiKey. Not sent to stdio providers."
+          },
+          "verifyTls": {
+            "type": "boolean",
+            "default": true,
+            "description": "Verify HTTPS server certificates for this MCP connection. Set false only for a trusted self-signed or private endpoint; disables certificate verification for this connection only. No effect for plain HTTP or stdio. Omission defaults to true, including legacy imports."
           }
         },
         "additionalProperties": false
@@ -11698,7 +11980,8 @@
           "createdAt",
           "updatedAt",
           "environmentVariables",
-          "headerNames"
+          "headerNames",
+          "verifyTls"
         ],
         "properties": {
           "id": {
@@ -11768,6 +12051,11 @@
               "type": "string"
             },
             "description": "Configured lowercase HTTP header names only; never values."
+          },
+          "verifyTls": {
+            "type": "boolean",
+            "default": true,
+            "description": "Verify HTTPS server certificates for this MCP connection. Set false only for a trusted self-signed or private endpoint; disables certificate verification for this connection only. No effect for plain HTTP or stdio. Omission defaults to true, including legacy imports."
           }
         },
         "additionalProperties": false
@@ -15189,7 +15477,7 @@
               "array",
               "null"
             ],
-            "description": "Ordered prior Forge PNG/JPEG/WebP image artifacts for supported video models, after saved portraits. Maximum six combined references. No source bytes or paths.",
+            "description": "Ordered prior succeeded Forge PNG/JPEG/WebP image artifacts for supported image/video models, after saved portraits. Video accepts at most six combined references. No bytes or paths.",
             "items": {
               "type": "object",
               "additionalProperties": false,
@@ -15208,6 +15496,17 @@
                 }
               }
             }
+          },
+          "referenceAttachmentIds": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Ordered runtime-owned PNG/JPEG/WebP chat attachment IDs. Requires trusted runtime agent/session context; operator HTTP calls without that context fail closed. No bytes or arbitrary paths. Snapshotted with hashes before dispatch."
           }
         },
         "required": [
@@ -15291,7 +15590,22 @@
               },
               "maxImages": {
                 "type": "integer",
-                "description": "Combined saved portraits and artifact reference limit."
+                "description": "Combined reference image limit when advertised."
+              }
+            }
+          },
+          "referenceAttachments": {
+            "type": "object",
+            "required": [
+              "available"
+            ],
+            "properties": {
+              "available": {
+                "type": "boolean"
+              },
+              "maxImages": {
+                "type": "integer",
+                "description": "Combined reference image limit when advertised."
               }
             }
           }
@@ -15322,20 +15636,19 @@
           },
           "sourceAttachments": {
             "type": "object",
-            "properties": {
-              "available": {
-                "const": false,
-                "type": "boolean"
-              },
-              "reason": {
-                "type": "string"
-              }
-            },
             "required": [
               "available",
-              "reason"
+              "field"
             ],
-            "additionalProperties": false
+            "properties": {
+              "available": {
+                "type": "boolean"
+              },
+              "field": {
+                "type": "string",
+                "const": "referenceAttachmentIds"
+              }
+            }
           },
           "video": {
             "type": "object",
@@ -16690,6 +17003,26 @@
           "enabled": {
             "type": "boolean",
             "default": true
+          },
+          "conclusions": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "success",
+                "failure",
+                "neutral",
+                "cancelled",
+                "skipped",
+                "timed_out",
+                "action_required",
+                "startup_failure",
+                "stale"
+              ]
+            },
+            "description": "Matching conclusions. New and migrated watches default to failure, timed_out, startup_failure and action_required; omitted on update preserves the existing selection. Cancelled and stale are excluded by default."
           }
         }
       },
@@ -16704,7 +17037,8 @@
           "instruction",
           "enabled",
           "createdAt",
-          "updatedAt"
+          "updatedAt",
+          "conclusions"
         ],
         "properties": {
           "id": {
@@ -16736,6 +17070,26 @@
           "updatedAt": {
             "type": "string",
             "format": "date-time"
+          },
+          "conclusions": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": [
+                "success",
+                "failure",
+                "neutral",
+                "cancelled",
+                "skipped",
+                "timed_out",
+                "action_required",
+                "startup_failure",
+                "stale"
+              ]
+            },
+            "description": "Matching conclusions. New and migrated watches default to failure, timed_out, startup_failure and action_required; omitted on update preserves the existing selection. Cancelled and stale are excluded by default."
           }
         }
       },
@@ -18536,22 +18890,38 @@
       },
       "AgentMinionSettingsUpdate": {
         "type": "object",
-        "required": [
-          "maxDepth"
-        ],
         "properties": {
           "maxDepth": {
             "$ref": "#/components/schemas/MinionMaxDepth"
+          },
+          "defaultHarness": {
+            "$ref": "#/components/schemas/MinionDefaultHarness"
+          },
+          "codexModel": {
+            "$ref": "#/components/schemas/CodexMinionModelSelection"
           }
         },
         "additionalProperties": true,
-        "description": "The only supported minion setting is maxDepth. It is required even though the default for an unset agent is 1; unknown fields do not create additional settings."
+        "description": "Provide any nonempty subset of maxDepth, defaultHarness, codexModel. Omitted fields retain saved values. codexModel is a complete connection/model pair or null to clear; unknown top-level fields are ignored.",
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/AgentMinionDepthUpdate"
+          },
+          {
+            "$ref": "#/components/schemas/AgentMinionHarnessUpdate"
+          },
+          {
+            "$ref": "#/components/schemas/AgentMinionCodexModelUpdate"
+          }
+        ]
       },
       "AgentMinionSettingsResponse": {
         "type": "object",
         "required": [
           "ok",
-          "maxDepth"
+          "maxDepth",
+          "defaultHarness",
+          "codexModel"
         ],
         "properties": {
           "ok": {
@@ -18560,6 +18930,12 @@
           },
           "maxDepth": {
             "$ref": "#/components/schemas/MinionMaxDepth"
+          },
+          "defaultHarness": {
+            "$ref": "#/components/schemas/MinionDefaultHarness"
+          },
+          "codexModel": {
+            "$ref": "#/components/schemas/CodexMinionModelSelection"
           }
         },
         "additionalProperties": false
@@ -18656,6 +19032,14 @@
               "null"
             ],
             "additionalProperties": true
+          },
+          "harness": {
+            "type": "string",
+            "enum": [
+              "burrow",
+              "codex"
+            ],
+            "description": "Actual spawn-time child harness; legacy children default to burrow. Root chats use burrow."
           }
         },
         "additionalProperties": true
@@ -18752,6 +19136,14 @@
               "null"
             ],
             "additionalProperties": true
+          },
+          "harness": {
+            "type": "string",
+            "enum": [
+              "burrow",
+              "codex"
+            ],
+            "description": "Actual spawn-time child harness; legacy children default to burrow. Root chats use burrow."
           }
         },
         "additionalProperties": true
@@ -19144,7 +19536,7 @@
           "sessionId": {
             "type": "string",
             "default": "default",
-            "description": "Task jobs always use the assigned agent\u2019s default session; prompt jobs retain their selected session."
+            "description": "Task jobs always use the assigned agent’s default session; prompt jobs retain their selected session."
           },
           "enabled": {
             "type": "boolean"
@@ -19189,7 +19581,7 @@
           "extraInstructions": {
             "type": "string",
             "default": "",
-            "description": "Optional additional task instructions; task execution reuses the task\u2019s existing instructions and appends only these extras, never a replacement prompt."
+            "description": "Optional additional task instructions; task execution reuses the task’s existing instructions and appends only these extras, never a replacement prompt."
           },
           "scheduleKind": {
             "type": "string",
@@ -19339,7 +19731,7 @@
           },
           "sessionId": {
             "type": "string",
-            "description": "Task jobs always use the assigned agent\u2019s default session; prompt jobs retain their selected session."
+            "description": "Task jobs always use the assigned agent’s default session; prompt jobs retain their selected session."
           },
           "enabled": {
             "type": "boolean"
@@ -19381,7 +19773,7 @@
           },
           "extraInstructions": {
             "type": "string",
-            "description": "Optional additional task instructions; task execution reuses the task\u2019s existing instructions and appends only these extras, never a replacement prompt."
+            "description": "Optional additional task instructions; task execution reuses the task’s existing instructions and appends only these extras, never a replacement prompt."
           },
           "scheduleKind": {
             "type": "string",
@@ -19817,6 +20209,186 @@
             "default": false
           }
         }
+      },
+      "ForgeGalleryFolder": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "parentId",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parentId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ForgeGalleryImage": {
+        "type": "object",
+        "required": [
+          "jobId",
+          "artifactId",
+          "folderId",
+          "createdAt",
+          "artifact"
+        ],
+        "properties": {
+          "jobId": {
+            "type": "string"
+          },
+          "artifactId": {
+            "type": "string"
+          },
+          "folderId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "artifact": {
+            "$ref": "#/components/schemas/ForgeArtifact"
+          }
+        }
+      },
+      "ForgeGallery": {
+        "type": "object",
+        "required": [
+          "ok",
+          "folders",
+          "images"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "folders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ForgeGalleryFolder"
+            }
+          },
+          "images": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ForgeGalleryImage"
+            }
+          }
+        }
+      },
+      "MinionDefaultHarness": {
+        "type": "string",
+        "enum": [
+          "burrow",
+          "codex"
+        ],
+        "default": "burrow",
+        "description": "Default harness for new minions. Legacy or unset settings use burrow."
+      },
+      "AgentMinionDepthUpdate": {
+        "type": "object",
+        "required": [
+          "maxDepth"
+        ],
+        "properties": {
+          "maxDepth": {
+            "$ref": "#/components/schemas/MinionMaxDepth"
+          },
+          "defaultHarness": {
+            "$ref": "#/components/schemas/MinionDefaultHarness"
+          },
+          "codexModel": {
+            "$ref": "#/components/schemas/CodexMinionModelSelection"
+          }
+        },
+        "additionalProperties": true
+      },
+      "AgentMinionHarnessUpdate": {
+        "type": "object",
+        "required": [
+          "defaultHarness"
+        ],
+        "properties": {
+          "maxDepth": {
+            "$ref": "#/components/schemas/MinionMaxDepth"
+          },
+          "defaultHarness": {
+            "$ref": "#/components/schemas/MinionDefaultHarness"
+          },
+          "codexModel": {
+            "$ref": "#/components/schemas/CodexMinionModelSelection"
+          }
+        },
+        "additionalProperties": true
+      },
+      "CodexMinionModelSelection": {
+        "description": "Complete direct OpenAI OAuth connection and enabled model pair. Null clears the independent per-agent Codex selection; no parent/Burrow/LB fallback.",
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/CodexMinionModelPair"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "AgentMinionCodexModelUpdate": {
+        "type": "object",
+        "required": [
+          "codexModel"
+        ],
+        "properties": {
+          "maxDepth": {
+            "$ref": "#/components/schemas/MinionMaxDepth"
+          },
+          "defaultHarness": {
+            "$ref": "#/components/schemas/MinionDefaultHarness"
+          },
+          "codexModel": {
+            "$ref": "#/components/schemas/CodexMinionModelSelection"
+          }
+        },
+        "additionalProperties": true
+      },
+      "CodexMinionModelPair": {
+        "type": "object",
+        "required": [
+          "connectionId",
+          "model"
+        ],
+        "properties": {
+          "connectionId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
       }
     },
     "securitySchemes": {

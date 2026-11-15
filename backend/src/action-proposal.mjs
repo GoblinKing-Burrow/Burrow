@@ -111,6 +111,7 @@ function normalizeAction(action, index) {
     task: action?.task || action?.purpose ? String(action.task || action.purpose) : null,
     label: action?.label ? String(action.label).trim().slice(0, 80) : null,
     model: action?.model || action?.modelId ? String(action.model || action.modelId).trim() : null,
+    harness: action?.harness ?? null,
     modelProfile: action?.modelProfile ? String(action.modelProfile).trim() : null,
     target: action?.target && typeof action.target === 'object' && !Array.isArray(action.target) ? action.target : null,
     includeDisabled: action?.includeDisabled === undefined ? false : action.includeDisabled,
@@ -135,6 +136,7 @@ function normalizeAction(action, index) {
     useAgentReferenceImage: action?.useAgentReferenceImage,
     useOperatorReferenceImage: action?.useOperatorReferenceImage,
     referenceAgentIds: action?.referenceAgentIds,
+    referenceAttachmentIds: action?.referenceAttachmentIds,
     referenceArtifacts: action?.referenceArtifacts,
     // Preserve typed options (including invalid values) for store-owned validation.
     imageOptions: action?.imageOptions,
@@ -200,6 +202,7 @@ function normalizeAction(action, index) {
   if (tool === 'files_write' && normalized.content === null) errors.push('content_required');
   if (tool === 'files_patch' && !normalized.patch) errors.push('patch_required');
   if (tool === 'spawn_subagent') {
+    if (normalized.harness !== null && !['burrow', 'codex'].includes(normalized.harness)) errors.push('harness_invalid');
     if (!normalized.task) errors.push('task_required');
     normalized.target = normalizeSpawnTarget(action?.target, errors);
   }
@@ -467,6 +470,7 @@ export function nativeToolSchemas({ includeSpawnSubagent = true, includeForge = 
           additionalProperties: false,
           properties: {
             task: { type: 'string' },
+            harness: { type: 'string', enum: ['burrow', 'codex'], description: 'Optional child execution harness. Omit to use the agent minion default.' },
             label: { type: 'string', description: 'Optional short display label for the child in the agent tree (maximum 80 characters). Keep the full instruction in task.' },
             model: { type: 'string', description: 'Optional exact enabled configured model id for this child only. Omit to inherit the parent model.' },
             target: {
@@ -548,7 +552,7 @@ export function actionFromNativeToolCall(call = {}, index = 0) {
   if (tool === 'agents_list') return normalizeNative({ tool, reason: args.reason, query: args.query, includeDisabled: args.includeDisabled, cursor: args.cursor, limit: args.limit });
   if (tool === 'agent_send_message') return normalizeNative({ tool, reason: args.reason, recipientAgentId: args.recipientAgentId, targetSessionId: args.targetSessionId, messageMode: args.messageMode, content: args.content });
   if (tool === 'forge_catalog' || tool === 'forge_list_jobs') return normalizeNative({ tool, reason: args.reason });
-  if (tool === 'forge_create_job') return normalizeNative({ tool, reason: args.reason, mode: args.mode, connectionId: args.connectionId, modelId: args.modelId, prompt: args.prompt, idempotencyKey: args.idempotencyKey, useAgentReferenceImage: args.useAgentReferenceImage, useOperatorReferenceImage: args.useOperatorReferenceImage, referenceAgentIds: args.referenceAgentIds, referenceArtifacts: args.referenceArtifacts, imageOptions: args.imageOptions });
+  if (tool === 'forge_create_job') return normalizeNative({ tool, reason: args.reason, mode: args.mode, connectionId: args.connectionId, modelId: args.modelId, prompt: args.prompt, idempotencyKey: args.idempotencyKey, useAgentReferenceImage: args.useAgentReferenceImage, useOperatorReferenceImage: args.useOperatorReferenceImage, referenceAgentIds: args.referenceAgentIds, referenceAttachmentIds: args.referenceAttachmentIds, referenceArtifacts: args.referenceArtifacts, imageOptions: args.imageOptions });
   if (tool === 'forge_inspect_job') return normalizeNative({ tool, reason: args.reason, jobId: args.jobId });
   if (tool === 'forge_attach_artifact') return normalizeNative({ tool, reason: args.reason, jobId: args.jobId, artifactId: args.artifactId });
   if (tool === 'mcp_providers') return normalizeNative({ tool, reason: args.reason });
@@ -556,7 +560,7 @@ export function actionFromNativeToolCall(call = {}, index = 0) {
   if (tool === 'mcp_call') return normalizeNative({ tool, reason: args.reason, provider: args.provider, mcpToolName: args.mcpToolName, mcpArguments: args.mcpArguments });
   if (tool === 'list_skills') return normalizeNative({ tool, reason: args.reason });
   if (tool === 'load_skill') return normalizeNative({ tool, reason: args.reason, skillId: args.skillId });
-  if (tool === 'spawn_subagent') return normalizeNative({ tool, reason: args.reason, task: args.task, label: args.label, model: args.model || args.modelId, modelProfile: args.modelProfile, target: args.target });
+  if (tool === 'spawn_subagent') return normalizeNative({ tool, reason: args.reason, task: args.task, label: args.label, harness: args.harness, model: args.model || args.modelId, modelProfile: args.modelProfile, target: args.target });
   const normalized = normalizeNative({ tool, reason: args.reason });
   if (Object.keys(args).some((key) => key !== 'reason')) normalized.errors.push('tool_arguments_unmapped');
   return normalized;
