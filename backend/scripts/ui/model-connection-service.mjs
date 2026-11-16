@@ -7,7 +7,8 @@ import {
   normalizeModels,
   providerPoolModels,
 } from '../../src/model-settings-store.mjs';
-import { readMinionSettings, saveMinionSettings } from '../../src/minion-depth.mjs';
+import { readMinionSettings, readMinionSettingsState, saveMinionSettings } from '../../src/minion-depth.mjs';
+import { listMinionProfiles as listProfiles, createMinionProfile as createProfile, updateMinionProfile as updateProfile, minionProfileAction as minionProfileActionText } from '../../src/minion-profiles.mjs';
 import { CODEX_SELECTION_ACTIONS } from '../../src/codex-model-selection.mjs';
 import {
   claudeCredentialAuthPayload,
@@ -55,6 +56,7 @@ export function mergeDiscoveredModels(discovered = [], existing = [], normalize 
 export function createModelConnectionService({
   modelsStore,
   metadataStore,
+  agentsStore = null,
   resolveAgentRuntime,
   logger,
   runtimeRoot = null,
@@ -273,19 +275,56 @@ export function createModelConnectionService({
 
   async function agentMinionSettings(agentId) {
     const runtime = await resolveAgentRuntime(agentId);
-    return { ok: true, ...await readMinionSettingsImpl(metadataStore(), runtime.agentId) };
+    return { ok: true, ...await readMinionSettingsState(metadataStore(), runtime.agentId) };
   }
 
   async function saveAgentMinionSettings(agentId, body = {}) {
     const runtime = await resolveAgentRuntime(agentId);
     try {
-      return { ok: true, ...await saveMinionSettingsImpl(metadataStore(), runtime.agentId, body, { models: modelsStore() }) };
+      await saveMinionSettingsImpl(metadataStore(), runtime.agentId, body, { models: modelsStore() });
+      return { ok: true, ...await readMinionSettingsState(metadataStore(), runtime.agentId) };
     } catch (error) {
       if (error?.statusCode === 400 && CODEX_SELECTION_ACTIONS[error.message]) {
         return { ok: false, status: 400, error: error.message, message: CODEX_SELECTION_ACTIONS[error.message] };
       }
       throw error;
     }
+  }
+
+  async function globalMinionSettings() {
+    return { ok: true, ...await readMinionSettingsState(metadataStore()) };
+  }
+  async function saveGlobalMinionSettings(body = {}) {
+    return { ok: true, ...await saveMinionSettingsImpl(metadataStore(), null, body, { models: modelsStore() }) };
+  }
+
+  // agentId supplies migration/default context only; the roster is global.
+  async function minionProfileAgentId(agentId) {
+    const selected = (await resolveAgentRuntime(agentId)).agentId;
+    const registry = typeof agentsStore === 'function' ? agentsStore() : agentsStore;
+    if (registry?.list) {
+      for (const agent of await registry.list({ includeDisabled: true })) {
+        await listProfiles(metadataStore(), agent.id, { agentName: agent.name || agent.id });
+      }
+    }
+    return agentId ? selected : null;
+  }
+  async function minionProfileResult(run) {
+    try { return await run(); }
+    catch (error) {
+      const message = String(error?.message || error);
+      const action = minionProfileActionText(message) || CODEX_SELECTION_ACTIONS[message] || null;
+      return { ok: false, status: error?.statusCode || 400, error: message, ...(action ? { message: action } : {}) };
+    }
+  }
+  async function minionProfiles(agentId = null) {
+    return minionProfileResult(async () => listProfiles(metadataStore(), await minionProfileAgentId(agentId)));
+  }
+  async function createMinionProfile(body = {}, agentId = null) {
+    return minionProfileResult(async () => createProfile(metadataStore(), await minionProfileAgentId(agentId), body, { models: modelsStore() }));
+  }
+  async function updateMinionProfile(id, body = {}, agentId = null) {
+    return minionProfileResult(async () => updateProfile(metadataStore(), await minionProfileAgentId(agentId), id, body, { models: modelsStore() }));
   }
 
   async function chatIdentities() { return { ok: true, ...await modelsStore().identities() }; }
@@ -390,8 +429,13 @@ export function createModelConnectionService({
     saveAgentModelSelection,
     agentMinionModelSelection,
     saveAgentMinionModelSelection,
+    globalMinionSettings,
+    saveGlobalMinionSettings,
     agentMinionSettings,
     saveAgentMinionSettings,
+    minionProfiles,
+    createMinionProfile,
+    updateMinionProfile,
     chatIdentities,
     saveChatIdentity,
     discoverModelConnection,

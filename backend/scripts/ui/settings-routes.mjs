@@ -1,6 +1,6 @@
 import { classifyModelFailure } from '../../src/model-failure.mjs';
 
-export function createSettingsRoutes({ globalProfileDocuments, timezoneSettings, saveTimezoneSettings, readJsonBody, sendJson, modelConnections, claudeCliCredentialStatus, importClaudeCliCredential, startOpenAiOAuthLoginApi, openAiOAuthLoginStatus, submitOpenAiOAuthLoginApi, cancelOpenAiOAuthLoginApi, startClaudeCodeLoginApi, claudeCodeLoginStatus, submitClaudeCodeLoginApi, cancelClaudeCodeLoginApi, importClaudeCodeLoginApi, mcpConnections, discoverMcpConnection, diagnoseMcpConnection, saveMcpConnection, removeMcpConnection, agentMcpTools, saveAgentMcpTools, agentModelSelection, saveAgentModelSelection, agentMinionModelSelection, saveAgentMinionModelSelection, agentMinionSettings, saveAgentMinionSettings, archiveSummaryModelSelection, saveArchiveSummaryModelSelection, discoverModelConnection, saveModelConnection, removeModelConnection, setupStatus, completeSetup, completeSetupOperation, listSkills, createSkill, getSkill, updateSkill, deleteSkill, agentSkills, saveAgentSkills } = {}) {
+export function createSettingsRoutes({ globalProfileDocuments, timezoneSettings, saveTimezoneSettings, readJsonBody, sendJson, modelConnections, claudeCliCredentialStatus, importClaudeCliCredential, startOpenAiOAuthLoginApi, openAiOAuthLoginStatus, submitOpenAiOAuthLoginApi, cancelOpenAiOAuthLoginApi, startClaudeCodeLoginApi, claudeCodeLoginStatus, submitClaudeCodeLoginApi, cancelClaudeCodeLoginApi, importClaudeCodeLoginApi, mcpConnections, discoverMcpConnection, diagnoseMcpConnection, saveMcpConnection, removeMcpConnection, agentMcpTools, saveAgentMcpTools, agentModelSelection, saveAgentModelSelection, agentMinionModelSelection, saveAgentMinionModelSelection, agentMinionSettings, saveAgentMinionSettings, globalMinionSettings, saveGlobalMinionSettings, minionProfiles, createMinionProfile, updateMinionProfile, archiveSummaryModelSelection, saveArchiveSummaryModelSelection, discoverModelConnection, saveModelConnection, removeModelConnection, setupStatus, completeSetup, completeSetupOperation, listSkills, createSkill, getSkill, updateSkill, deleteSkill, agentSkills, saveAgentSkills } = {}) {
   const resultResponse = (res, result, success = 200) => {
     sendJson(res, result.ok ? success : (result.status || 500), result);
     return true;
@@ -55,6 +55,16 @@ export function createSettingsRoutes({ globalProfileDocuments, timezoneSettings,
       if (req.method === 'POST' && action === 'import') return resultResponse(res, await importClaudeCodeLoginApi(id, await readJsonBody(req)));
     }
     if (req.method === 'GET' && url.pathname === '/api/settings/mcp-connections') { sendJson(res, 200, await mcpConnections()); return true; }
+    // Shared specialists; optional agentId requests effective overrides.
+    if (url.pathname === '/api/settings/minions') {
+      const agentId = url.searchParams.get('agentId');
+      if (req.method === 'GET') return resultResponse(res, await invoke(async () => minionProfiles(agentId)));
+      if (req.method === 'POST') return resultResponse(res, await invoke(async () => createMinionProfile(await readJsonBody(req), agentId)), 201);
+    }
+    if (/^\/api\/settings\/minions\/[^/]+$/.test(url.pathname) && req.method === 'PUT') {
+      const id = decodeURIComponent(url.pathname.slice('/api/settings/minions/'.length));
+      return resultResponse(res, await invoke(async () => updateMinionProfile(id, await readJsonBody(req), url.searchParams.get('agentId'))));
+    }
     if (req.method === 'POST' && url.pathname === '/api/settings/mcp-connections/discover') return resultResponse(res, await discoverMcpConnection(await readJsonBody(req)));
     if (req.method === 'POST' && url.pathname === '/api/settings/mcp-connections/diagnose') return resultResponse(res, await diagnoseMcpConnection(await readJsonBody(req)));
     if (req.method === 'POST' && url.pathname === '/api/settings/mcp-connections') return resultResponse(res, await saveMcpConnection(await readJsonBody(req)));
@@ -68,6 +78,10 @@ export function createSettingsRoutes({ globalProfileDocuments, timezoneSettings,
       const agentId = decodeURIComponent(url.pathname.slice('/api/agents/'.length, -'/archive-summary-model-selection'.length));
       if (req.method === 'GET') { sendJson(res, 200, await archiveSummaryModelSelection(agentId)); return true; }
       if (req.method === 'PUT') return resultResponse(res, await saveArchiveSummaryModelSelection(agentId, await readJsonBody(req)));
+    }
+    if (url.pathname === '/api/settings/minion-settings') {
+      if (req.method === 'GET') return resultResponse(res, await invoke(() => globalMinionSettings()));
+      if (req.method === 'PUT') return resultResponse(res, await invoke(async () => saveGlobalMinionSettings(await readJsonBody(req))));
     }
     if (/^\/api\/agents\/[^/]+\/minion-settings$/.test(url.pathname)) {
       const agentId = decodeURIComponent(url.pathname.slice('/api/agents/'.length, -'/minion-settings'.length));

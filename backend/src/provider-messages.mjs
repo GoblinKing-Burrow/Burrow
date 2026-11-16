@@ -52,7 +52,10 @@ export function normalizeProviderMessage(message = {}) {
   const normalized = { role, content: normalizedContent };
   if (message?.metadata?.providerMessageSource) {
     Object.defineProperty(normalized, 'metadata', {
-      value: { providerMessageSource: String(message.metadata.providerMessageSource) },
+      value: {
+        providerMessageSource: String(message.metadata.providerMessageSource),
+        ...(message.metadata.providerSpeaker ? { providerSpeaker: String(message.metadata.providerSpeaker) } : {}),
+      },
       enumerable: false,
     });
   }
@@ -293,9 +296,21 @@ export function conversationProviderMessages({ priorSummary = '', recentMessages
       const snapshot = message?.metadata?.providerTurn;
       if (snapshot?.version === 1 && Array.isArray(snapshot.messages)
           && !(message?.role === 'agent' && ['outbound', 'inbound'].includes(message?.metadata?.direction))) {
-        return historicalProviderTurnMessages(snapshot).map((entry) => ({ ...entry, metadata: {
-          providerMessageSource: 'historical-user-turn',
-        } }));
+        return historicalProviderTurnMessages(snapshot).map((entry) => {
+          // Only the actual current-task message in the captured provider turn
+          // gets an operator label. Support snapshots are filtered above and
+          // historical text is never reclassified by inspecting its contents.
+          const isOperatorTask = entry?.metadata?.providerMessageSource === 'current-task'
+            && entry.role === 'user'
+            && (entry.metadata?.providerSpeaker === 'operator' || (!entry.metadata?.providerSpeaker && message.role === 'user'));
+          const labeled = isOperatorTask ? {
+            ...entry,
+            content: Array.isArray(entry.content)
+              ? (entry.metadata?.providerSpeaker === 'operator' ? entry.content : [{ type: 'text', text: '[Operator message]:' }, ...entry.content])
+              : (entry.metadata?.providerSpeaker === 'operator' ? entry.content : `[Operator message]:\n${String(entry.content || '')}`),
+          } : entry;
+          return { ...labeled, metadata: { providerMessageSource: 'historical-user-turn' } };
+        });
       }
       return [message];
     }),

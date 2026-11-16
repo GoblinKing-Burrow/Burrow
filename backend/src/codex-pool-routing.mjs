@@ -1,5 +1,7 @@
+import { claudeDirectEligible, claudePoolEligible } from './claude-model-selection.mjs';
 import { ProviderPoolEngine } from './provider-pool-engine.mjs';
 import { createProviderUsageService } from './provider-usage-service.mjs';
+import { geminiDirectEligible } from './gemini-model-selection.mjs';
 
 export const codexDirectEligible = connection => Boolean(connection
   && connection.enabled !== false
@@ -22,13 +24,16 @@ export async function codexPoolSnapshot(store, connectionId, model) {
 
 // Configuration eligibility deliberately ignores transient usage/cooldown state.
 export function withCodexEligibility(connections) {
-  return connections.map(connection => ({ ...connection, codexEligible: codexDirectEligible(connection)
+  return connections.map(connection => ({ ...connection,
+    claudeEligible: claudeDirectEligible(connection) || claudePoolEligible(connection, connections),
+    codexEligible: codexDirectEligible(connection)
     || Boolean(connection.apiType === 'openai-lb' && connection.enabled !== false && connection.pool?.enabled
       && (connection.pool.memberConnectionIds || []).some(id => {
         const member = connections.find(item => item.id === id);
         return codexDirectEligible(member) && (member.models || []).some(model => model.selected !== false
           && codexSupportsModel(connection, model.id));
-      })) }));
+      })),
+    geminiEligible: geminiDirectEligible(connection) }));
 }
 
 export async function createCodexPoolRouting(store, connectionId, model, context) {

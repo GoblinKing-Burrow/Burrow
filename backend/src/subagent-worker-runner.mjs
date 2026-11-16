@@ -1,4 +1,6 @@
 import { runCodexMinion } from './codex-minion-runner.mjs';
+import { runClaudeMinion } from './claude-minion-runner.mjs';
+import { runGeminiMinion } from './gemini-minion-runner.mjs';
 import { compactSubagentEvidence, evidenceDeliveryCounts } from './subagent-evidence.mjs';
 import { CHAT_RESULT_VERSION, chatResultMetadata } from './chat-result-metadata.mjs';
 import { canSpawnMinion, nextMinionDepth, normalizeMinionDepth } from './minion-depth.mjs';
@@ -88,9 +90,9 @@ function subagentFinishToolSchema() {
   };
 }
 
-function subagentToolSchemas({ includeFinish = true, minionDepth = { depth: 1 } } = {}) {
+function subagentToolSchemas({ includeFinish = true, minionDepth = { depth: 1 }, minionProfiles = [] } = {}) {
   // Isolated child processes do not own the server Forge dispatcher.
-  const tools = nativeToolSchemas({ includeForge: false, includeSpawnSubagent: canSpawnMinion(minionDepth) });
+  const tools = nativeToolSchemas({ includeForge: false, includeSpawnSubagent: canSpawnMinion(minionDepth), minionProfiles });
   return includeFinish ? [...tools, subagentFinishToolSchema()] : tools;
 }
 
@@ -159,6 +161,7 @@ async function runSubagentToolCalls({ toolCalls = [], target, dataRoot, childSes
   const executionContext = createExecutionContext({
     conversationStore: parentExecutionContext?.conversationStore || parentExecutionContext?.stores?.conversations,
     stores: parentExecutionContext?.stores,
+    executionProviders: parentExecutionContext?.executionProviders,
     minionDepth: parentExecutionContext?.minionDepth,
     agentId: parentExecutionContext?.agentId,
     executionBoundaries: parentExecutionContext?.executionBoundaries || null,
@@ -459,6 +462,7 @@ export async function runSpawnSubagentChild(options = {}) {
     // Execution-context dependencies are deliberately non-enumerable.
     conversationStore: parentExecutionContext?.conversationStore,
     stores: parentExecutionContext?.stores,
+    executionProviders: parentExecutionContext?.executionProviders,
     telemetry,
     abortSignal: signal,
     parentRunId: id,
@@ -469,6 +473,10 @@ export async function runSpawnSubagentChild(options = {}) {
     signal?.throwIfAborted();
     result = options.harness === 'codex'
       ? await runCodexMinion({ ...options, parentExecutionContext: childExecutionContext, signal })
+      : options.harness === 'claude'
+      ? await runClaudeMinion({ ...options, parentExecutionContext: childExecutionContext, signal })
+      : options.harness === 'gemini'
+      ? await runGeminiMinion({ ...options, parentExecutionContext: childExecutionContext, signal })
       : await runRegisteredSpawnSubagentChild({ ...options, parentExecutionContext: childExecutionContext, signal });
     return result;
   } catch (error) {
@@ -636,10 +644,11 @@ async function runRegisteredSpawnSubagentChild({
       provenance: { source: 'spawn-subagent-child', reason: cancelled ? 'model_cancelled' : reason } });
     return result;
   };
+  const minionProfiles = [];
   const messages = normalizeProviderMessages([{ role: 'system', content: 'Internal subagent task. This isolated child request is not parent conversation history.' }, { role: 'user', content: prompt }]);
   await progress?.({ type: 'subagent-progress', phase: 'model-request', id });
   await recordLiveActivity({ kind: 'model', phase: 'model-request', label: 'Waiting for model response', model: modelConfig?.model || null }, 'model_request');
-  const first = await callModel('complete', { sessionId: childSessionId, messages, tools: subagentToolSchemas({ minionDepth: parentExecutionContext.minionDepth }), traceLogger: modelTrace, signal });
+  const first = await callModel('complete', { sessionId: childSessionId, messages, tools: subagentToolSchemas({ minionDepth: parentExecutionContext.minionDepth, minionProfiles }), traceLogger: modelTrace, signal });
   if (!first.cancelled && !signal?.aborted) await progress?.({ type: 'subagent-progress', phase: 'model-response', id });
   await recordLiveActivity({ kind: 'model', phase: 'model-response', label: first.ok ? 'Model response received' : 'Model response failed', status: first.ok ? 'completed' : 'error', model: modelConfig?.model || null, error: first.ok ? null : (first.error || first.status) }, first.ok ? 'model_response' : 'model_error');
   if (first.ok) signal?.throwIfAborted();
@@ -694,7 +703,7 @@ async function runRegisteredSpawnSubagentChild({
     const nativeContinuation = Boolean(current.choice?.toolCalls?.length && typeof adapter.continueWithToolResults === 'function');
     await progress?.({ type: 'subagent-progress', phase: 'model-request', id });
     await recordLiveActivity({ kind: 'model', phase: 'model-request', label: 'Waiting for model continuation', model: modelConfig?.model || null }, 'model_request');
-    const continuationTools = subagentToolSchemas({ minionDepth: parentExecutionContext.minionDepth });
+    const continuationTools = subagentToolSchemas({ minionDepth: parentExecutionContext.minionDepth, minionProfiles });
     let next;
     try {
       const compatibilityMessages = nativeContinuation ? null : normalizeProviderMessages([

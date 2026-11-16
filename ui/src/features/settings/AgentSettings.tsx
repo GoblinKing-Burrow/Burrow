@@ -1,8 +1,5 @@
-import { MinionTypeSettings } from './MinionTypeSettings';
-import { DefaultMinionModel } from './DefaultMinionModel';
-import { MinionDepthSettings } from './MinionDepthSettings';
+import { MinionSettings } from './MinionSettings';
 import type { Agent, SavedProvider } from '../../app/types';
-import { SettingSection } from './SettingsPrimitives';
 import { AgentDetails } from './AgentDetails';
 import { AgentMcpTools } from './AgentMcpTools';
 import { AgentProfileDocuments } from './AgentProfileDocuments';
@@ -15,6 +12,7 @@ export type AgentSettingsProps = {
   savedProviders: SavedProvider[];
   onAgentsChanged: () => Promise<void>;
   section?:
+    | 'minions'
     | 'details'
     | 'profile-documents'
     | 'mcp-tools'
@@ -42,30 +40,14 @@ export function AgentSettings({
     />
   );
   const minion = (
-    <SettingSection title="Minion settings">
-      <MinionTypeSettings
-        key={JSON.stringify([selected.id, resourceId, 'type'])}
-        resourceId={resourceId}
-      >
-        <DefaultMinionModel
-          key={JSON.stringify([selected.id, resourceId, 'model'])}
-          resourceId={resourceId}
-          savedProviders={savedProviders}
-        />
-      </MinionTypeSettings>
-      <MinionDepthSettings
-        key={JSON.stringify([selected.id, resourceId, 'depth'])}
-        resourceId={resourceId}
-      />
-    </SettingSection>
+    <MinionSettings
+      key={JSON.stringify([selected.id, resourceId])}
+      agentId={resourceId}
+      overflowTarget={overflowTarget}
+    />
   );
-  if (section === 'details')
-    return (
-      <>
-        {details}
-        {minion}
-      </>
-    );
+  if (section === 'minions') return minion;
+  if (section === 'details') return details;
   if (section === 'profile-documents')
     return <AgentProfileDocuments agentId={selected.id} overflowTarget={overflowTarget} />;
   if (section === 'mcp-tools') return <AgentMcpTools agentId={selected.id} />;

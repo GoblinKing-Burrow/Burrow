@@ -6,12 +6,17 @@
   },
   "claude-code": {
     "packageName": "@anthropic-ai/claude-code",
-    "version": "2.1.283",
+    "version": "latest",
     "executable": "claude"
   },
   "codex": {
     "packageName": "@openai/codex",
     "version": "latest",
     "executable": "codex"
+  },
+  "gemini-cli": {
+    "packageName": "@google/gemini-cli",
+    "version": "latest",
+    "executable": "gemini"
   }
 }

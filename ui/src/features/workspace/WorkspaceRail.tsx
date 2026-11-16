@@ -463,8 +463,14 @@ function MinionList({
                 <span className="subagent-copy">
                   <b title={minion.name}>{minion.name}</b>
                   <small>
-                    {minion.harness === 'codex' ? 'Codex Minion' : 'Burrow Minion'} ·{' '}
-                    {minion.retained ? 'Last seen · ' : ''}
+                    {minion.harness === 'codex'
+                      ? 'Codex Minion'
+                      : minion.harness === 'claude'
+                        ? 'Claude Minion'
+                        : minion.harness === 'gemini'
+                          ? 'Gemini Minion'
+                          : 'Burrow Minion'}{' '}
+                    · {minion.retained ? 'Last seen · ' : ''}
                     {minion.activity}
                   </small>
                 </span>

@@ -129,13 +129,36 @@ function normalizeSpawnRequest(spawnRequest = null) {
     parentConversationId: compactString(spawnRequest.parentConversationId) || null,
     parentRunId: compactString(spawnRequest.parentRunId) || null,
     targetRoot: compactString(spawnRequest.targetRoot) || null,
-    harness: spawnRequest.harness === 'codex' ? 'codex' : 'burrow',
+    harness: ['codex','claude','gemini'].includes(spawnRequest.harness) ? spawnRequest.harness : 'burrow',
     capability: compactString(spawnRequest.capability) || null,
     model: compactString(spawnRequest.model) || null,
     resolvedModel: compactString(spawnRequest.resolvedModel) || null,
     resolvedConnectionId: compactString(spawnRequest.resolvedConnectionId) || null,
     modelProfile: compactString(spawnRequest.modelProfile) || null,
+    minionProfileId: compactString(spawnRequest.minionProfileId) || null,
+    executionHostId: compactString(spawnRequest.executionHostId) || null,
     task: compactString(spawnRequest.task) || null,
+  };
+}
+
+/**
+ * Immutable copy of the minion profile that governed this child. Editing or
+ * disabling the profile later must not rewrite what this run was told to be.
+ */
+function normalizeMinionProfileSnapshot(snapshot = null) {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return null;
+  const id = compactString(snapshot.id);
+  if (!id) return null;
+  const model = snapshot.model && typeof snapshot.model === 'object'
+    ? { connectionId: compactString(snapshot.model.connectionId) || null, model: compactString(snapshot.model.model) || null }
+    : null;
+  return {
+    id,
+    name: compactString(snapshot.name) || null,
+    harness: ['codex', 'claude', 'gemini'].includes(snapshot.harness) ? snapshot.harness : 'burrow',
+    model,
+    executionHostId: compactString(snapshot.executionHostId) || null,
+    instructions: typeof snapshot.instructions === 'string' ? snapshot.instructions : '',
   };
 }
 
@@ -226,6 +249,7 @@ export function createSubagentContract({
   trace = {},
   spawnRequest = null,
   model = null,
+  minionProfile = null,
   result = null,
   phase = null,
   activity = null,
@@ -238,7 +262,7 @@ export function createSubagentContract({
   const contract = {
     contractVersion: SUBAGENT_CONTRACT_VERSION,
     kind: SUBAGENT_KIND,
-    harness: harness === 'codex' ? 'codex' : 'burrow',
+    harness: ['codex','claude','gemini'].includes(harness) ? harness : 'burrow',
     id: subagentId(id),
     owner: normalizeOwner(owner),
     ...(minionDepth ? { minionDepth: normalizeMinionDepth(minionDepth) } : {}),
@@ -251,6 +275,7 @@ export function createSubagentContract({
     trace: normalizeTrace(trace),
     spawnRequest: normalizeSpawnRequest(spawnRequest),
     model: normalizeModelSelection(model),
+    minionProfile: normalizeMinionProfileSnapshot(minionProfile),
     result: normalizeResult(result),
     activity: normalizeActivity(activity),
     provenance: Array.isArray(provenance) ? provenance : [],

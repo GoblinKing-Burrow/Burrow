@@ -73,7 +73,7 @@ export type RuntimeAgent = {
   } | null;
 };
 
-export type MinionHarness = 'burrow' | 'codex';
+export type MinionHarness = 'burrow' | 'codex' | 'claude' | 'gemini';
 
 /** Runtime-owned lineage; a child keeps its spawn-time depth budget. */
 export type MinionAncestry = {
@@ -169,7 +169,11 @@ export type RuntimeModel = {
 };
 
 export type AnthropicUsageWindow = { key: string; usedPercent: number; resetAt?: string | null };
-export type AnthropicUsage = { windows: AnthropicUsageWindow[] };
+export type AnthropicFullResets = { availableCount: number; nearestExpiresAt: string | null };
+export type AnthropicUsage = {
+  windows: AnthropicUsageWindow[];
+  fullResets?: AnthropicFullResets | null;
+};
 export type OpenAiUsageWindow = {
   key: string;
   label: string;
@@ -217,6 +221,9 @@ export type ProviderPool = {
 
 export type ModelConnection = {
   codexEligible?: boolean;
+  claudeEligible?: boolean;
+  geminiEligible?: boolean;
+  enabled?: boolean;
   autoUseExpiringResets?: boolean;
   id: string;
   provider: string;

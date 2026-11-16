@@ -35,9 +35,35 @@ beforeEach(() => {
 describe('Default minion provider autosave', () => {
   function mountDetailsWithOverflow() {
     vi.mocked(api).mockImplementation(async (path) =>
-      String(path).endsWith('/minion-settings')
-        ? { ok: true, maxDepth: 1 }
-        : { ok: true, selection: null },
+      String(path).startsWith('/api/settings/minions?')
+        ? { ok: true, profiles: [] }
+        : String(path).includes('model-connections')
+          ? { connections: [] }
+          : {
+              ok: true,
+              maxDepth: 1,
+              defaultHarness: 'burrow',
+              codexModel: null,
+              claudeModel: null,
+              geminiModel: null,
+              burrowModel: null,
+              codexEnabled: false,
+              claudeEnabled: false,
+              geminiEnabled: false,
+              overrideEnabled: true,
+              profileOverrides: {},
+              effective: {
+                maxDepth: 1,
+                defaultHarness: 'burrow',
+                codexModel: null,
+                claudeModel: null,
+                geminiModel: null,
+                burrowModel: null,
+                codexEnabled: false,
+                claudeEnabled: false,
+                geminiEnabled: false,
+              },
+            },
     );
     const overflow = document.createElement('div');
     document.body.append(overflow);
@@ -62,7 +88,7 @@ describe('Default minion provider autosave', () => {
           selected={agent}
           savedProviders={providers}
           onAgentsChanged={vi.fn()}
-          section="details"
+          section="minions"
           overflowTarget={overflow}
         />
       </ConfirmProvider>,
@@ -70,30 +96,29 @@ describe('Default minion provider autosave', () => {
     return { ...rendered, overflow };
   }
 
-  it('loads minion controls once using encoded resource identity without a normal Save button', async () => {
+  it('loads simple defaults once using encoded resource identity', async () => {
     const { unmount, overflow } = mountDetailsWithOverflow();
     try {
-      await ready();
-      expect(screen.getAllByLabelText('Default minion provider')).toHaveLength(1);
+      await screen.findByLabelText('Burrow provider');
+      expect(screen.getAllByLabelText('Burrow provider')).toHaveLength(1);
       expect(
         vi
           .mocked(api)
-          .mock.calls.some(([path]) => path === '/api/agents/agent%2Fname/minion-model-selection'),
+          .mock.calls.some(([path]) => path === '/api/agents/agent%2Fname/minion-settings'),
       ).toBe(true);
-      expect(screen.queryByText('Save minion model')).toBeNull();
+      expect(screen.getByRole('button', { name: 'Save minion defaults' })).toBeTruthy();
     } finally {
       unmount();
       overflow.remove();
     }
   });
 
-  it('keeps minion controls in primary, not supporting content', async () => {
+  it('keeps Burrow defaults in the main column and native defaults in the third column', async () => {
     const { container, unmount, overflow } = mountDetailsWithOverflow();
     try {
-      await ready();
-      expect(container.contains(providerSelect())).toBe(true);
-      expect(overflow.contains(providerSelect())).toBe(false);
-      expect(overflow.childElementCount).toBe(0);
+      const profileSelect = await screen.findByLabelText('Burrow provider');
+      expect(container.contains(profileSelect)).toBe(true);
+      expect(overflow.contains(screen.getByLabelText('Codex Enabled'))).toBe(true);
     } finally {
       unmount();
       overflow.remove();

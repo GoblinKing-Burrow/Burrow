@@ -263,7 +263,7 @@ export function mergeSubagentResult(record = {}) {
 export function subagentVisibilitySummary(record = {}) {
   return {
     id: record.id || null,
-    harness: record.harness === 'codex' ? 'codex' : 'burrow',
+    harness: ['codex','claude','gemini'].includes(record.harness) ? record.harness : 'burrow',
     depth: record.minionDepth?.depth ?? 1,
     maxDepth: record.minionDepth?.maxDepth ?? 1,
     rootSessionId: record.minionDepth?.rootSessionId || null,
@@ -283,6 +283,10 @@ export function subagentVisibilitySummary(record = {}) {
       parentRunId: record.owner?.parentRunId || null,
     },
     ...(record.model ? { model: record.model } : {}),
+    // The profile that governed this child, as captured at admission. Shown so
+    // the agent tree can attribute a child without re-reading live settings.
+    ...(record.minionProfile ? { minionProfile: { id: record.minionProfile.id, name: record.minionProfile.name,
+      harness: record.minionProfile.harness, executionHostId: record.minionProfile.executionHostId } } : {}),
     trace: {
       runId: record.trace?.runId || null,
       traceDir: record.trace?.traceDir || null,

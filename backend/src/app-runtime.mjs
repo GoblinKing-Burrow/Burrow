@@ -7,7 +7,6 @@ import { contextSessionId, withContextHistory } from './model-context-boundary.m
 import { createHash } from 'node:crypto';
 import { visibleUserMessage } from './runtime-turn-input.mjs';
 import { performance } from 'node:perf_hooks';
-import { normalizeProviderMessage } from './provider-messages.mjs';
 import { beginSessionAdmissionSupersession, finishSessionAdmissionSupersession, serializeSessionAdmission } from './session-admission.mjs';
 import { operatorTimezone } from './timezone.mjs';
 import { postgresContinuity } from './postgres-continuity.mjs';
@@ -453,7 +452,8 @@ async function runAskChatUnserialized({
     ? { recipientAgentId: incomingAgentMessage.senderAgentId, sessionId: incomingAgentMessage.sourceSessionId }
     : null;
   const minionDepth = await resolveTurnMinionDepth({ metadata: stores?.metadata, conversations: stores?.conversations, agentId: runtimeState.agentId, sessionId: resolvedSessionId, runId: resolvedRunId });
-  const executionContext = createRuntimeExecutionContext({ minionDepth, agentMessageReplyTo, stores, runtimeState, resolvedSessionId, conversationId, continuityScope, agentRuntime, resolveAgentRuntime, runAgentReply, resolvedWorkingRoot, resolvedTarget, dataRoot, executionBoundaries, mcpTools, mcpConnections, parentRunId: resolvedRunId, traceContext: telemetryRun ? telemetry.traceContextForRun?.(resolvedRunId) : null, telemetry: telemetryRun ? telemetry : null, abortSignal: normalizedArgs.abort_signal || null, skillOverrides: scopedSkillsConfig });
+  const minionProfiles = []; // Legacy profiles are not part of normal discovery.
+  const executionContext = createRuntimeExecutionContext({ minionDepth, minionProfiles, agentMessageReplyTo, stores, runtimeState, resolvedSessionId, conversationId, continuityScope, agentRuntime, resolveAgentRuntime, runAgentReply, resolvedWorkingRoot, resolvedTarget, dataRoot, executionBoundaries, mcpTools, mcpConnections, parentRunId: resolvedRunId, traceContext: telemetryRun ? telemetry.traceContextForRun?.(resolvedRunId) : null, telemetry: telemetryRun ? telemetry : null, abortSignal: normalizedArgs.abort_signal || null, skillOverrides: scopedSkillsConfig });
   // Native child sessions never fall through to Burrow planning or tools.
   const codexFollowup = await runCodexSessionFollowup({ stores, executionContext,
     agentId: runtimeState.agentId, sessionId: resolvedSessionId, runId: resolvedRunId,
@@ -598,18 +598,15 @@ async function runAskChatUnserialized({
   if (continuationResult) return continuationResult;
 
   const shouldCallModel = normalizedArgs.call_model || !normalizedArgs.no_call_model;
-  const modelTask = incomingAgentMessage
-    ? normalizeProviderMessage({ role: 'agent', content: message, metadata: {
-      fromAgentId: incomingAgentMessage.senderAgentId,
-      toAgentId: runtimeState.agentId,
-      sourceSessionId: incomingAgentMessage.sourceSessionId,
-      targetSessionId: historySessionId,
-      messageMode: incomingAgentMessage.messageMode || 'request_reply',
-    } }).content
-    : message;
+  const modelTask = message;
+  const turnSourceName = incomingAgentMessage ? 'a2a' : externalTurnMetadata ? 'mod/external'
+    : completionEvent ? 'workflow-event' : chatInput ? 'queue_next'
+      : runSource || turnSource || command || 'chat';
+  const operatorTurn = !incomingAgentMessage && !externalTurnMetadata && !completionEvent
+    && ['operator-chat', 'queue_next', 'chat'].includes(turnSourceName);
   let promptContext;
   try {
-    promptContext = await prepareRuntimePromptContext({ rootDir, sessionRoot, resolvedSessionId, preparedContext, runtimeState, runtimeConfig, agentRuntime, stores, route, ambientWorkingContext, structuredSubagents, extraEyesReview, dreamPreload, childEvidence, sessionRecall, runEvidence, albdruckRecall, groupChannelContext, promptAttachments, attachmentManifest, modelTask, logger, modelConfig, executionContext, modAgentContext, sharedModContext, incomingAgentMessage, signal: normalizedArgs.abort_signal, temporalContext: { turnStartedAt, lastOperatorMessageAt, timezone: await operatorTimezone(stores.metadata) } });
+    promptContext = await prepareRuntimePromptContext({ rootDir, sessionRoot, resolvedSessionId, preparedContext, runtimeState, runtimeConfig, agentRuntime, stores, route, ambientWorkingContext, structuredSubagents, extraEyesReview, dreamPreload, childEvidence, sessionRecall, runEvidence, albdruckRecall, groupChannelContext, promptAttachments, attachmentManifest, modelTask, logger, modelConfig, executionContext, modAgentContext, sharedModContext, incomingAgentMessage, operatorTurn, signal: normalizedArgs.abort_signal, temporalContext: { turnStartedAt, lastOperatorMessageAt, timezone: await operatorTimezone(stores.metadata) } });
   } catch (error) {
     // Context preparation can reject before returning its final inspection.
     // Route that exact budget failure through the same durable blocked owner,

@@ -92,7 +92,16 @@ export function Chat({
   composerResetGeneration?: number;
   selectionBlocked?: boolean;
 }) {
-  const isCodexMinion = 'stream' in selected && selected.harness === 'codex';
+  const nativeMinionName =
+    'stream' in selected
+      ? selected.harness === 'codex'
+        ? 'Codex'
+        : selected.harness === 'claude'
+          ? 'Claude'
+          : selected.harness === 'gemini'
+            ? 'Gemini'
+            : undefined
+      : undefined;
   // Show the owning conversation, not the child's stream id or the agent's
   // last selected chat. Nested minions share their recorded root session.
   const parentSessionId =
@@ -389,7 +398,9 @@ export function Chat({
         setDraft={composerHistory.setDraft}
         attached={attached}
         onAttach={onAttach}
-        attachmentDisabledReason={isCodexMinion ? 'Codex minions accept text only.' : undefined}
+        attachmentDisabledReason={
+          nativeMinionName ? `${nativeMinionName} minions accept text only.` : undefined
+        }
         onRemoveAttachment={onRemoveAttachment}
         disabled={false}
         sendDisabled={
@@ -425,8 +436,8 @@ export function Chat({
           ])
         }
         placeholder={
-          isCodexMinion
-            ? 'Message Codex minion (text only)…'
+          nativeMinionName
+            ? `Message ${nativeMinionName} minion (text only)…`
             : isNewSession
               ? `Message ${selected.name}…`
               : 'Message the active agent…'
