@@ -1,3 +1,4 @@
+import { boundaryFailure } from './diagnostic-boundary.mjs';
 // Live mod-agent provider publication is independent of tool catalogs and MCP.
 // Only Core publishes an activated host, keyed by its trusted installed identity.
 const providers = new Map();
@@ -63,9 +64,23 @@ function validateSharedRecords(value) {
     return { name: entry.name, content: entry.content };
   });
 }
-export async function resolveSharedModContext(agentRuntime, { sessionId, signal } = {}) {
+export async function resolveSharedModContext(agentRuntime, { sessionId, signal, addressedParticipants = [], includeRecipient = true } = {}) {
   const agent = agentRuntime?.agent;
   if (!agent?.id || agentRuntime.agentId !== agent.id || typeof sessionId !== 'string' || !sessionId || sessionId.length > 128 || signal?.aborted) throw unavailable();
+  // The caller supplies participants only from authenticated runtime routing.
+  // Rebuild a closed projection here so request prose/metadata cannot be passed
+  // through as participant authority.
+  if (!Array.isArray(addressedParticipants) || addressedParticipants.length > 32) throw unavailable();
+  const participantMap = new Map();
+  for (const participant of addressedParticipants) {
+    const id = participant?.agent?.id;
+    if (!id || participant.agentId !== id || typeof id !== 'string' || id.length > 96) throw unavailable();
+    const tags = participant.agent?.modAgent?.participantTags ?? [];
+    if (!Array.isArray(tags) || tags.length > 32 || tags.some(tag => typeof tag !== 'string' || !/^[a-z0-9][a-z0-9._:-]{0,63}$/.test(tag))) throw unavailable();
+    participantMap.set(id, { agentId: id, tags: [...new Set(tags)] });
+  }
+  if (includeRecipient && !participantMap.has(agent.id)) participantMap.set(agent.id, { agentId: agent.id, tags: [...(agent.modAgent?.participantTags || [])] });
+  const participants = [...participantMap.values()].sort((a, b) => a.agentId.localeCompare(b.agentId));
   const contributions = [];
   for (const id of [...providers.keys()].sort()) {
     if (signal?.aborted) throw unavailable();
@@ -73,12 +88,12 @@ export async function resolveSharedModContext(agentRuntime, { sessionId, signal 
     if (!mod) continue;
     let context;
     try {
-      const result = await mod.host.invoke('shared-context', { agentId: agent.id, sessionId }, { abortSignal: signal });
+      const result = await mod.host.invoke('shared-context', { agentId: agent.id, sessionId, participants }, { abortSignal: signal });
       if (signal?.aborted) throw unavailable();
       // Revoked/replaced/paused/crashed hosts cannot leak stale results.
       if (activeSharedProvider(id) !== mod) continue;
       context = validateSharedRecords(result);
-    } catch { throw unavailable(); }
+    } catch (error) { throw boundaryFailure('mod_agent_unavailable', error, 'context_invoke'); }
     if (context.length) contributions.push({ ownerModId: id, context, mod });
   }
   if (signal?.aborted) throw unavailable();
@@ -96,7 +111,7 @@ export async function resolveModAgentContext(agentRuntime, { sessionId, signal }
     // A replaced, disabled or crashed host must not complete a dependent turn.
     if (activeModAgentProvider(agent) !== mod || signal?.aborted) throw unavailable();
     return validateRecords(result);
-  } catch { throw unavailable(); }
+  } catch (error) { throw boundaryFailure('mod_agent_unavailable', error, 'context_invoke'); }
 }
 
 // Native bridge is intentionally small and does not require an MCP connection or

@@ -1,3 +1,4 @@
+import { ForgeSchematic } from './ForgeSchematic';
 import { ForgeConstellation } from './ForgeConstellation';
 import { useConfirm } from '../../app/ConfirmDialog';
 import { rovingKeys } from '../../app/keyboardWidgets';
@@ -616,11 +617,17 @@ export function Forge({
     : orderedJobs.filter((job) => jobMode(job) === mode).slice(0, 5);
   const recentJobs = scopedJobs;
   const selectedJob = scopedJobs.find((job) => job.id === selectedJobId) ?? scopedJobs[0];
-  const motion = useForgeMotion(machineRef, selectedJob, submittedJobRef.current, () => {
-    const output = machineRef.current?.querySelector('.forge-output-content');
-    if (!output || output.querySelector('[data-forge-preview-loading]')) return false;
-    return [...output.querySelectorAll('img')].every((image) => image.complete);
-  });
+  const motion = useForgeMotion(
+    machineRef,
+    selectedJob,
+    submittedJobRef.current,
+    () => {
+      const output = machineRef.current?.querySelector('.forge-output-content');
+      if (!output || output.querySelector('[data-forge-preview-loading]')) return false;
+      return [...output.querySelectorAll('img')].every((image) => image.complete);
+    },
+    !showHome && !showGallery,
+  );
   const submit = async () => {
     const model = availableModels.find((item) => modelKey(item) === selectedModel);
     const submittedPrompt = mode === 'music' ? composeMusicPrompt(prompt, lyrics) : prompt.trim();
@@ -806,6 +813,7 @@ export function Forge({
       {showHome && (
         <>
           <div className="forge-home-atmosphere" aria-hidden="true" />
+          <ForgeSchematic enabled={motion.enabled} />
           <ForgeConstellation enabled={motion.enabled} />
         </>
       )}
@@ -913,15 +921,6 @@ export function Forge({
             width={1254}
             height={1254}
           />
-          <h1 className="forge-home-title">The Forge Awaits</h1>
-          <label className="forge-home-effects">
-            <input
-              type="checkbox"
-              checked={motion.enabled}
-              onChange={(event) => motion.setEnabled(event.target.checked)}
-            />{' '}
-            Forge effects
-          </label>
         </section>
       )}
       {!showHome && (
@@ -1165,17 +1164,6 @@ export function Forge({
                 <span>PROBABLY FINE</span>
               </div>
               <small>Pressure is theatrical. Job status isn't.</small>
-            </div>
-            <div className="forge-motion-control">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={motion.enabled}
-                  onChange={(event) => motion.setEnabled(event.target.checked)}
-                />
-                Forge effects
-              </label>
-              <small>Turn off motion without stopping generation.</small>
             </div>
             <div className="forge-actions">
               {(mode !== 'music' || availableModels.length > 0) && (

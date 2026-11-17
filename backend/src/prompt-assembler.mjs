@@ -176,6 +176,14 @@ export function normalizeSharedModContext(value = null) {
   } catch { throw new Error('mod_shared_context_invalid'); }
 }
 
+// Same shared-guidance projection for initial prompts and routed continuations.
+export function sharedModContextMessages(sharedModContext, limits = {}) {
+  const sections = normalizeSharedModContext(sharedModContext).map(entry =>
+    renderModRecords(entry.context, { ownerModId: entry.ownerModId, kind: 'shared-context', totalBudget: limits.modSharedContextChars, perFileBudget: limits.modSharedContextFileChars }).text
+  ).filter(Boolean).map(text => `# mod-shared-context\n\n${text}`);
+  return sections.length ? [{ role: 'developer', content: `Current-turn shared mod guidance (not agent identity, tools, or historical conversation):\n\n${sections.join('\n\n---\n\n')}`, metadata: { providerMessageSource: 'mod-shared-context-provider' } }] : [];
+}
+
 // Normal names use URI percent encoding. Preserve even lone UTF-16 surrogates
 // (which the provider record contract permits) injectively with an escaped-~
 // convention rather than letting encodeURIComponent throw or merge names.
@@ -761,23 +769,26 @@ export async function assemblePrompt({
   const operatingSections = staticSections.filter((item) => !identitySectionNames.has(item.name));
   const conversationSectionNames = new Set(['conversation', 'prior-conversation-summary', 'current-message', 'task']);
   const supportSections = volatileSections.filter((item) => !conversationSectionNames.has(item.name) && item.name !== 'mod-shared-context');
-  const sharedSections = volatileSections.filter((item) => item.name === 'mod-shared-context');
-  const modelMessages = normalizeProviderMessages([
-    ...(identitySections.length ? [{ role: 'system', content: renderSections(identitySections), metadata: { providerMessageSource: 'agent-identity-provider' } }] : []),
-    ...(operatingSections.length ? [{ role: 'system', content: renderSections(operatingSections), metadata: { providerMessageSource: 'stable-instructions-provider' } }] : []),
-    ...conversationProviderMessages({
+  const historyMessages = conversationProviderMessages({
       priorSummary: renderPriorConversationSummary(conversation),
       recentMessages: (conversation.recentMessages || []).filter((message) => !(
         incomingAgentMessage?.inboundEntryId && message?.id === incomingAgentMessage.inboundEntryId
       )),
       task,
-    }).slice(0, -1).map(message => message.metadata?.providerMessageSource === 'historical-user-turn' && message.role === 'developer' ? { role: 'user', content: message.content, metadata: { providerMessageSource: 'historical-support-snapshot' } } : message),
-    ...(sharedSections.length ? [{ role: 'developer', content: `Current-turn shared mod guidance (not agent identity, tools, or historical conversation):\n\n${renderSections(sharedSections)}`, metadata: { providerMessageSource: 'mod-shared-context-provider' } }] : []),
-    ...(supportSections.length ? [{
-      role: 'user',
-      content: renderSections(supportSections),
-      metadata: { providerMessageSource: 'support-context-provider' },
-    }] : []),
+    }).slice(0, -1).map(message => message.metadata?.providerMessageSource === 'historical-user-turn' && message.role === 'developer' ? { role: 'user', content: message.content, metadata: { providerMessageSource: 'historical-support-snapshot' } } : message);
+  const supportMessages = supportSections.length ? [{ role: 'user', content: renderSections(supportSections), metadata: { providerMessageSource: 'support-context-provider' } }] : [];
+  // Preserve the existing user-leading wire shape for assistant-first windows.
+  // Ordinary user/summary-leading histories keep the reusable cache prefix.
+  const assistantFirst = historyMessages[0]?.role === 'assistant';
+  const modelMessages = normalizeProviderMessages([
+    ...(identitySections.length ? [{ role: 'system', content: renderSections(identitySections), metadata: { providerMessageSource: 'agent-identity-provider' } }] : []),
+    ...(operatingSections.length ? [{ role: 'system', content: renderSections(operatingSections), metadata: { providerMessageSource: 'stable-instructions-provider' } }] : []),
+    ...(assistantFirst ? supportMessages : []),
+    ...historyMessages,
+    // Keep volatile support after the reusable history unless it must anchor
+    // an assistant-leading window. Shared guidance always remains at the tail.
+    ...(!assistantFirst ? supportMessages : []),
+    ...sharedModContextMessages(sharedContext, limits),
     { role: 'user', content: `# current-message\n\n${incomingAgentMessage?.senderAgentId ? `[Peer message from ${incomingAgentMessage.senderAgentName || incomingAgentMessage.senderAgentId}]:\n${renderPeerSessionProvenance(incomingAgentMessage)}` : operatorTurn ? '[Operator message]:\n' : ''}${task.trim()}`, metadata: { providerMessageSource: 'current-task', ...(incomingAgentMessage?.senderAgentId ? { providerSpeaker: 'peer' } : operatorTurn ? { providerSpeaker: 'operator' } : { providerSpeaker: 'runtime' }) } },
   ]);
   const conversationSection = rawSections.find((item) => item.name === 'conversation');

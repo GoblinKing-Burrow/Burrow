@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { RefObject } from 'react';
+import { usePersistedForgeEffects } from '../../app/usePersistedLayout';
 import { createForgeEffects } from './forgeEffects';
 import { ForgeMotion } from './forgeMotion';
 import type { MotionJob } from './forgeMotion';
@@ -9,15 +10,22 @@ export function useForgeMotion(
   job: MotionJob | undefined,
   submittedId: string,
   ready: () => boolean,
+  surfaceActive = true,
 ) {
-  const [enabled, setEnabled] = useState(true);
+  const [enabled, setEnabled] = usePersistedForgeEffects();
   const [systemReduced, setSystemReduced] = useState(
     () => window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false,
   );
   const controller = useRef(new ForgeMotion());
   const effects = useRef<ReturnType<typeof createForgeEffects> | null>(null);
   const clock = useRef({ frame: 0, last: 0 });
-  const current = useRef({ job, submittedId, ready, reduced: !enabled || systemReduced });
+  const current = useRef({
+    job,
+    submittedId,
+    ready,
+    surfaceActive,
+    reduced: !enabled || systemReduced,
+  });
   const paintRef = useRef<() => void>(() => {});
   const reduced = !enabled || systemReduced;
 
@@ -62,6 +70,8 @@ export function useForgeMotion(
   const schedule = () => {
     if (
       clock.current.frame ||
+      !current.current.surfaceActive ||
+      !root.current ||
       document.hidden ||
       !controller.current.animating ||
       (current.current.reduced && !controller.current.revealing)
@@ -80,13 +90,18 @@ export function useForgeMotion(
     );
     const dt = clock.current.last ? (now - clock.current.last) / 1000 : 0;
     clock.current.last = now;
-    if (!document.hidden) controller.current.tick(dt);
+    if (state.surfaceActive && !document.hidden) controller.current.tick(dt);
     paintRef.current();
     schedule();
   };
 
   useLayoutEffect(() => {
-    current.current = { job, submittedId, ready, reduced };
+    current.current = { job, submittedId, ready, reduced, surfaceActive };
+    if (!surfaceActive) {
+      cancelAnimationFrame(clock.current.frame);
+      clock.current.frame = 0;
+      clock.current.last = 0;
+    }
     paintRef.current = paint;
     controller.current.observe(job, submittedId, job?.status === 'succeeded' && ready(), reduced);
     paint();
@@ -94,7 +109,7 @@ export function useForgeMotion(
   });
 
   useEffect(() => {
-    if (!root.current) return;
+    if (!root.current || !surfaceActive) return;
     effects.current = createForgeEffects(root.current);
     paintRef.current();
     const media = window.matchMedia?.('(prefers-reduced-motion: reduce)');
@@ -123,7 +138,7 @@ export function useForgeMotion(
         content.removeAttribute('aria-hidden');
       }
     };
-  }, []);
+  }, [surfaceActive]);
 
   return { enabled: !reduced, setEnabled };
 }

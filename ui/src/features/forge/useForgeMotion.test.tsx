@@ -12,28 +12,38 @@ let media: {
   removeEventListener: ReturnType<typeof vi.fn>;
 };
 let visibility: boolean;
-function Harness({ job, ready = true }: { job: MotionJob; ready?: boolean }) {
+function Harness({
+  job,
+  ready = true,
+  home = false,
+}: {
+  job: MotionJob;
+  ready?: boolean;
+  home?: boolean;
+}) {
   const root = useRef<HTMLElement>(null);
-  const motion = useForgeMotion(root, job, 'live', () => ready);
+  const motion = useForgeMotion(root, job, 'live', () => ready, !home);
   return (
     <main ref={root} className="forge-machine">
-      <div className="forge-grid">
-        <canvas className="forge-seam-sparks" />
-        <section className="forge-studio">
-          <div className="forge-pressure">
-            <strong data-forge-meter-state />
-          </div>
-        </section>
-        <section className="forge-preview">
-          <div className="forge-viewer-body">
-            <div className="forge-output-content">
-              <button>Output action</button>
+      {!home && (
+        <div className="forge-grid">
+          <canvas className="forge-seam-sparks" />
+          <section className="forge-studio">
+            <div className="forge-pressure">
+              <strong data-forge-meter-state />
             </div>
-            <canvas className="forge-blast" />
-          </div>
-        </section>
-        <section className="forge-history" />
-      </div>
+          </section>
+          <section className="forge-preview">
+            <div className="forge-viewer-body">
+              <div className="forge-output-content">
+                <button>Output action</button>
+              </div>
+              <canvas className="forge-blast" />
+            </div>
+          </section>
+          <section className="forge-history" />
+        </div>
+      )}
       <label>
         <input
           type="checkbox"
@@ -57,6 +67,7 @@ function advance(ms: number) {
   });
 }
 beforeEach(() => {
+  localStorage.clear();
   frames = new Map();
   index = 0;
   now = 0;
@@ -138,5 +149,58 @@ it('switching selected job mid-reveal drops masks without replaying completed hi
   view.rerender(<Harness job={job('succeeded', 'old')} />);
   expect(document.querySelector<HTMLElement>('.forge-output-content')!.inert).toBe(false);
   view.rerender(<Harness job={job('succeeded')} />);
+  expect(document.querySelector<HTMLElement>('.forge-output-content')!.inert).toBe(false);
+});
+
+it('attaches effects after leaving Home and reattaches after returning', () => {
+  const view = render(<Harness job={job('running')} home />);
+  expect(document.querySelectorAll('.forge-fracture')).toHaveLength(0);
+  view.rerender(<Harness job={job('running')} />);
+  expect(document.querySelectorAll('.forge-fracture')).toHaveLength(14);
+  view.rerender(<Harness job={job('running')} home />);
+  view.rerender(<Harness job={job('running')} />);
+  expect(document.querySelectorAll('.forge-fracture')).toHaveLength(14);
+  view.rerender(<Harness job={job('succeeded')} />);
+  advance(4000);
+  expect(document.querySelector<HTMLElement>('.forge-output-content')!.inert).toBe(false);
+});
+
+it('keeps an agent-started reveal pending on Home until the machine is visible', () => {
+  const view = render(<Harness job={job('running', 'agent-job')} home />);
+  expect(frames.size).toBe(0);
+  advance(6000);
+  view.rerender(<Harness job={job('succeeded', 'agent-job')} home />);
+  advance(20000);
+  expect(frames.size).toBe(0);
+  expect(document.querySelector('main')?.dataset.forgePhase).toBe('arming');
+  view.rerender(<Harness job={job('succeeded', 'agent-job')} />);
+  expect(document.querySelector<HTMLElement>('.forge-output-content')!.inert).toBe(true);
+  advance(1000);
+  expect(document.querySelector('main')?.dataset.forgePhase).toBe('delivering');
+  advance(3200);
+  expect(document.querySelector('main')?.dataset.forgePhase).toBe('success');
+  expect(document.querySelector<HTMLElement>('.forge-output-content')!.inert).toBe(false);
+  view.rerender(<Harness job={job('succeeded', 'agent-job')} home />);
+  advance(10000);
+  view.rerender(<Harness job={job('succeeded', 'agent-job')} />);
+  expect(document.querySelector('main')?.dataset.forgePhase).toBe('success');
+  expect(frames.size).toBe(0);
+});
+
+it('shows working on entry and pauses an in-progress blast while away', () => {
+  const view = render(<Harness job={job('running', 'agent-job')} home />);
+  view.rerender(<Harness job={job('running', 'agent-job')} />);
+  advance(1000);
+  expect(document.querySelector('main')?.dataset.forgePhase).toBe('working');
+  view.rerender(<Harness job={job('succeeded', 'agent-job')} />);
+  advance(1000);
+  view.rerender(<Harness job={job('succeeded', 'agent-job')} home />);
+  expect(frames.size).toBe(0);
+  advance(20000);
+  view.rerender(<Harness job={job('succeeded', 'agent-job')} />);
+  expect(document.querySelector('main')?.dataset.forgePhase).toBe('delivering');
+  advance(80);
+  expect(document.querySelector<HTMLElement>('.forge-output-content')!.inert).toBe(true);
+  advance(3200);
   expect(document.querySelector<HTMLElement>('.forge-output-content')!.inert).toBe(false);
 });

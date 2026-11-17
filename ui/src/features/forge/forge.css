@@ -677,7 +677,7 @@
 }
 .forge-home-emblem {
   display: block;
-  width: min(560px, 78vw);
+  width: min(720px, 84vw);
   max-width: 100%;
   height: auto;
   object-fit: contain;
@@ -760,4 +760,43 @@
   inset: 0;
   width: 100%;
   height: 100%;
+}
+
+.forge-schematic {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -1;
+  pointer-events: none;
+  color: var(--accent);
+}
+.forge-etch-lines {
+  opacity: 0.24;
+  stroke-width: 1;
+}
+.forge-etch-energy {
+  opacity: 0.65;
+  stroke-dasharray: 32 480;
+  stroke-dashoffset: 0;
+}
+.forge-schematic-live .forge-etch-energy path {
+  animation: forge-etch-flow 14s linear infinite;
+}
+@keyframes forge-etch-flow {
+  to {
+    stroke-dashoffset: -1024;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .forge-schematic-live .forge-etch-energy path {
+    animation: none;
+  }
+}
+
+.forge-etch-energy path:nth-child(2n) {
+  animation-delay: -5s;
+}
+.forge-etch-energy path:nth-child(3n) {
+  animation-delay: -9s;
 }

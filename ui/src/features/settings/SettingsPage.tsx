@@ -1,3 +1,5 @@
+import { apiErrorMessage } from '../../app/apiError';
+import { usePersistedForgeEffects } from '../../app/usePersistedLayout';
 import { MinionSettings } from './MinionSettings';
 import './settingsWorkspace.css';
 import './normalizedWorkspace.css';
@@ -122,6 +124,7 @@ export function Settings({
   ) => void;
   previewFirstRun?: boolean;
 }) {
+  const [forgeEffects, setForgeEffects] = usePersistedForgeEffects();
   const navigate = useUnsavedNavigation();
   const [settingsAgentId, setSettingsAgentId] = useState(selected.id);
   const [agentGlobal, setAgentGlobal] = useState(false);
@@ -177,6 +180,7 @@ export function Settings({
       decodeLegacy: (raw) => (raw === 'true' ? true : raw === 'false' ? false : undefined),
     }),
   );
+  const [modCatalogError, setModCatalogError] = useState('');
   const agents = settingsAgents(catalog);
   const settingsSelected = agents.find((agent) => agent.id === settingsAgentId) ?? agents[0];
 
@@ -189,9 +193,17 @@ export function Settings({
     let sequence = 0;
     const refresh = () => {
       const current = ++sequence;
-      void loadModSettingsContributions().then((items) => {
-        if (!cancelled && current === sequence) setTargetContributions(items);
-      });
+      void loadModSettingsContributions()
+        .then((items) => {
+          if (!cancelled && current === sequence) {
+            setTargetContributions(items);
+            setModCatalogError('');
+          }
+        })
+        .catch((cause) => {
+          if (!cancelled && current === sequence)
+            setModCatalogError(apiErrorMessage(cause, 'Could not load mod settings.'));
+        });
     };
     refresh();
     window.addEventListener(modContributionsChangedEvent, refresh);
@@ -335,6 +347,16 @@ export function Settings({
               </div>
             </fieldset>
           </SettingSection>
+          <SettingSection title="Effects">
+            <label className="settings-checkbox-row">
+              <input
+                type="checkbox"
+                checked={forgeEffects}
+                onChange={(event) => setForgeEffects(event.target.checked)}
+              />
+              Forge effects
+            </label>
+          </SettingSection>
           <BrowserTabSettings />
         </div>
       )}
@@ -391,6 +413,7 @@ export function Settings({
         aria-label="Settings workspace"
       >
         {!navigationTarget && settingsNavigation}
+        {modCatalogError && <p role="alert">{modCatalogError}</p>}
         {tab === 'agents' && (
           <div className="settings-prototype-agent-selector">
             <AgentToolbar
