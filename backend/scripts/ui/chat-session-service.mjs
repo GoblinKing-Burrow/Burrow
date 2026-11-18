@@ -6,7 +6,7 @@ import { applyModelRecoveryProgress, modelRecoveryProgress } from '../../src/mod
 import { beginSessionAdmissionSupersession, finishSessionAdmissionSupersession, serializeSessionAdmission } from '../../src/session-admission.mjs';
 import { beginRuntimeSessionExecutionSupersession, finishRuntimeSessionExecutionSupersession, chatTurnInputFromBody, createChatTurnRunId, chatTurnResponse, chatTurnProgressResponse, chatTurnErrorResponse } from '../../src/chat-turn-controller.mjs';
 import { coreApiCaller } from '../../src/core-api-dispatch.mjs';
-import { activeChatRunKey, activeChatRunSummary, activeChatRunSummaries, cancelActiveChatRun, registerActiveAgentRun } from '../../src/active-chat-runs.mjs';
+import { activeChatRunKey, activeChatRunSummary, activeChatRunSummaries, cancelActiveChatRun, registerActiveAgentRun, retainActiveChatProgress } from '../../src/active-chat-runs.mjs';
 import { chatCommandHelpText, chatCommandResponse, parseChatCommand } from '../../src/chat-commands.mjs';
 import { conversationAuthority as conversationAuthorityDefault } from '../../src/conversation-authority.mjs';
 import { buildSessionEntry as buildSessionEntryDefault } from '../../src/session-entry.mjs';
@@ -30,6 +30,7 @@ import { projectSubagentTree as projectSubagentTreeDefault, sessionMinionAncestr
 export function publicChatProgress(record = {}) {
   if (record.type === 'model-recovery') return modelRecoveryProgress(record);
   const payload = record.payload || {};
+  if (record.source === 'native-minion-tool') return record.publicProgress || null;
   if (['context-compaction-started', 'context-compaction-completed', 'context-compaction-failed'].includes(record.type)) {
     return { type: record.type.replace('context-compaction-', 'context.compaction.'), data: {
       reason: payload.reason || null, compressed: payload.compressed === true,
@@ -269,7 +270,7 @@ async function handleChatCommand({ parsed, sessionId, agentRuntime, runId = null
   if (parsed.command === 'context') {
     const traceSessionRoot = resolveRuntimeTracePath({ cacheRoot: runtime.runtimeState.cacheRoot, workspaceRoot: runtime.runtimeState.workspaceRoot, agentId: agentRuntime.agentId, sessionId });
     const request = await latestProviderRequest({ traceSessionRoot, sessionId, runId: context.runId || null, requestId: context.requestId || null });
-    if (!request) return { status: 404, response: chatCommandResponse({ command: 'context', sessionId, text: 'No captured provider request is available for this session meter. Send a message first; older requests may predate request capture. Current settings have not been substituted for missing captured context.', receipt: { error: 'provider_request_unavailable', runId: context.runId || null, requestId: context.requestId || null }, ok: false }) };
+    if (!request) return { status: 404, response: chatCommandResponse({ command: 'context', sessionId, text: 'No captured provider request is available for this session meter. Send a message first; older captures may have expired or may predate request capture. Current settings have not been substituted for missing captured context.', receipt: { error: 'provider_request_unavailable', runId: context.runId || null, requestId: context.requestId || null }, ok: false }) };
     const full = parsed.args === 'full';
     const presentation = contextReport({ request, agentRuntime, sessionId, status, full });
     const response = chatCommandResponse({ command: 'context', sessionId, text: presentation.text, receipt: { mode: full ? 'full' : 'overview', runId: request.runId, sentAt: request.ts, requestId: request.payload?.requestId || null, messageCount: request.payload?.messageCount ?? null, promptChars: request.payload?.promptChars ?? null, estimatedTokens: context.requestId === request.payload?.requestId ? context.estimatedTokens ?? null : null, capacityTokens: context.capacityTokens ?? null } });
@@ -404,7 +405,7 @@ async function handleSerializedChat({ req, res, body, agentRuntime, sessionId, l
         const progress = publicChatProgress(traceRecord);
         if (progress) {
           const event = { ...progress, runId, sessionId, ts: traceRecord.ts || new Date().toISOString() };
-          record.progress = [...record.progress, event].slice(-50);
+          retainActiveChatProgress(record, event, traceRecord.source === 'native-minion-tool');
           if (progress.type === 'model.recovery') observeModelRecovery(serverLogger, traceRecord, record);
           if (!applyModelRecoveryProgress(record, progress)) {
             if (controller.signal.aborted || record.phase === 'cancelling') record.phase = 'cancelling';
@@ -573,7 +574,7 @@ async function currentActiveChatRunSummaries({ agentId = null, sessionId = null 
   const runtimes = agentId ? [await resolveAgentContext(agentId)] : await Promise.all((await agentsStore().list({ includeDisabled: true })).map((agent) => resolveAgentContext(agent.id)));
   for (const agentRuntime of runtimes) {
     const [records, settings, metadata] = await Promise.all([
-      listSubagentSummaries(agentRuntime),
+      listSubagentSummaries(agentRuntime, { includeProgress: true }),
       readMinionSettings(metadataStore(), agentRuntime.agentId),
       sessionId ? postgresApplication.stores.conversations.getMetadata({ agentId: agentRuntime.agentId, sessionId }) : null,
     ]);

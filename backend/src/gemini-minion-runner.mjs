@@ -1,3 +1,4 @@
+import { createNativeMinionActivity, createNativeMinionTelemetry } from './native-minion-telemetry.mjs';
 import { diagnosticText, collectDiagnosticSecrets } from './native-minion-diagnostics.mjs';
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
@@ -126,9 +127,10 @@ function processClient(child, onEvent, redact) {
 
 /** Server-only native CLI adapter. Admission/terminal receipts remain parent-owned. */
 export async function runGeminiMinion({ id, task, target, dataRoot, childSessionId, owner = {}, modelConfig,
-  traceDir = null, parentExecutionContext = null, signal = parentExecutionContext?.abortSignal,
+  traceDir = null, parentExecutionContext = null, onTraceRecord = null, signal = parentExecutionContext?.abortSignal,
   executionPolicy = parentExecutionContext?.executionPolicy, continuation = null } = {}) {
   const cancellation = new AbortController();
+  let nativeTelemetry;
   signal = signal ? AbortSignal.any([signal, cancellation.signal]) : cancellation.signal;
   let resolvedConnectionId, actualModel = null, launchAttempted = false;
   let child, client, poll, killTimer, spawned = false, nativeSession, store, authority, recorded = false;
@@ -157,6 +159,8 @@ export async function runGeminiMinion({ id, task, target, dataRoot, childSession
     type: activity ? 'event' : 'message', role: activity ? null : 'assistant', content: redact(content),
     visibility: activity ? 'activity' : 'chat', entersPrompt: !activity,
     metadata: { kind: activity ? 'gemini-minion-activity' : 'gemini-minion-response', subagentExecution: true, provenance: 'model' } });
+  const nativeActivity = createNativeMinionActivity({ dataRoot, runId: id, sessionId: childSessionId, traceDir,
+    getAuthority: () => authority, isRecorded: () => recorded && !continuation, onTraceRecord });
   const enqueue = fn => {
     if (++pendingWrites > 32) { pendingWrites--; persistenceFailed = true; cancellation.abort(); return; }
     writes = writes.then(fn).catch(() => { persistenceFailed = true; cancellation.abort(); }).finally(() => { pendingWrites--; });
@@ -178,6 +182,8 @@ export async function runGeminiMinion({ id, task, target, dataRoot, childSession
     signal.throwIfAborted();
     const host = resolveProcessExecutionTarget(parentExecutionContext || {});
     const remote = host.kind === 'remote';
+    nativeTelemetry = createNativeMinionTelemetry({ harness: 'gemini', runId: id, telemetry: parentExecutionContext?.telemetry,
+      executionTarget: remote ? 'remote' : 'local', requestedModel: modelConfig?.model, redact, onToolProgress: nativeActivity.observe });
     const boundaries = parentExecutionContext?.executionBoundaries;
     if (boundaries && (!Array.isArray(boundaries.hardBlocks) || boundaries.hardBlocks.some(rule => rule.enabled !== false))) fail('gemini_execution_boundaries_unsupported');
     const policy = normalizeExecutionPolicyInput(executionPolicy);
@@ -244,7 +250,9 @@ export async function runGeminiMinion({ id, task, target, dataRoot, childSession
     child = remote ? await openRemoteGeminiProcess(controller, host.targetId, target.root, { args, apiKey: auth.apiKey })
       : spawn(executable, args, { cwd: target.root, shell: false, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'], env });
     spawned = true;
+    nativeTelemetry?.start({ fresh: !saved?.sessionId });
     client = processClient(child, event => {
+      nativeTelemetry?.observe(event);
       if (event.type === 'init' && typeof event.model === 'string') actualModel = redact(event.model).slice(0, 240);
       // Persist init on arrival, not just on a successful final result.
       if (event.type === 'init' || event.type === 'result') {
@@ -295,6 +303,7 @@ export async function runGeminiMinion({ id, task, target, dataRoot, childSession
       }
     }
   } finally {
+    nativeTelemetry?.finish(result, { cancelled: signal.aborted });
     clearInterval(poll);
     signal.removeEventListener('abort', abort);
     let cleanupUnconfirmed = false;
@@ -321,5 +330,6 @@ export async function runGeminiMinion({ id, task, target, dataRoot, childSession
     }
     if (cleanupUnconfirmed) result = { ...result, ...base, ok: false, summary: 'Gemini process cleanup could not be confirmed.', blockers: ['gemini_cleanup_failed'], warnings: [], sideEffectsApplied: null };
   }
+  await nativeActivity.flush();
   return { ...result, model: { requested: modelConfig?.model || null, actual: actualModel, connectionId: modelConfig?.connectionId || null, resolvedConnectionId: resolvedConnectionId || null }, spawned, cancelled: signal.aborted };
 }

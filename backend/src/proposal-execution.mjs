@@ -20,6 +20,7 @@ import { activeModAgentProvider, executeModAgentTool } from './mod-agent-runtime
 import { executeForgeTool, forgeFailure } from './forge-agent-tools.mjs';
 import { viewForgeArtifactReference } from './forge-artifact-reference.mjs';
 import { protectToolOutput } from './protected-values.mjs';
+import { inspectRuntimeContext } from './runtime-context-inspect.mjs';
 import { executeSkillTool } from './skill-tool-executor.mjs';
 import path from 'node:path';
 
@@ -34,7 +35,7 @@ function withExecutionProvenance(result, target, executionContext, toolCallId) {
   };
 }
 
-export async function executeReviewedProposalActions({ conversationStore = null, actions = [], reviews = [], workspaceRoot = null, rootDir = null, dataRoot = null, sessionId = null, conversationId = null, agentId = null, agentRuntime = null, resolveAgentRuntime = null, runAgentReply = null, workingMemoryStore = null, executionPolicy = null, modelConfig = null, traceLogger = null, artifactPrefix = null, observedToolResults = [], executionContext = null, abortSignal = null, invokeMcp = invokeMcpTool, childRunner = null } = {}) {
+export async function executeReviewedProposalActions({ conversationStore = null, actions = [], reviews = [], workspaceRoot = null, rootDir = null, dataRoot = null, sessionId = null, conversationId = null, agentId = null, agentRuntime = null, resolveAgentRuntime = null, runAgentReply = null, workingMemoryStore = null, executionPolicy = null, modelConfig = null, traceLogger = null, artifactPrefix = null, observedToolResults = [], executionContext = null, abortSignal = null, invokeMcp = invokeMcpTool, childRunner = null, onToolProgress = null } = {}) {
   abortSignal = abortSignal || executionContext?.abortSignal || null;
   // The execution context is authoritative; model arguments or a separately
   // supplied runtime must never replace a mod identity for the safety recheck.
@@ -75,6 +76,7 @@ export async function executeReviewedProposalActions({ conversationStore = null,
 
   for (const action of actions) {
     const resultStart = toolResults.length;
+    const skippedStart = skipped.length;
     try {
     if (abortSignal?.aborted) {
       skipped.push({ index: action.index, tool: action.tool, toolCallId: action.toolCallId || null, status: 'cancelled' });
@@ -125,6 +127,7 @@ export async function executeReviewedProposalActions({ conversationStore = null,
         continue;
       }
     }
+    await onToolProgress?.({ phase: 'start', action });
     if (action.tool === 'mod_agent_tool') {
       const started = await traceLogger?.toolStart?.({ tool: action.tool, toolCallId: action.toolCallId || null, modToolName: action.modToolName });
       let result;
@@ -267,6 +270,17 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       const { result, finishTrace } = await executeMcpTool({ action, executionContext, agentId, sessionId, conversationId, resolvedConversationId, workspaceRoot, rootDir, abortSignal, traceLogger, invokeMcp });
       toolResults.push(result);
       await finishTrace?.();
+      continue;
+    }
+
+    if (action.tool === 'runtime_context_inspect') {
+      const started = await traceLogger?.toolStart?.({ tool: action.tool, toolCallId: action.toolCallId || null, section: action.contextSection });
+      const result = await inspectRuntimeContext({ section: action.contextSection, executionContext, agentRuntime,
+        agentId: executionContext?.agentId || agentId, sessionId: executionContext?.sessionId || sessionId,
+        conversationStore: executionContext?.conversationStore || executionContext?.stores?.conversations || conversationStore, signal: abortSignal });
+      toolResults.push(result);
+      await (traceLogger?.toolEnd || traceLogger?.tool)?.({ tool: action.tool, toolCallId: action.toolCallId || null,
+        ...(started?.payload?.activityId ? { activityId: started.payload.activityId } : {}), ok: result.ok, error: result.error || null });
       continue;
     }
 
@@ -489,6 +503,8 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       for (let i = resultStart; i < toolResults.length; i += 1) {
         toolResults[i] = { ...toolResults[i], toolCallId: action.toolCallId || null };
       }
+      if (onToolProgress) await onToolProgress({ phase: 'result', action,
+        result: toolResults[resultStart], skipped: skipped[skippedStart] });
     }
   }
 

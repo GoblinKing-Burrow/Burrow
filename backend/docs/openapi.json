@@ -4127,7 +4127,7 @@
           "Archive"
         ],
         "summary": "List archived runtime proof packets",
-        "description": "Returns runs across all enabled agents when agentId is omitted. Pages use descending completion/start time with stable identity tie-breakers; use cursor to reach older runs.",
+        "description": "Returns runs across all enabled agents when agentId is omitted. Pages use descending completion/start time with stable identity tie-breakers; use cursor to reach older runs. Search filters retained run summaries before paging.",
         "operationId": "listArchiveRuns",
         "parameters": [
           {
@@ -4135,6 +4135,15 @@
           },
           {
             "$ref": "#/components/parameters/SessionId"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Case-insensitive literal search of run IDs and displayed run summary fields (agent name, objective, and status).",
+            "schema": {
+              "type": "string"
+            }
           },
           {
             "$ref": "#/components/parameters/Limit"
@@ -4152,6 +4161,9 @@
         "responses": {
           "200": {
             "$ref": "#/components/responses/ArchiveRunListResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
           },
           "404": {
             "$ref": "#/components/responses/ErrorResponse"
@@ -7202,7 +7214,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Durable minion settings; defaults: maxDepth 1, defaultHarness burrow, codexModel null, claudeModel null.",
+            "description": "Durable Minion settings with independent model defaults and locks (unlocked by default).",
             "content": {
               "application/json": {
                 "schema": {
@@ -7225,11 +7237,23 @@
                     "defaultMinionProfileId": null,
                     "burrowModel": null,
                     "codexEnabled": false,
-                    "claudeEnabled": false
+                    "claudeEnabled": false,
+                    "geminiEnabled": false,
+                    "geminiModel": null,
+                    "burrowModelLocked": false,
+                    "codexModelLocked": false,
+                    "claudeModelLocked": false,
+                    "geminiModelLocked": false
                   },
                   "burrowModel": null,
                   "codexEnabled": false,
-                  "claudeEnabled": false
+                  "claudeEnabled": false,
+                  "geminiEnabled": false,
+                  "geminiModel": null,
+                  "burrowModelLocked": false,
+                  "codexModelLocked": false,
+                  "claudeModelLocked": false,
+                  "geminiModelLocked": false
                 }
               }
             }
@@ -7317,7 +7341,7 @@
         },
         "responses": {
           "200": {
-            "description": "Durable minion settings; defaults: maxDepth 1, defaultHarness burrow, codexModel null, claudeModel null.",
+            "description": "Durable Minion settings with independent model defaults and locks (unlocked by default).",
             "content": {
               "application/json": {
                 "schema": {
@@ -7340,11 +7364,23 @@
                     "defaultMinionProfileId": null,
                     "burrowModel": null,
                     "codexEnabled": false,
-                    "claudeEnabled": false
+                    "claudeEnabled": false,
+                    "geminiEnabled": false,
+                    "geminiModel": null,
+                    "burrowModelLocked": false,
+                    "codexModelLocked": false,
+                    "claudeModelLocked": false,
+                    "geminiModelLocked": false
                   },
                   "burrowModel": null,
                   "codexEnabled": false,
-                  "claudeEnabled": false
+                  "claudeEnabled": false,
+                  "geminiEnabled": false,
+                  "geminiModel": null,
+                  "burrowModelLocked": false,
+                  "codexModelLocked": false,
+                  "claudeModelLocked": false,
+                  "geminiModelLocked": false
                 }
               }
             }
@@ -7400,6 +7436,18 @@
                     "value": {
                       "ok": false,
                       "error": "codex_model_not_enabled"
+                    }
+                  },
+                  "minion_model_lock_invalid": {
+                    "value": {
+                      "ok": false,
+                      "error": "minion_model_lock_invalid"
+                    }
+                  },
+                  "minion_model_lock_requires_model": {
+                    "value": {
+                      "ok": false,
+                      "error": "minion_model_lock_requires_model"
                     }
                   }
                 }
@@ -9477,7 +9525,7 @@
         "description": "Agents Global defaults inherited by agents with overrideEnabled false; partial writes preserve omitted settings.",
         "responses": {
           "200": {
-            "description": "Durable minion settings; defaults: maxDepth 1, defaultHarness burrow, codexModel null, claudeModel null.",
+            "description": "Durable Minion settings with independent model defaults and locks (unlocked by default).",
             "content": {
               "application/json": {
                 "schema": {
@@ -9492,7 +9540,13 @@
                   "defaultMinionProfileId": null,
                   "burrowModel": null,
                   "codexEnabled": false,
-                  "claudeEnabled": false
+                  "claudeEnabled": false,
+                  "geminiEnabled": false,
+                  "geminiModel": null,
+                  "burrowModelLocked": false,
+                  "codexModelLocked": false,
+                  "claudeModelLocked": false,
+                  "geminiModelLocked": false
                 }
               }
             }
@@ -9575,7 +9629,7 @@
         },
         "responses": {
           "200": {
-            "description": "Durable minion settings; defaults: maxDepth 1, defaultHarness burrow, codexModel null, claudeModel null.",
+            "description": "Durable Minion settings with independent model defaults and locks (unlocked by default).",
             "content": {
               "application/json": {
                 "schema": {
@@ -9590,7 +9644,13 @@
                   "defaultMinionProfileId": null,
                   "burrowModel": null,
                   "codexEnabled": false,
-                  "claudeEnabled": false
+                  "claudeEnabled": false,
+                  "geminiEnabled": false,
+                  "geminiModel": null,
+                  "burrowModelLocked": false,
+                  "codexModelLocked": false,
+                  "claudeModelLocked": false,
+                  "geminiModelLocked": false
                 }
               }
             }
@@ -9646,6 +9706,18 @@
                     "value": {
                       "ok": false,
                       "error": "codex_model_not_enabled"
+                    }
+                  },
+                  "minion_model_lock_invalid": {
+                    "value": {
+                      "ok": false,
+                      "error": "minion_model_lock_invalid"
+                    }
+                  },
+                  "minion_model_lock_requires_model": {
+                    "value": {
+                      "ok": false,
+                      "error": "minion_model_lock_requires_model"
                     }
                   }
                 }
@@ -9771,6 +9843,76 @@
           },
           "502": {
             "$ref": "#/components/responses/AnthropicResetActivationResponse"
+          }
+        }
+      }
+    },
+    "/api/traces/{runId}/provider-requests": {
+      "get": {
+        "tags": [
+          "Traces"
+        ],
+        "summary": "Inspect saved redacted provider requests for a run",
+        "description": "Lists physical provider requests in recorded order, without bodies. Select requestId to read one body, if available. Requires normal operator authentication or Backdoor Core API authority; scoped diagnostics bearer tokens are not accepted.",
+        "operationId": "getTraceProviderRequests",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PathRunId"
+          },
+          {
+            "name": "agentId",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Agent owning the run."
+          },
+          {
+            "name": "sessionId",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Source session owning the run; defaults to default."
+          },
+          {
+            "name": "requestId",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "ID of one physical provider request; omit to list metadata."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Request metadata or one selected request capture.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ProviderRequestHistory"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ProviderRequestCapture"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "401": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "403": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
           }
         }
       }
@@ -19453,13 +19595,35 @@
           },
           "burrowModel": {
             "$ref": "#/components/schemas/CodexMinionModelSelection",
-            "description": "Nullable Burrow model override; null inherits parent model."
+            "description": "Nullable Burrow model default; null inherits the parent model."
           },
           "codexEnabled": {
             "type": "boolean"
           },
           "claudeEnabled": {
             "type": "boolean"
+          },
+          "geminiEnabled": {
+            "type": "boolean"
+          },
+          "geminiModel": {
+            "$ref": "#/components/schemas/CodexMinionModelSelection"
+          },
+          "burrowModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "codexModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "claudeModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "geminiModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
           }
         },
         "additionalProperties": true,
@@ -19624,6 +19788,82 @@
               }
             },
             "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "geminiEnabled"
+            ],
+            "properties": {
+              "geminiEnabled": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "geminiModel"
+            ],
+            "properties": {
+              "geminiModel": {
+                "$ref": "#/components/schemas/CodexMinionModelSelection"
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "burrowModelLocked"
+            ],
+            "properties": {
+              "burrowModelLocked": {
+                "type": "boolean",
+                "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "codexModelLocked"
+            ],
+            "properties": {
+              "codexModelLocked": {
+                "type": "boolean",
+                "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "claudeModelLocked"
+            ],
+            "properties": {
+              "claudeModelLocked": {
+                "type": "boolean",
+                "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "geminiModelLocked"
+            ],
+            "properties": {
+              "geminiModelLocked": {
+                "type": "boolean",
+                "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+              }
+            },
+            "additionalProperties": true
           }
         ]
       },
@@ -19641,7 +19881,13 @@
           "effective",
           "burrowModel",
           "codexEnabled",
-          "claudeEnabled"
+          "claudeEnabled",
+          "geminiEnabled",
+          "geminiModel",
+          "burrowModelLocked",
+          "codexModelLocked",
+          "claudeModelLocked",
+          "geminiModelLocked"
         ],
         "properties": {
           "ok": {
@@ -19713,13 +19959,35 @@
           },
           "burrowModel": {
             "$ref": "#/components/schemas/CodexMinionModelSelection",
-            "description": "Nullable Burrow model override; null inherits parent model."
+            "description": "Nullable Burrow model default; null inherits the parent model."
           },
           "codexEnabled": {
             "type": "boolean"
           },
           "claudeEnabled": {
             "type": "boolean"
+          },
+          "geminiEnabled": {
+            "type": "boolean"
+          },
+          "geminiModel": {
+            "$ref": "#/components/schemas/CodexMinionModelSelection"
+          },
+          "burrowModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "codexModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "claudeModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "geminiModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
           }
         },
         "additionalProperties": false
@@ -21470,13 +21738,35 @@
           },
           "burrowModel": {
             "$ref": "#/components/schemas/CodexMinionModelSelection",
-            "description": "Nullable Burrow model override; null inherits parent model."
+            "description": "Nullable Burrow model default; null inherits the parent model."
           },
           "codexEnabled": {
             "type": "boolean"
           },
           "claudeEnabled": {
             "type": "boolean"
+          },
+          "geminiEnabled": {
+            "type": "boolean"
+          },
+          "geminiModel": {
+            "$ref": "#/components/schemas/CodexMinionModelSelection"
+          },
+          "burrowModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "codexModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "claudeModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "geminiModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
           }
         },
         "additionalProperties": true,
@@ -21582,6 +21872,82 @@
               }
             },
             "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "geminiEnabled"
+            ],
+            "properties": {
+              "geminiEnabled": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "geminiModel"
+            ],
+            "properties": {
+              "geminiModel": {
+                "$ref": "#/components/schemas/CodexMinionModelSelection"
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "burrowModelLocked"
+            ],
+            "properties": {
+              "burrowModelLocked": {
+                "type": "boolean",
+                "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "codexModelLocked"
+            ],
+            "properties": {
+              "codexModelLocked": {
+                "type": "boolean",
+                "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "claudeModelLocked"
+            ],
+            "properties": {
+              "claudeModelLocked": {
+                "type": "boolean",
+                "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+              }
+            },
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "required": [
+              "geminiModelLocked"
+            ],
+            "properties": {
+              "geminiModelLocked": {
+                "type": "boolean",
+                "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+              }
+            },
+            "additionalProperties": true
           }
         ],
         "not": {
@@ -21610,7 +21976,13 @@
           "defaultMinionProfileId",
           "burrowModel",
           "codexEnabled",
-          "claudeEnabled"
+          "claudeEnabled",
+          "geminiEnabled",
+          "geminiModel",
+          "burrowModelLocked",
+          "codexModelLocked",
+          "claudeModelLocked",
+          "geminiModelLocked"
         ],
         "properties": {
           "ok": {
@@ -21638,13 +22010,35 @@
           },
           "burrowModel": {
             "$ref": "#/components/schemas/CodexMinionModelSelection",
-            "description": "Nullable Burrow model override; null inherits parent model."
+            "description": "Nullable Burrow model default; null inherits the parent model."
           },
           "codexEnabled": {
             "type": "boolean"
           },
           "claudeEnabled": {
             "type": "boolean"
+          },
+          "geminiEnabled": {
+            "type": "boolean"
+          },
+          "geminiModel": {
+            "$ref": "#/components/schemas/CodexMinionModelSelection"
+          },
+          "burrowModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "codexModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "claudeModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "geminiModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
           }
         },
         "additionalProperties": false
@@ -21659,7 +22053,13 @@
           "defaultMinionProfileId",
           "burrowModel",
           "codexEnabled",
-          "claudeEnabled"
+          "claudeEnabled",
+          "geminiEnabled",
+          "geminiModel",
+          "burrowModelLocked",
+          "codexModelLocked",
+          "claudeModelLocked",
+          "geminiModelLocked"
         ],
         "properties": {
           "maxDepth": {
@@ -21683,13 +22083,35 @@
           },
           "burrowModel": {
             "$ref": "#/components/schemas/CodexMinionModelSelection",
-            "description": "Nullable Burrow model override; null inherits parent model."
+            "description": "Nullable Burrow model default; null inherits the parent model."
           },
           "codexEnabled": {
             "type": "boolean"
           },
           "claudeEnabled": {
             "type": "boolean"
+          },
+          "geminiEnabled": {
+            "type": "boolean"
+          },
+          "geminiModel": {
+            "$ref": "#/components/schemas/CodexMinionModelSelection"
+          },
+          "burrowModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "codexModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "claudeModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
+          },
+          "geminiModelLocked": {
+            "type": "boolean",
+            "description": "Restrict new spawns to the saved model. Defaults to false. Setting true requires a saved model; clearing the model clears this lock."
           }
         },
         "additionalProperties": false
@@ -21803,6 +22225,180 @@
           }
         },
         "additionalProperties": true
+      },
+      "ProviderRequestMetadata": {
+        "type": "object",
+        "required": [
+          "requestId",
+          "ts",
+          "provider",
+          "model",
+          "api",
+          "modelCall",
+          "continuation",
+          "state"
+        ],
+        "properties": {
+          "requestId": {
+            "type": "string"
+          },
+          "ts": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "api": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "modelCall": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "continuation": {
+            "type": "boolean",
+            "description": "The provider adapter marked this request as a native continuation. Replayed tool history can also appear in requests without this mark."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "available",
+              "expired",
+              "not_captured",
+              "unavailable"
+            ]
+          }
+        }
+      },
+      "ProviderRequestDetail": {
+        "type": "object",
+        "required": [
+          "requestId",
+          "ts",
+          "provider",
+          "model",
+          "api",
+          "modelCall",
+          "continuation",
+          "state"
+        ],
+        "properties": {
+          "requestId": {
+            "type": "string"
+          },
+          "ts": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "api": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "modelCall": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "continuation": {
+            "type": "boolean",
+            "description": "The provider adapter marked this request as a native continuation. Replayed tool history can also appear in requests without this mark."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "available",
+              "expired",
+              "not_captured",
+              "unavailable"
+            ]
+          },
+          "body": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Present only for an available capture. Uses Burrow\u2019s existing redaction boundary; may contain private prompt content."
+          }
+        }
+      },
+      "ProviderRequestHistory": {
+        "type": "object",
+        "required": [
+          "ok",
+          "runId",
+          "retentionDays",
+          "requests"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "runId": {
+            "type": "string"
+          },
+          "retentionDays": {
+            "type": "integer"
+          },
+          "requests": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderRequestMetadata"
+            }
+          }
+        }
+      },
+      "ProviderRequestCapture": {
+        "type": "object",
+        "required": [
+          "ok",
+          "runId",
+          "request"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "const": true
+          },
+          "runId": {
+            "type": "string"
+          },
+          "request": {
+            "$ref": "#/components/schemas/ProviderRequestDetail"
+          }
+        }
       }
     },
     "securitySchemes": {
