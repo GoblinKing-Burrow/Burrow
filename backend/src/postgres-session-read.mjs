@@ -1,3 +1,4 @@
+import { archiveRunBoundary } from './archive-pagination.mjs';
 import { archiveReadQuery, withArchiveRead } from './postgres-archive-read.mjs';
 import { readArchiveTranscriptPage } from './postgres-archive-page.mjs';
 import { archivePayloadKeySQL, archiveTruthyPayloadSQL } from './postgres-archive-lexical.mjs';
@@ -582,7 +583,8 @@ export class PostgresSessionReadStore {
     const agentId = required(rawAgentId, 'agentId');
     const sessionId = rawSessionId == null ? null : required(rawSessionId, 'sessionId');
     const size = limitValue(limit);
-    if (boundary && (typeof boundary.t !== 'string' || typeof boundary.i !== 'string')) throw new Error('archive_cursor_invalid');
+    if (boundary && (typeof boundary.t !== 'string' || boundary.t.includes('\0'))) throw new Error('archive_cursor_invalid');
+    const [lastRun, lastSession, lastAgent] = boundary ? archiveRunBoundary(boundary.i) : [];
     const search = text(query).trim().toLowerCase();
     // Search the displayed directory status, not the detail's terminal status.
     // The evidence conditions mirror archive-proof's failure/unresolved counts.
@@ -598,10 +600,10 @@ export class PostgresSessionReadStore {
         ELSE 'completed' END AS status) summary
       WHERE r.agent_id=$1 AND ($2::text IS NULL OR r.session_id=$2)
       AND ($2::text IS NOT NULL OR NULLIF(s.metadata->'contextIsolation'->>'historySessionId','') IS NULL)
-      AND ($3::text IS NULL OR (r.sort_timestamp,r.agent_id || ':' || r.run_id)<($3,$4))
+      AND ($3::text IS NULL OR (r.sort_timestamp,r.run_id COLLATE "C",r.session_id COLLATE "C",r.agent_id COLLATE "C")<($3,$4,$8,$9))
       AND ($6::text='' OR strpos(lower(concat_ws(' ', $7::text,COALESCE(evidence.item->>'objective',''),'',summary.status,r.run_id)), $6)>0)
-      ORDER BY r.sort_timestamp DESC,r.agent_id || ':' || r.run_id DESC LIMIT $5`,
-    [agentId, sessionId, boundary?.t ?? null, boundary?.i ?? null, size + 1, search, agentName || agentId]);
+      ORDER BY r.sort_timestamp DESC,r.run_id COLLATE "C" DESC,r.session_id COLLATE "C" DESC,r.agent_id COLLATE "C" DESC LIMIT $5`,
+    [agentId, sessionId, boundary?.t ?? null, lastRun ?? null, size + 1, search, agentName || agentId, lastSession ?? null, lastAgent ?? null]);
     const hasMore = rows.length > size;
     return { rows: (hasMore ? rows.slice(0, size) : rows).map(row => ({
       agentId: row.agent_id, sessionId: row.session_id, runId: row.run_id,
@@ -610,6 +612,19 @@ export class PostgresSessionReadStore {
       lastActivityAt: row.last_activity_at?.toISOString?.() || row.last_activity_at || null,
       sortTimestamp: row.sort_timestamp, evidence: row.evidence || null, status: row.status,
     })), hasMore };
+  }
+
+  async listArchiveRunSessions({ agentId: rawAgentId, runId: rawRunId, signal, deadline } = {}) {
+    const agentId = required(rawAgentId, 'agentId'), runId = required(rawRunId, 'runId');
+    // Legacy trace URLs may not name the session. Seek the two occurrence
+    // indexes by agent/run, then order only matching sessions by recency.
+    const { rows } = await sessionReadQuery(this.pool, `WITH matches AS (
+      SELECT session_id FROM conversation_entries WHERE agent_id=$1 AND run_key=$2
+      UNION
+      SELECT session_id FROM conversation_archive_entries WHERE agent_id=$1 AND run_key=$2
+    ) SELECT s.session_id FROM matches m JOIN conversation_sessions s USING(session_id)
+      WHERE s.agent_id=$1 ORDER BY s.updated_at DESC,s.session_id DESC`, [agentId, proofRunKey({ runId })], { signal, deadline });
+    return rows.map(row => row.session_id);
   }
 
   async readArchiveRunSources({ agentId: rawAgentId, runs = [], signal, deadline } = {}) {
