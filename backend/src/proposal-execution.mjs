@@ -412,7 +412,7 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       const started = await traceLogger?.toolStart?.({ tool: 'agent_update_tools_profile', agentId });
       const result = await updateOwnToolsProfile({ agentId, markdown: action.profileToolsContent, store: executionContext?.stores?.profiles });
       toolResults.push(result);
-      await (traceLogger?.toolEnd || traceLogger?.tool)?.({ tool: 'agent_update_tools_profile', ...(started?.payload?.activityId ? { activityId: started.payload.activityId } : {}), ok: result.ok, agentId: agentId || null, document: result.document || null, error: result.error || null });
+      await (traceLogger?.toolEnd || traceLogger?.tool)?.({ tool: 'agent_update_tools_profile', ...(started?.payload?.activityId ? { activityId: started.payload.activityId } : {}), ok: result.ok, agentId: agentId || null, status: result.status || null, document: result.document || null, error: result.error || null });
       continue;
     }
 
@@ -436,7 +436,7 @@ export async function executeReviewedProposalActions({ conversationStore = null,
         // Resolve only after toolStart's observer opens the sender's tool span.
         // This is internal transport context, never authority from action/content.
         const parentTraceContext = executionContext?.telemetry?.traceContextForTool?.(traceLogger?.runId || executionContext?.parentRunId, started?.payload?.activityId || action.toolCallId) || executionContext?.traceContext || null;
-        result = await sendAgentMessage({ conversationStore: conversationStore || executionContext?.conversationStore || executionContext?.stores?.conversations, senderRuntime: agentRuntime || executionContext?.agentRuntime, resolveRecipientRuntime: resolveAgentRuntime || executionContext?.resolveAgentRuntime, runRecipientReply: runAgentReply || executionContext?.runAgentReply, recipientAgentId: action.recipientAgentId, targetSessionId: action.targetSessionId, replyTo: executionContext?.agentMessageReplyTo, content: action.content, messageMode: action.messageMode || 'request_reply', runId: traceLogger?.runId || null, sourceSessionId: sessionId || executionContext?.sessionId, parentTraceContext, abortSignal, onAddressedParticipant: executionContext?.sharedContextContinuation?.addressed });
+        result = await sendAgentMessage({ conversationStore: conversationStore || executionContext?.conversationStore || executionContext?.stores?.conversations, senderRuntime: agentRuntime || executionContext?.agentRuntime, resolveRecipientRuntime: resolveAgentRuntime || executionContext?.resolveAgentRuntime, runRecipientReply: runAgentReply || executionContext?.runAgentReply, recipientAgentId: action.recipientAgentId, targetSessionId: action.targetSessionId, replyTo: executionContext?.agentMessageReplyTo, content: action.content, messageMode: action.messageMode || 'request_reply', runId: traceLogger?.runId || null, sourceSessionId: sessionId || executionContext?.sessionId, parentTraceContext, abortSignal, onAddressedParticipant: executionContext?.sharedContextContinuation?.addressed, groupChannelContext: executionContext?.groupChannelContext });
       } catch (error) {
         result = { tool: 'agent_send_message', ok: false, recipientAgentId: action.recipientAgentId || null, targetSessionId: action.targetSessionId || null, error: error?.message || String(error), autoExecuted: false };
       }

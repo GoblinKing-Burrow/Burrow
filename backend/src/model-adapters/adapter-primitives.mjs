@@ -273,6 +273,7 @@ function nativeToolReceipt(result = {}) {
   if (result?.tool === 'agent_send_message' && result?.reply && typeof result.reply === 'object') {
     receipt.recipientReply = {
       ok: result.reply.ok === true,
+      ...(result.reply.roomEntryId ? { roomEntryId: result.reply.roomEntryId, fromAgentId: result.recipientAgentId } : {}),
       content: typeof result.reply.content === 'string' ? result.reply.content : null,
       error: typeof result.reply.error === 'string' ? result.reply.error : null,
     };
@@ -328,7 +329,7 @@ function nativeToolReceipt(result = {}) {
     memory_working_search: ['project', 'agentId', 'results'],
     memory_rolling_search: ['project', 'agentId', 'owner', 'entersPrompt', 'results'],
     memory_working_write: ['record'],
-    agent_update_tools_profile: ['document'],
+    agent_update_tools_profile: ['status', 'document'],
     session_write_handoff: ['handoff'],
     files_read: ['encoding', 'bytes', 'modifiedAt', 'offsetBytes', 'returnedBytes', 'nextOffsetBytes'],
     files_write: ['encoding', 'created', 'overwrote', 'bytesWritten'],
