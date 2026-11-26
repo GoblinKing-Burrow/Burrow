@@ -1,6 +1,9 @@
+import { executeTaskWorkflowWaitTool } from './task-workflow-wait-tools.mjs';
+import { createCompletionEventSettings } from './completion-event-settings.mjs';
 import { createNativeToolExecutor } from './native-tool-executor.mjs';
 import { REFERENCE_IMAGE_ATTACHMENT_PREFIX, OPERATOR_REFERENCE_IMAGE_ATTACHMENT_PREFIX } from './postgres-agent-reference-image-store.mjs';
 import { searchAgentRunEvidence } from './run-evidence.mjs';
+import { executeOutcomeTool } from './outcome-tools.mjs';
 import { executeBrainTool } from './brain-tool-executor.mjs';
 import { executeSpawnSubagentTool } from './subagent-spawn-execution.mjs';
 import { listAgentPeers } from './agent-directory-tool.mjs';
@@ -257,7 +260,7 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       let result;
       try {
         const args = action.tool === 'forge_create_job'
-          ? { mode: action.forgeMode, connectionId: action.forgeConnectionId || action.connectionId, modelId: action.forgeModelId || action.modelId, prompt: action.forgePrompt || action.prompt, idempotencyKey: action.forgeIdempotencyKey || action.idempotencyKey, useAgentReferenceImage: action.useAgentReferenceImage, useOperatorReferenceImage: action.useOperatorReferenceImage, referenceAgentIds: action.referenceAgentIds, referenceAttachmentIds: action.referenceAttachmentIds, referenceArtifacts: action.referenceArtifacts, imageOptions: action.imageOptions }
+          ? { mode: action.forgeMode, connectionId: action.forgeConnectionId || action.connectionId, modelId: action.forgeModelId || action.modelId, prompt: action.forgePrompt || action.prompt, idempotencyKey: action.forgeIdempotencyKey || action.idempotencyKey, useAgentReferenceImage: action.useAgentReferenceImage, useOperatorReferenceImage: action.useOperatorReferenceImage, referenceAgentIds: action.referenceAgentIds, referenceAttachmentIds: action.referenceAttachmentIds, referenceArtifacts: action.referenceArtifacts, imageOptions: action.imageOptions, videoOptions: action.videoOptions }
           : action.tool === 'forge_list_gallery_folders' ? { name: action.galleryName }
           : action.tool === 'forge_list_gallery_images' ? { folderId: action.galleryFolderId }
           : action.tool === 'forge_move_gallery_image' ? { jobId: action.jobId, artifactId: action.artifactId, folderId: action.galleryFolderId }
@@ -284,6 +287,16 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       toolResults.push(result);
       await (traceLogger?.toolEnd || traceLogger?.tool)?.({ tool: action.tool, toolCallId: action.toolCallId || null,
         ...(started?.payload?.activityId ? { activityId: started.payload.activityId } : {}), ok: result.ok, error: result.error || null });
+      continue;
+    }
+
+    if (action.tool === 'verify_outcome') {
+      const started = await traceLogger?.toolStart?.({ tool: action.tool, toolCallId: action.toolCallId || null });
+      const result = await executeOutcomeTool(action.outcomeArguments, { signal: abortSignal || undefined });
+      toolResults.push(result);
+      await (traceLogger?.toolEnd || traceLogger?.tool)?.({ tool: action.tool, toolCallId: action.toolCallId || null,
+        ...(started?.payload?.activityId ? { activityId: started.payload.activityId } : {}), ok: result.ok,
+        outcomeStatus: result.outcomeCheck?.status || null, error: result.error || null });
       continue;
     }
 
@@ -372,6 +385,17 @@ export async function executeReviewedProposalActions({ conversationStore = null,
       const result = await executeContinuityHandoffWriteTool({ arguments: { title: action.title, content: action.content, sourceRefs: action.sourceRefs }, agentId, sessionId, runId: traceLogger?.runId || null, store: executionContext?.stores?.continuity });
       toolResults.push(result);
       await (traceLogger?.toolEnd || traceLogger?.tool)?.({ tool: 'session_write_handoff', ...(started?.payload?.activityId ? { activityId: started.payload.activityId } : {}), ok: result.ok, handoff: result.handoff || null, error: result.error || null });
+      continue;
+    }
+
+    if (['tasks_wait_for_workflow', 'tasks_list_workflow_waits'].includes(action.tool)) {
+      const started = await traceLogger?.toolStart?.({ tool: action.tool, taskId: action.workflowWaitArguments?.taskId, toolCallId: action.toolCallId || null });
+      const result = await executeTaskWorkflowWaitTool({ tool: action.tool, arguments: action.workflowWaitArguments,
+        agentId, sessionId: sessionId || executionContext?.sessionId, runId: traceLogger?.runId || executionContext?.parentRunId,
+        store: executionContext?.stores?.taskWorkflowWaits, tasks: executionContext?.stores?.tasks,
+        receiverSettings: executionContext?.stores?.completionEventSettings ? createCompletionEventSettings({store:executionContext.stores.completionEventSettings}) : null });
+      toolResults.push(result);
+      await (traceLogger?.toolEnd || traceLogger?.tool)?.({tool:action.tool, toolCallId:action.toolCallId || null, ...(started?.payload?.activityId ? {activityId:started.payload.activityId} : {}),ok:result.ok,waitId:result.wait?.id || null,error:result.error || null});
       continue;
     }
 

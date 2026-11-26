@@ -1,3 +1,7 @@
+import { correlateArchiveTools, archiveToolHistory, archiveToolResultForEntry as resultForEntry } from './archive-tool-history.mjs';
+import { archiveRunExecution, archiveRunStatus } from './archive-run-state.mjs';
+import { outcomeEvidenceForResult } from './outcome-tools.mjs';
+import { normalizeOutcomeCheck } from './outcome-verification.mjs';
 import { archiveReadCheckpoint, archiveReadTasks } from './archive-read-scope.mjs';
 import { isInternalContextSession } from './model-context-boundary.mjs';
 import { evidenceTranscript } from './session-search.mjs';
@@ -15,15 +19,8 @@ function boundedInteger(value, fallback = 100, max = MAX_RUNS) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.max(1, Math.min(max, Math.floor(number))) : fallback;
 }
-function statusFor({ receipt = null, evidence = null, answer = null } = {}) {
-  if (!receipt) return answer ? 'unverified' : 'incomplete';
-  const decision = text(receipt?.decision);
-  if (['model_failed', 'incomplete', 'failed'].includes(decision)) return 'failed';
-  if (['cancelled','interrupted'].includes(decision)) return 'warning';
-  if (failureEvidence(evidence).length || unresolvedEvidence(evidence).length) return 'warning';
-  if (answer?.metadata?.terminalStatus === 'failed' || answer?.metadata?.decision === 'model_failed') return 'failed';
-  return 'completed';
-}
+function statusFor(input = {}) { return archiveRunStatus(archiveRunExecution(input), input.answer); }
+
 function receiptFor(entries) {
   return entries.filter((entry) => entry.type === 'receipt').at(-1)?.metadata?.receiptRef || null;
 }
@@ -57,13 +54,7 @@ function safeDetail(value) {
   const compact = redactAndTruncateText(source.replace(/\s+/gu, ' '), { maxChars: TOOL_DETAIL_LIMIT });
   return compact.text ? `${compact.text}${compact.truncated ? '…' : ''}` : '';
 }
-function resultForEntry(entry = {}) {
-  if (entry.metadata?.normalizedResult && typeof entry.metadata.normalizedResult === 'object') return entry.metadata.normalizedResult;
-  try {
-    const parsed = JSON.parse(entry.content || '{}');
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch { return {}; }
-}
+
 function toolSummary(item = {}) {
   const result = item.result || {};
   const payload = item.payload || {};
@@ -95,58 +86,14 @@ function toolSummary(item = {}) {
   return `${tool}${provider ? ` via ${provider}` : ''}${target ? ` on ${target}` : ''} ${state}.`;
 }
 
-function correlatedToolTimeline(executionEntries = [], trace = null) {
-  const calls = new Set();
-  const byId = new Map();
-  let anonymous = 0;
-  const obtain = (ids, source) => {
-    const stableIds = (Array.isArray(ids) ? ids : [ids]).map(text).filter(Boolean);
-    let call = stableIds.map((id) => byId.get(id)).find(Boolean);
-    if (!call) {
-      call = { id: stableIds[0] || null, sources: new Set(), status: 'running', ts: null, finishedAt: null, anonymous: stableIds.length ? null : `${source}-anonymous-${anonymous += 1}` };
-      calls.add(call);
-    }
-    for (const id of stableIds) byId.set(id, call);
-    return call;
-  };
-  for (const item of Array.isArray(trace?.toolActivity) ? trace.toolActivity : []) {
-    const call = obtain([item.id, item.payload?.toolCallId], 'trace');
-    call.sources.add('trace');
-    call.tool = text(item.tool) || call.tool;
-    call.payload = { ...(call.payload || {}), ...(item.payload || {}) };
-    call.ts ||= item.startedAt || item.finishedAt || null;
-    if (item.status !== 'running') {
-      call.status = item.status === 'failed' ? 'failed' : 'completed';
-      call.finishedAt = item.finishedAt || call.finishedAt;
-    }
-  }
-  for (const entry of executionEntries) {
-    if (entry.type === 'tool_call') {
-      for (const raw of Array.isArray(entry.metadata?.toolCalls) ? entry.metadata.toolCalls : []) {
-        const call = obtain(raw?.id, 'session-call');
-        call.sources.add('session');
-        call.tool = text(raw?.tool) || text(raw?.name) || call.tool;
-        call.arguments = raw?.arguments && typeof raw.arguments === 'object' ? raw.arguments : {};
-        call.ts ||= entry.ts || null;
-      }
-      continue;
-    }
-    const result = resultForEntry(entry);
-    const call = obtain([entry.metadata?.callId, result.activityId, result.execution?.toolCallId], 'session-result');
-    call.sources.add('session');
-    call.result = result;
-    call.tool = text(result.tool) || text(entry.metadata?.tool) || call.tool;
-    call.status = (entry.metadata?.ok ?? result.ok) === false ? 'failed' : 'completed';
-    call.finishedAt = entry.ts || call.finishedAt;
-    call.ts ||= entry.ts || null;
-  }
-  return [...calls.values()].map((call) => ({
-    kind: call.sources.has('session') ? (call.status === 'running' ? 'tool_call' : 'tool_result') : 'tool_trace',
-    status: call.status === 'failed' ? 'failed' : call.status === 'running' ? 'warning' : 'ok',
-    ts: call.finishedAt || call.ts || null,
-    summary: toolSummary(call),
-    evidence: call.sources.size > 1 ? 'session_execution+trace_receipt' : call.sources.has('session') ? 'session_execution' : 'trace_receipt',
-    ...(call.id ? { callId: call.id } : {}),
+function correlatedToolTimeline(executionEntries = [], trace = null, execution = null) {
+  return correlateArchiveTools(executionEntries, trace, { terminal: execution?.status !== 'running' }).map(call => ({
+    kind: call.source === 'trace' ? 'tool_trace' : ['pending','unknown'].includes(call.status) && !call.result ? 'tool_call' : 'tool_result',
+    status: call.status === 'failed' ? 'failed' : call.status === 'pending' ? 'pending' : call.status === 'unknown' ? 'unknown' : 'ok',
+    ts: call.finishedAt || call.traceAt || call.ts || null,
+    summary: call.status === 'unknown' ? `${call.tool} — result not recorded.` : `${toolSummary({ ...call, status: call.status === 'pending' ? 'running' : call.status })}${call.detail ? ` · ${call.detail}` : ''}`,
+    evidence: call.source === 'trace' ? 'trace_receipt' : call.traceStatus ? 'session_execution+trace_receipt' : 'session_execution',
+    ...(call.callId ? { callId: call.callId } : {}),
   }));
 }
 
@@ -191,7 +138,7 @@ function operatorEvidenceText(item = {}, category = 'observation') {
       if (item.status === 'failed') return `Verification failed${command ? `: ${command}` : ''}.`;
       return `Verification passed${command ? `: ${command}` : ''}.`;
     }
-    if (item.status === 'failed') return `Command failed${command ? `: ${command}` : '.'}`;
+    if (item.status === 'failed' || category === 'unresolved') return `${category === 'unresolved' ? 'Recorded tool issue' : 'Command failed'}${command ? `: ${command}` : ''}${detail ? ` — ${safeDetail(detail)}` : '.'}`;
     return `Command completed${command ? `: ${command}` : '.'}`;
   }
   const labels = {
@@ -213,7 +160,7 @@ function evidenceItems(evidence = {}) {
   return ['observations', 'changes', 'validations', 'unresolved'].flatMap((key) => Array.isArray(evidence?.[key]) ? evidence[key] : []);
 }
 function failureEvidence(evidence = {}) {
-  return evidenceItems(evidence).filter((item) => item?.status === 'failed' || /^shell_exec:\s*(?:command )?failed/iu.test(text(item?.text))).slice(0, MAX_FAILURES);
+  return evidenceItems(evidence).filter((item) => !normalizeOutcomeCheck(item?.outcomeCheck) && (item?.status === 'failed' || /^shell_exec:\s*(?:command )?failed/iu.test(text(item?.text)))).slice(0, MAX_FAILURES);
 }
 function unresolvedEvidence(evidence = {}) {
   return (Array.isArray(evidence?.unresolved) ? evidence.unresolved : []).filter((item) => item?.status === 'unresolved' && !genericCompletionText(item?.text) && !/^shell_exec:\s*(?:command )?failed/iu.test(text(item?.text))).slice(0, MAX_FAILURES);
@@ -221,8 +168,12 @@ function unresolvedEvidence(evidence = {}) {
 function nonFailure(items = []) { return (Array.isArray(items) ? items : []).filter((item) => item?.status !== 'failed'); }
 
 function terminalSummary(receipt = null, status = 'completed') {
-  if (status === 'unverified') return 'Run has an assistant response but no terminal runtime receipt; outcome is unverified.';
-  if (status === 'incomplete') return 'Run ended without an assistant response or terminal runtime receipt; no outcome was recorded.';
+  if (status === 'running') return 'Run is in progress.';
+  if (status === 'superseded') return 'Run superseded.';
+  if (status === 'cancelled') return 'Run cancelled.';
+  if (status === 'interrupted') return 'Run interrupted.';
+  if (status === 'unverified') return 'Agent response retained; terminal execution state was not recorded.';
+  if (status === 'incomplete') return 'No completion or active execution state is recorded for this run.';
   const decision = text(receipt?.decision);
   if (decision === 'cancelled') return 'Run cancelled.';
   if (decision === 'interrupted') return 'Run interrupted.';
@@ -363,7 +314,7 @@ function childVerificationEvidence(subagents = []) {
   });
 }
 function verificationEvidence(evidence = {}, subagents = []) {
-  const recorded = nonFailure(evidence?.validations);
+  const recorded = (Array.isArray(evidence?.validations) ? evidence.validations : []).filter(item => item?.status !== 'failed' || normalizeOutcomeCheck(item?.outcomeCheck));
   return [...recorded.map((item) => ({ ...item, text: operatorEvidenceText(item, 'verification') })), ...childVerificationEvidence(subagents)];
 }
 function isLinkedChildObservation(item = {}, subagents = []) {
@@ -380,9 +331,13 @@ function contextEventSummary(event = {}) {
   const outcome = event.compression?.compressed ? 'compression applied' : event.compression?.attempted ? `compression not applied${event.compression?.reason ? ` (${event.compression.reason.replace(/[_-]+/gu, ' ')})` : ''}` : 'compression not evaluated';
   return [event.phase.replace(/[_-]+/gu, ' '), tokens, usage, threshold, outcome].filter(Boolean).join(' · ');
 }
-function timelineFor({ receipt, answer, activities, executionEntries, trace, evidence, context, subagents, lastActivityAt = null }) {
+function timelineFor({ execution, receipt, answer, request, workflowEvent, taskWorkflowWait, activities, executionEntries, trace, evidence, context, subagents, lastActivityAt = null }) {
   const timeline = [];
-  timeline.push(...correlatedToolTimeline(executionEntries, trace));
+  if (taskWorkflowWait) timeline.push({kind:'observation',status:'observed',ts:taskWorkflowWait.resumedAt || request?.ts || null,evidence:'runtime_receipt',summary:`Task ${taskWorkflowWait.taskId} resumed workflow wait ${taskWorkflowWait.id} from its durable checkpoint: ${safeDetail(taskWorkflowWait.checkpoint)}. Triggering event: ${taskWorkflowWait.trigger.id}. Workflow conclusion is not publication verification.`});
+  if (workflowEvent) timeline.push({ kind: 'observation', status: 'observed', ts: request?.ts || null,
+    summary: `Workflow event ${workflowEvent.id}: ${workflowEvent.repository} · ${workflowEvent.workflow} · GitHub run ${workflowEvent.runId}, attempt ${workflowEvent.runAttempt}, conclusion ${workflowEvent.conclusion}. Handling request: ${safeDetail(request?.content)}`,
+    evidence: 'runtime_receipt' });
+  timeline.push(...correlatedToolTimeline(executionEntries, trace, execution));
   // Activity cards are a legacy aggregate. Canonical calls/results or trace
   // activities are more precise and must not be rendered a second time.
   if (!executionEntries.length && !(Array.isArray(trace?.toolActivity) && trace.toolActivity.length)) for (const activity of activities) {
@@ -395,7 +350,7 @@ function timelineFor({ receipt, answer, activities, executionEntries, trace, evi
   }
   for (const item of observationEvidence(evidence, subagents)) timeline.push({ kind: 'observation', status: item.status, ts: evidence.createdAt || null, summary: operatorEvidenceText(item, 'observation'), evidence: 'run_evidence' });
   for (const item of nonFailure(evidence?.changes)) timeline.push({ kind: 'change', status: item.status, ts: evidence.createdAt || null, summary: operatorEvidenceText(item, 'change'), evidence: 'run_evidence' });
-  for (const item of verificationEvidence(evidence, subagents)) timeline.push({ kind: 'verification', status: item.status, ts: evidence?.createdAt || null, summary: item.text, evidence: item.sourceRefs?.[0]?.startsWith('subagent:') ? 'subagent_record' : 'run_evidence' });
+  for (const item of verificationEvidence(evidence, subagents)) timeline.push({ kind: 'verification', status: item.status, ts: item.outcomeCheck?.checkedAt || evidence?.createdAt || null, summary: item.text, evidence: item.outcomeCheck ? 'outcome_check' : item.sourceRefs?.[0]?.startsWith('subagent:') ? 'subagent_record' : 'run_evidence' });
   for (const item of failureEvidence(evidence)) timeline.push({ kind: 'failure', status: 'failed', ts: evidence.createdAt || null, summary: operatorFailureText(item), evidence: 'run_evidence' });
   for (const item of unresolvedEvidence(evidence)) timeline.push({ kind: 'unresolved', status: item.status, ts: evidence.createdAt || null, summary: operatorEvidenceText(item, 'unresolved'), evidence: 'run_evidence' });
   if (context) {
@@ -407,15 +362,41 @@ function timelineFor({ receipt, answer, activities, executionEntries, trace, evi
     timeline.push({ kind: 'context', status: context.compression?.compressed ? 'ok' : context.budget?.pressure === 'blocked' ? 'warning' : 'ok', ts: contextTs, summary: context.summary || contextSummary(context), evidence: 'runtime_receipt' });
   }
   for (const child of subagents) timeline.push({ kind: 'subagent', status: child.verification?.status === 'failed' ? 'failed' : child.status === 'succeeded' ? 'ok' : child.status === 'failed' || child.status === 'timed_out' ? 'failed' : 'warning', ts: child.completedAt || child.createdAt || null, summary: childTimelineSummary(child), evidence: 'subagent_record' });
-  const status = statusFor({ receipt, evidence, answer });
-  if (receipt?.decision || ['unverified', 'incomplete'].includes(status)) timeline.push({ kind: 'terminal', status: ['unverified', 'incomplete'].includes(status) ? 'warning' : status, ts: answer?.ts || evidence?.createdAt || lastActivityAt, summary: terminalSummary(receipt, status), evidence: receipt ? 'runtime_receipt' : 'archive_inference' });
+  const status = execution ? archiveRunStatus(execution, answer) : statusFor({ receipt, evidence, answer });
+  if (receipt?.decision || ['unverified', 'incomplete'].includes(status)) timeline.push({ kind: 'terminal', status: ['unverified', 'incomplete'].includes(status) ? 'unknown' : status, ts: answer?.ts || evidence?.createdAt || lastActivityAt, summary: terminalSummary(receipt, status), evidence: receipt ? 'runtime_receipt' : 'archive_inference' });
   return timeline.sort((left, right) => String(left.ts || '').localeCompare(String(right.ts || ''))).slice(-MAX_TIMELINE);
 }
 
-async function proofDetail({ conversationStore, agentId, agentName, sessionId, runId, entries, evidence, subagentRecords = [], traceRoot = null, signal, deadline }) {
+export function workflowEventFor(entries) {
+  const entry = entries.find(item => item.type === 'message' && item.role === 'user' && item.metadata?.source === 'workflow-event' && item.metadata?.completionEvent);
+  const value = entry?.metadata?.completionEvent;
+  if (!value || !['id', 'repository', 'workflow', 'runId', 'headSha', 'conclusion', 'url'].every(key => typeof value[key] === 'string' && value[key]) || !Number.isInteger(value.runAttempt)) return null;
+  return { ...Object.fromEntries(['id', 'repository', 'workflow', 'runId', 'runAttempt', 'headSha', 'conclusion', 'url'].map(key => [key, value[key]])), ...(typeof value.taskWaitId === 'string' && typeof value.taskId === 'string' ? { taskWaitId: value.taskWaitId, taskId: value.taskId } : {}) };
+}
+
+// Canonical tool results survive an interrupted terminal commit or metadata
+// eviction. Merge by physical call identity, never by an assistant's claim.
+function evidenceWithOutcomeChecks(evidence, entries, runId) {
+  const validations = [...(Array.isArray(evidence?.validations) ? evidence.validations : [])];
+  const keys = new Set(validations.filter(item => normalizeOutcomeCheck(item?.outcomeCheck)).map(item => item.callId || JSON.stringify(item.outcomeCheck)));
+  for (const entry of executionEntriesFor(entries).filter(item => item.type === 'tool_result' && item.metadata?.tool === 'verify_outcome')) {
+    const result = resultForEntry(entry);
+    const item = outcomeEvidenceForResult({ ...result, toolCallId: result.toolCallId || entry.metadata?.callId }, [`run:${runId}`]);
+    if (!item) continue;
+    const key = item.callId || JSON.stringify(item.outcomeCheck);
+    if (!keys.has(key)) { validations.push(item); keys.add(key); }
+  }
+  return validations.length ? { ...(evidence || {}), validations } : evidence;
+}
+
+async function proofDetail({ conversationStore, agentId, agentName, sessionId, runId, entries, evidence, continuityHead = null, subagentRecords = [], traceRoot = null, signal, deadline }) {
+  evidence = evidenceWithOutcomeChecks(evidence, entries, runId);
   const receipt = receiptFor(entries);
   const answer = answerFor(entries);
   const request = requestFor(entries);
+  const workflowEvent = workflowEventFor(entries);
+  const waitMetadata = entries.find(item => item.type === 'message' && item.role === 'user' && item.metadata?.source === 'workflow-event' && item.metadata?.taskWorkflowWait)?.metadata.taskWorkflowWait;
+  const taskWorkflowWait = workflowEvent && waitMetadata?.id === workflowEvent.taskWaitId && waitMetadata?.trigger?.id === workflowEvent.id && waitMetadata?.continuation?.runId === runId && waitMetadata?.taskId === workflowEvent.taskId ? waitMetadata : null;
   const activities = activitiesFor(entries);
   const executionEntries = executionEntriesFor(entries);
   const options = { signal, deadline };
@@ -426,7 +407,10 @@ async function proofDetail({ conversationStore, agentId, agentName, sessionId, r
   const trace = traceRoot ? await summarizeProofTrace({ rootDir: traceRoot, runId, ...options }) : null;
   archiveReadCheckpoint(options);
   const bounds = runBounds(entries, trace?.exists ? trace : null);
-  const status = statusFor({ receipt, evidence, answer });
+  const execution = archiveRunExecution({ receipt, answer, continuityHead, runId });
+  const status = archiveRunStatus(execution, answer);
+  const toolHistory = archiveToolHistory(correlateArchiveTools(executionEntries, null, { terminal: execution.status !== 'running' }));
+  delete toolHistory.traceOnly;
   const context = contextProof(receipt);
   if (context) context.summary = contextSummary(context);
   const subagents = childProof(subagentRecords, runId);
@@ -437,11 +421,11 @@ async function proofDetail({ conversationStore, agentId, agentName, sessionId, r
     agentId,
     agentName,
     sessionId,
-    status,
+    status, execution, toolHistory,
     startedAt: bounds.startedAt || evidence?.createdAt || answer?.ts || null,
-    completedAt: answer?.ts || evidence?.createdAt || null,
+    completedAt: ['running','not_recorded'].includes(execution.status) ? null : entries.filter(entry => entry.type === 'receipt').at(-1)?.ts || answer?.ts || null,
     lastActivityAt: bounds.lastActivityAt,
-    objective: evidence?.objective || null,
+    objective: evidence?.objective || request?.content?.slice(0, 900) || null,
     request: request?.content || null,
     finalAnswer: answer?.content || null,
     decision: receipt?.decision || null,
@@ -463,8 +447,10 @@ async function proofDetail({ conversationStore, agentId, agentName, sessionId, r
       unresolved: unresolvedEvidence(evidence).map((item) => ({ ...item, text: operatorEvidenceText(item, 'unresolved') })),
     },
     context,
+    ...(workflowEvent ? { workflowEvent } : {}),
+    ...(taskWorkflowWait ? { taskWorkflowWait } : {}),
     subagents,
-    timeline: timelineFor({ receipt, answer, activities, executionEntries, trace: trace?.exists ? trace : null, evidence, context, subagents, lastActivityAt: bounds.lastActivityAt }),
+    timeline: timelineFor({ execution, receipt, answer, request, workflowEvent, taskWorkflowWait, activities, executionEntries, trace: trace?.exists ? trace : null, evidence, context, subagents, lastActivityAt: bounds.lastActivityAt }),
     references: {
       trace: traceDir ? { runId, url: `/api/traces/${encodeURIComponent(runId)}?sessionId=${encodeURIComponent(sessionId)}` } : null,
       sourceRefs: evidence?.sourceRefs || [],
@@ -473,25 +459,30 @@ async function proofDetail({ conversationStore, agentId, agentName, sessionId, r
 }
 
 // List projection deliberately never builds detail or consults trace storage.
-function proofSummary({ agentId, agentName, sessionId, runId, entries, evidence, subagentRecords }) {
+function proofSummary({ agentId, agentName, sessionId, runId, entries, evidence, continuityHead = null, subagentRecords }) {
+  evidence = evidenceWithOutcomeChecks(evidence, entries, runId);
   const receipt = receiptFor(entries);
   const answer = answerFor(entries);
+  const request = requestFor(entries);
+  const execution = archiveRunExecution({ receipt, answer, continuityHead, runId });
+  const toolHistory = archiveToolHistory(correlateArchiveTools(executionEntriesFor(entries), null, { terminal: execution.status !== 'running' }));
+  delete toolHistory.traceOnly;
   const bounds = runBounds(entries);
   const children = subagentRecords.filter(record => record.owner?.parentRunId === runId).slice(0, 24);
   const childIds = new Set(children.map(record => record.id));
   return {
     id: runId, runId, agentId, agentName, sessionId,
-    status: statusFor({ receipt, evidence, answer }),
+    status: archiveRunStatus(execution, answer), execution, toolHistory,
     startedAt: bounds.startedAt || evidence?.createdAt || answer?.ts || null,
-    completedAt: answer?.ts || evidence?.createdAt || null,
+    completedAt: ['running','not_recorded'].includes(execution.status) ? null : entries.filter(entry => entry.type === 'receipt').at(-1)?.ts || answer?.ts || null,
     lastActivityAt: bounds.lastActivityAt,
-    objective: evidence?.objective || null,
+    objective: evidence?.objective || request?.content?.slice(0, 900) || null,
     decision: receipt?.decision || null,
     route: receipt?.route || null,
     counts: {
       observations: nonFailure(evidence?.observations).filter(item => !(text(item.tool) === 'spawn_subagent' && childIds.has(text(item.subagentId)))).length,
       changes: nonFailure(evidence?.changes).length,
-      verifications: nonFailure(evidence?.validations).length + children.filter(record => childVerification(record)).length,
+      verifications: verificationEvidence(evidence).length + children.filter(record => childVerification(record)).length,
       failures: failureEvidence(evidence).length,
       unresolved: unresolvedEvidence(evidence).length,
       toolActivities: entries.reduce((total, entry) => total + (entry.visibility === 'activity' ? Number(entry.metadata?.toolActivity?.totalCalls || 0) : 0), 0),
@@ -562,20 +553,39 @@ export async function listArchiveRunSummariesPage({ rootDir, conversationStore, 
   archiveReadCheckpoint(options);
   const subagentRecords = dataRoot ? await listSubagentRecords({ dataRoot, includeFinal: true, limit: 500, ...options }) : [];
   archiveReadCheckpoint(options);
+  const runs = directory.rows.map(row => ({
+    ...proofSummary({ agentId, agentName, sessionId: row.sessionId, runId: row.runId, entries: row.entries || [], evidence: row.evidence, continuityHead: row.continuityHead, subagentRecords }),
+    _sortTimestamp: row.sortTimestamp,
+  }));
+  return { runs, hasMore: directory.hasMore };
+}
+
+// Use the shared native directory to choose a global page before touching any
+// run evidence. Compatibility stores keep their existing per-scope path.
+export async function listArchiveRunSummariesForScopes({ scopes = [], sessionId = null, query = '', limit = 100, boundary = null, signal, deadline } = {}) {
+  const options = { signal, deadline };
+  archiveReadCheckpoint(options);
+  if (!scopes.length) return { runs: [], hasMore: false };
+  const store = scopes[0].conversationStore;
+  if (typeof store?.listArchiveRunDirectoryForAgents !== 'function'
+    || scopes.some(scope => scope.conversationStore !== store)) return null;
+  const byAgent = new Map(scopes.map(scope => [scope.agentId, scope]));
+  const directory = await store.listArchiveRunDirectoryForAgents({ agentIds: [...byAgent.keys()],
+    agentNames: Object.fromEntries(scopes.map(scope => [scope.agentId, scope.agentName])),
+    sessionId, query, limit, boundary, ...options });
+  archiveReadCheckpoint(options);
+  const selectedAgents = [...new Set(directory.rows.map(row => row.agentId))];
+  const children = new Map(await archiveReadTasks(selectedAgents.map(agentId => async readOptions => {
+    const { dataRoot } = byAgent.get(agentId);
+    return [agentId, dataRoot ? await listSubagentRecords({ dataRoot, includeFinal: true, limit: 500, ...readOptions }) : []];
+  }), options));
   const runs = directory.rows.map(row => {
-    const children = subagentRecords.filter(record => record.owner?.parentRunId === row.runId).slice(0, 24);
-    const evidence = row.evidence;
+    const scope = byAgent.get(row.agentId);
     return {
-      id: row.runId, runId: row.runId, agentId, agentName, sessionId: row.sessionId,
-      status: row.status,
-      startedAt: row.startedAt || evidence?.createdAt || null,
-      completedAt: row.completedAt || evidence?.createdAt || null,
-      lastActivityAt: row.lastActivityAt || row.completedAt || row.startedAt || null,
+      ...proofSummary({ agentId: row.agentId, agentName: scope.agentName, sessionId: row.sessionId,
+        runId: row.runId, entries: row.entries || [], evidence: row.evidence,
+        continuityHead: row.continuityHead, subagentRecords: children.get(row.agentId) || [] }),
       _sortTimestamp: row.sortTimestamp,
-      objective: evidence?.objective || null, decision: evidence?.decision || null, route: evidence?.route || null,
-      counts: { observations: nonFailure(evidence?.observations).length, changes: nonFailure(evidence?.changes).length,
-        verifications: nonFailure(evidence?.validations).length + children.filter(record => childVerification(record)).length,
-        failures: failureEvidence(evidence).length, unresolved: unresolvedEvidence(evidence).length, toolActivities: 0, subagents: children.length },
     };
   });
   return { runs, hasMore: directory.hasMore };
@@ -590,7 +600,7 @@ export async function readArchiveRun({ rootDir, conversationStore, dataRoot = nu
     const source = await conversationStore.readArchiveRunSource({ agentId, sessionId, runId, ...options });
     archiveReadCheckpoint(options);
     if (!source) return null;
-    return proofDetail({ conversationStore, agentId, agentName, sessionId: source.sessionId, runId, entries: source.entries, evidence: source.evidence, subagentRecords, traceRoot: traceRootFor({ traceRoot, resolveTraceRoot, sessionId: source.sessionId }), ...options });
+    return proofDetail({ conversationStore, agentId, agentName, sessionId: source.sessionId, runId, entries: source.entries, evidence: source.evidence, continuityHead: source.continuityHead, subagentRecords, traceRoot: traceRootFor({ traceRoot, resolveTraceRoot, sessionId: source.sessionId }), ...options });
   }
   for (const session of await recordsFor(conversationStore, agentId, sessionId, options)) {
     const [entries, evidence] = await archiveReadTasks([

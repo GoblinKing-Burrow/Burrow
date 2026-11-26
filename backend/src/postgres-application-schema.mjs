@@ -3,6 +3,7 @@ import { POSTGRES_AGENT_RUN_FEED_SQL } from './postgres-agent-run-feed.mjs';
 import { POSTGRES_SESSION_RECALL_NONBLOCKING_SQL } from './postgres-session-recall-nonblocking.mjs';
 import { POSTGRES_SESSION_RETRIEVAL_SQL } from './postgres-session-retrieval.mjs';
 import { POSTGRES_SESSION_RECALL_REPAIRS_SQL } from './postgres-session-recall-repairs.mjs';
+import { POSTGRES_SESSION_RECALL_RELEVANCE_SQL } from './postgres-session-recall-relevance.mjs';
 import { POSTGRES_CONVERSATION_EMBEDDINGS_SQL } from './postgres-conversation-embeddings.mjs';
 import { POSTGRES_RESET_PROJECTIONS_SQL } from './postgres-reset-projections.mjs';
 import { POSTGRES_CHAT_RESULT_PROJECTION_SQL } from './postgres-chat-result-projection.mjs';
@@ -303,4 +304,72 @@ CREATE TABLE forge_artifact_cleanup (
 );
 ` },
   { version: 106, name: 'per-mod-auto-update', sql: POSTGRES_MOD_AUTO_UPDATE_SCHEMA_SQL },
+  { version: 107, name: 'bounded-task-workflow-waits', sql: `
+CREATE TABLE github_completion_inbox (
+ repository TEXT NOT NULL, run_id TEXT NOT NULL, run_attempt INTEGER NOT NULL,
+ completion JSONB NOT NULL, received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ PRIMARY KEY(repository,run_id,run_attempt)
+);
+CREATE TABLE task_workflow_waits (
+ id UUID PRIMARY KEY, task_id TEXT NOT NULL, agent_id TEXT NOT NULL, session_id TEXT NOT NULL,
+ repository TEXT NOT NULL, workflow TEXT NOT NULL, run_id TEXT NOT NULL,
+ run_attempt INTEGER NOT NULL CHECK(run_attempt>0), head_sha TEXT NOT NULL,
+ checkpoint TEXT NOT NULL CHECK(char_length(checkpoint) BETWEEN 1 AND 20000),
+ status TEXT NOT NULL DEFAULT 'waiting' CHECK(status IN ('waiting','matched','resumed','skipped')),
+ reason_code TEXT, reason TEXT, source JSONB NOT NULL, trigger JSONB, continuation JSONB, outcome JSONB,
+ registered_at TIMESTAMPTZ NOT NULL DEFAULT now(), matched_at TIMESTAMPTZ, resumed_at TIMESTAMPTZ, finished_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX task_workflow_waits_active_idx ON task_workflow_waits(task_id) WHERE status IN ('waiting','matched');
+CREATE UNIQUE INDEX task_workflow_waits_source_idx ON task_workflow_waits(task_id,(source->>'agentId'),(source->>'sessionId'),(source->>'runId'));
+CREATE INDEX task_workflow_waits_target_idx ON task_workflow_waits(repository,run_id,run_attempt) WHERE status='waiting';
+CREATE INDEX task_workflow_waits_task_idx ON task_workflow_waits(task_id,registered_at DESC,id DESC);
+ALTER TABLE github_completion_events ADD COLUMN task_wait_id UUID;
+ALTER TABLE github_completion_events ADD COLUMN task_id TEXT;
+CREATE UNIQUE INDEX github_completion_events_wait_idx ON github_completion_events(task_wait_id) WHERE task_wait_id IS NOT NULL;
+CREATE INDEX github_completion_events_normalized_identity_idx ON github_completion_events(lower(repository),run_id,run_attempt);
+-- Retain skips across task deletion, reassignment, status changes and manual claims.
+CREATE FUNCTION burrow_invalidate_task_waits() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF TG_OP='DELETE' THEN
+  UPDATE task_workflow_waits SET status='skipped',reason_code='task_deleted',reason='Task deleted',finished_at=now() WHERE task_id=OLD.id AND status IN ('waiting','matched');
+  RETURN OLD;
+ END IF;
+ UPDATE task_workflow_waits SET status='skipped',reason_code='task_no_longer_eligible',reason='Task status, assignment or execution superseded wait',finished_at=now()
+ WHERE task_id=NEW.id AND status IN ('waiting','matched') AND
+ (NEW.status NOT IN ('todo','in_progress') OR NEW.assigned_agent_id IS DISTINCT FROM agent_id OR
+ (NEW.execution_json->>'runId' IS DISTINCT FROM OLD.execution_json->>'runId' AND NEW.execution_json->>'runId' IS DISTINCT FROM source->>'runId'));
+ RETURN NEW;
+END $$;
+CREATE TRIGGER task_workflow_wait_invalidation AFTER UPDATE OR DELETE ON task_board_tasks FOR EACH ROW EXECUTE FUNCTION burrow_invalidate_task_waits();
+` },
+  { version: 108, name: 'archive-run-occurrence-order-indexes', sql: `
+-- Match the exact bytewise occurrence tiebreakers used by Archive cursors.
+-- Existing published indexes/migrations stay unchanged.
+CREATE INDEX conversation_archive_runs_occurrence_order_idx
+ ON conversation_archive_runs(agent_id,sort_timestamp DESC,run_id COLLATE "C" DESC,session_id COLLATE "C" DESC);
+CREATE INDEX conversation_archive_runs_session_occurrence_order_idx
+ ON conversation_archive_runs(agent_id,session_id,sort_timestamp DESC,run_id COLLATE "C" DESC);
+` },
+  { version: 109, name: 'identity-deletion-lifecycle', sql: `
+CREATE TABLE identity_deletion_events (
+ event_id UUID PRIMARY KEY, agent_id TEXT NOT NULL, owner_mod_id TEXT, storage_reference TEXT, deleted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','complete','failed')),
+ attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, retry_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX identity_deletion_events_pending_idx ON identity_deletion_events(retry_at,deleted_at) WHERE state <> 'complete';
+CREATE TABLE identity_deletion_recipients (
+ event_id UUID NOT NULL REFERENCES identity_deletion_events(event_id) ON DELETE CASCADE,
+ mod_id TEXT NOT NULL, acknowledged_at TIMESTAMPTZ, attempts INTEGER NOT NULL DEFAULT 0,
+ last_error TEXT, retry_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(event_id,mod_id)
+);
+CREATE INDEX identity_deletion_recipients_pending_idx ON identity_deletion_recipients(mod_id,retry_at) WHERE acknowledged_at IS NULL;
+CREATE TABLE identity_deletion_handlers (
+ mod_id TEXT PRIMARY KEY, registered_at TIMESTAMPTZ NOT NULL DEFAULT now(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE identity_deletion_reconciliation (
+ agent_id TEXT PRIMARY KEY, event_id UUID NOT NULL UNIQUE REFERENCES identity_deletion_events(event_id) ON DELETE CASCADE,
+ recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+` },
+  { version: 110, name: 'session-recall-provenance-and-exactness', sql: POSTGRES_SESSION_RECALL_RELEVANCE_SQL },
 ]);

@@ -9990,6 +9990,189 @@
           }
         }
       }
+    },
+    "/api/archive/workflow-events/{agentId}/{eventId}": {
+      "get": {
+        "tags": [
+          "Archive"
+        ],
+        "summary": "Read an exact retained workflow delivery and handling Proof availability",
+        "operationId": "getArchiveWorkflowEvent",
+        "description": "Exact scoped retained event lookup independent of collection filters and pagination. An allocated chatRunId is not proof. Only an existing canonical handling run whose workflow provenance matches this entire delivery supplies a target. Missing or wrong-agent pairs return 404. Reads obey Archive cancellation/deadline ownership and existing UI authorization. No GitHub fetch, dispatch or outcome inference.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PathAgentId"
+          },
+          {
+            "name": "eventId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/ArchiveWorkflowEventDetailResponse"
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "504": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/task-board/tasks/{taskId}/workflow-waits": {
+      "get": {
+        "tags": [
+          "Task board"
+        ],
+        "summary": "Read durable workflow checkpoints and exact continuation outcomes for one task",
+        "operationId": "getTaskBoardWorkflowWaits",
+        "description": "Normally authenticated read-only inspection. No registration, webhook polling or dispatch. Missing task returns 404. Unknown or wrong-task pagination cursor returns 400; operational read failures return 500 rather than an empty page.",
+        "parameters": [
+          {
+            "name": "taskId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque task-scoped keyset cursor from nextCursor."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Retained task workflow waits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskWorkflowWaitListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "404": {
+            "$ref": "#/components/responses/ErrorResponse"
+          },
+          "500": {
+            "$ref": "#/components/responses/ErrorResponse"
+          }
+        }
+      }
+    },
+    "/api/agents/deletions": {
+      "get": {
+        "tags": [
+          "Agents"
+        ],
+        "summary": "List pending or failed identity cleanup receipts",
+        "operationId": "listAgentDeletionCleanup",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pending and failed cleanup state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ok",
+                    "deletions"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "deletions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "eventId": {
+                            "type": "string"
+                          },
+                          "agentId": {
+                            "type": "string"
+                          },
+                          "ownerModId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "state": {
+                            "type": "string",
+                            "enum": [
+                              "pending",
+                              "failed"
+                            ]
+                          },
+                          "attempts": {
+                            "type": "integer"
+                          },
+                          "lastError": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "storagePending": {
+                            "type": "boolean"
+                          },
+                          "recipients": {
+                            "type": "array",
+                            "items": {
+                              "type": "object"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -11356,6 +11539,16 @@
             }
           }
         }
+      },
+      "ArchiveWorkflowEventDetailResponse": {
+        "description": "Exact retained workflow event and provenance-checked handling Proof availability.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ArchiveWorkflowEventDetailResponse"
+            }
+          }
+        }
       }
     },
     "schemas": {
@@ -12002,6 +12195,35 @@
           },
           "agent": {
             "$ref": "#/components/schemas/AgentCreate"
+          },
+          "cleanup": {
+            "type": "object",
+            "description": "Durable deletion cleanup receipt state (returned by DELETE).",
+            "properties": {
+              "eventId": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "failed",
+                  "complete"
+                ]
+              },
+              "attempts": {
+                "type": "integer"
+              },
+              "lastError": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "storagePending": {
+                "type": "boolean"
+              }
+            }
           }
         },
         "additionalProperties": true
@@ -14157,6 +14379,20 @@
           "agentName": {
             "type": "string",
             "description": "Current agent name, falling back to agentId."
+          },
+          "taskWaitId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Task wait source snapshot; null for ordinary standing watches."
+          },
+          "taskId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Task wait source snapshot; null for ordinary standing watches."
           }
         },
         "additionalProperties": false
@@ -14840,8 +15076,13 @@
           "warning",
           "failed",
           "unverified",
-          "incomplete"
-        ]
+          "incomplete",
+          "running",
+          "cancelled",
+          "interrupted",
+          "superseded"
+        ],
+        "description": "Execution state only. Legacy warning is retained for older clients; failed tool attempts and independent outcome checks are separate. incomplete/unverified mean completion was not recorded, not proof of execution failure."
       },
       "ArchiveEvidenceItem": {
         "type": "object",
@@ -14869,6 +15110,15 @@
             "items": {
               "type": "string"
             }
+          },
+          "tool": {
+            "type": "string"
+          },
+          "callId": {
+            "type": "string"
+          },
+          "outcomeCheck": {
+            "$ref": "#/components/schemas/OutcomeCheck"
           }
         },
         "additionalProperties": false
@@ -14964,8 +15214,17 @@
               "run_evidence",
               "runtime_receipt",
               "subagent_record",
-              "archive_inference"
+              "archive_inference",
+              "outcome_check",
+              "session_execution+trace_receipt"
             ]
+          },
+          "callId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Canonical physical tool call correlation ID when retained."
           }
         },
         "additionalProperties": false
@@ -14983,7 +15242,9 @@
           "evidence",
           "timeline",
           "references",
-          "subagents"
+          "subagents",
+          "execution",
+          "toolHistory"
         ],
         "properties": {
           "id": {
@@ -15150,6 +15411,63 @@
               "null"
             ],
             "description": "Exact canonical user message that initiated this run, when retained."
+          },
+          "workflowEvent": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "repository": {
+                "type": "string"
+              },
+              "workflow": {
+                "type": "string"
+              },
+              "runId": {
+                "type": "string"
+              },
+              "headSha": {
+                "type": "string"
+              },
+              "conclusion": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              },
+              "runAttempt": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "taskWaitId": {
+                "type": "string"
+              },
+              "taskId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "repository",
+              "workflow",
+              "runId",
+              "headSha",
+              "conclusion",
+              "url",
+              "runAttempt"
+            ],
+            "additionalProperties": false,
+            "description": "Trusted canonical workflow-event provenance of this exact handling run. id is the retained completion delivery UUID, not the GitHub run ID; combine with run.agentId for the exact Archive event backlink. Availability may change with retention; the event detail route returns a truthful 404 instead of another delivery."
+          },
+          "taskWorkflowWait": {
+            "$ref": "#/components/schemas/TaskWorkflowWait"
+          },
+          "execution": {
+            "$ref": "#/components/schemas/ArchiveRunExecution"
+          },
+          "toolHistory": {
+            "$ref": "#/components/schemas/ArchiveToolHistory"
           }
         },
         "additionalProperties": false
@@ -15169,7 +15487,7 @@
           "runs": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/ArchiveRunDetail"
+              "$ref": "#/components/schemas/ArchiveRunSummary"
             }
           },
           "nextCursor": {
@@ -16105,6 +16423,9 @@
           },
           "imageOptions": {
             "$ref": "#/components/schemas/ForgeImageOptions"
+          },
+          "videoOptions": {
+            "$ref": "#/components/schemas/ForgeVideoOptions"
           }
         },
         "required": [
@@ -16223,6 +16544,9 @@
               "minLength": 1
             },
             "description": "Ordered runtime-owned PNG/JPEG/WebP chat attachment IDs. Requires trusted runtime agent/session context; operator HTTP calls without that context fail closed. No bytes or arbitrary paths. Snapshotted with hashes before dispatch."
+          },
+          "videoOptions": {
+            "$ref": "#/components/schemas/ForgeVideoOptions"
           }
         },
         "required": [
@@ -16324,6 +16648,23 @@
                 "description": "Combined reference image limit when advertised."
               }
             }
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "image",
+              "music",
+              "speech",
+              "video"
+            ],
+            "description": "Present on supported models; comes from the same provider contract used by the worker."
+          },
+          "connectionLevel": {
+            "type": "boolean",
+            "description": "True for a native connection capability such as xAI TTS. Its local modelId selector is not sent as a provider model."
+          },
+          "videoOptions": {
+            "$ref": "#/components/schemas/ForgeVideoOptionsCapability"
           }
         },
         "required": [
@@ -16370,11 +16711,13 @@
             "type": "object",
             "properties": {
               "available": {
-                "const": false,
                 "type": "boolean"
               },
               "reason": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -16391,12 +16734,20 @@
             ],
             "properties": {
               "available": {
-                "type": "boolean",
-                "const": false
+                "type": "boolean"
               },
               "reason": {
-                "type": "string",
-                "const": "music_model_not_configured"
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "models": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ForgeModel"
+                },
+                "description": "Configured supported music contracts, not every audio output model."
               }
             }
           },
@@ -22473,6 +22824,889 @@
             "$ref": "#/components/schemas/ProviderRequestDetail"
           }
         }
+      },
+      "ForgeVideoOptions": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": false,
+        "description": "Video-only xAI settings; consult the selected model videoOptions workflow. Omitted/null/empty preserves provider defaults. Only explicitly supplied keys are persisted and sent. Workflow defaults to text-to-video without images or the catalog defaultReferenceWorkflow with images. Starting-frame animation inherits image aspect ratio and rejects explicit aspectRatio; subject references limit resolution/duration. Unsupported combinations are rejected before dispatch, never ignored.",
+        "properties": {
+          "workflow": {
+            "type": "string",
+            "enum": [
+              "text-to-video",
+              "image-to-video",
+              "reference-to-video"
+            ]
+          },
+          "durationSeconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 15
+          },
+          "aspectRatio": {
+            "type": "string",
+            "enum": [
+              "1:1",
+              "16:9",
+              "9:16",
+              "4:3",
+              "3:4",
+              "3:2",
+              "2:3",
+              "21:9",
+              "5:2"
+            ]
+          },
+          "resolution": {
+            "type": "string",
+            "enum": [
+              "480p",
+              "720p",
+              "1080p"
+            ]
+          }
+        }
+      },
+      "ForgeVideoWorkflowCapability": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "minImages",
+          "maxImages",
+          "durationSeconds",
+          "aspectRatios",
+          "resolutions",
+          "defaults"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "text-to-video",
+              "image-to-video",
+              "reference-to-video"
+            ]
+          },
+          "minImages": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maxImages": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6
+          },
+          "durationSeconds": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "min",
+              "max",
+              "default"
+            ],
+            "properties": {
+              "min": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "max": {
+                "type": "integer",
+                "maximum": 15
+              },
+              "default": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 15
+              }
+            }
+          },
+          "aspectRatios": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "1:1",
+                "16:9",
+                "9:16",
+                "4:3",
+                "3:4",
+                "3:2",
+                "2:3",
+                "21:9",
+                "5:2"
+              ]
+            },
+            "description": "Empty when aspect ratio follows the starting image; do not send aspectRatio."
+          },
+          "resolutions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "480p",
+                "720p",
+                "1080p"
+              ]
+            }
+          },
+          "defaults": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "resolution"
+            ],
+            "properties": {
+              "aspectRatio": {
+                "type": "string",
+                "enum": [
+                  "1:1",
+                  "16:9",
+                  "9:16",
+                  "4:3",
+                  "3:4",
+                  "3:2",
+                  "2:3",
+                  "21:9",
+                  "5:2"
+                ]
+              },
+              "resolution": {
+                "type": "string",
+                "enum": [
+                  "480p",
+                  "720p",
+                  "1080p"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "ForgeVideoOptionsCapability": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "defaultWorkflow",
+          "defaultReferenceWorkflow",
+          "workflows"
+        ],
+        "description": "Shared model/provider workflow contract for video controls and dispatch. Defaults describe the provider and are not injected into omitted requests. Image counts combine all portrait, Gallery, and chat selectors. Google video does not advertise these xAI-specific options.",
+        "properties": {
+          "defaultWorkflow": {
+            "type": "string",
+            "enum": [
+              "text-to-video",
+              "image-to-video",
+              "reference-to-video"
+            ]
+          },
+          "defaultReferenceWorkflow": {
+            "type": "string",
+            "enum": [
+              "text-to-video",
+              "image-to-video",
+              "reference-to-video"
+            ]
+          },
+          "workflows": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/ForgeVideoWorkflowCapability"
+            }
+          }
+        }
+      },
+      "OutcomeCheck": {
+        "type": "object",
+        "properties": {
+          "schemaVersion": {
+            "type": "integer",
+            "const": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "outcome-check"
+            ]
+          },
+          "verifier": {
+            "type": "string",
+            "enum": [
+              "github_public_release"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "verified",
+              "mismatch",
+              "unverified"
+            ]
+          },
+          "expected": {
+            "type": "object",
+            "properties": {
+              "repository": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              },
+              "artifact": {
+                "type": "object",
+                "properties": {
+                  "sourceTreeSha": {
+                    "type": "string"
+                  },
+                  "imageRepository": {
+                    "type": "string"
+                  },
+                  "imageId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "sourceTreeSha"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "repository",
+              "version",
+              "artifact"
+            ],
+            "additionalProperties": false
+          },
+          "observed": {
+            "type": "object",
+            "properties": {
+              "repository": {
+                "type": "string"
+              },
+              "version": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "artifact": {
+                "type": "object",
+                "properties": {
+                  "sourceTreeSha": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "imageRepository": {
+                    "type": "string"
+                  },
+                  "imageId": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "manifestDigest": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "sourceTreeSha"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "repository",
+              "version",
+              "artifact"
+            ],
+            "additionalProperties": false
+          },
+          "checkedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "reasonCode": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "evidenceSources": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "checkedAt": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "statusCode": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 100,
+                  "maximum": 599
+                }
+              },
+              "required": [
+                "kind",
+                "url",
+                "checkedAt",
+                "statusCode"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "intentSource": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "caller_supplied"
+                ]
+              },
+              "sourceRefs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "kind",
+              "sourceRefs"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "schemaVersion",
+          "kind",
+          "verifier",
+          "status",
+          "expected",
+          "observed",
+          "checkedAt",
+          "reasonCode",
+          "reason",
+          "evidenceSources",
+          "intentSource"
+        ],
+        "additionalProperties": false,
+        "description": "Runtime-executed outcome check, independent of workflow conclusion or agent completion. Expected identity is caller-supplied intent, never inferred from observed publication. Checks public final release/source tree and optionally requested GHCR image identity; not installation proof."
+      },
+      "ArchiveWorkflowHandlingProof": {
+        "type": "object",
+        "description": "available means retained exact handling evidence, not handling success or publication verification. Pending/running without retained evidence is not_recorded; terminal without retained evidence or mismatched provenance is unavailable. Only available has a target. Transient read failures propagate as errors, never as guessed availability.",
+        "required": [
+          "status",
+          "reasonCode",
+          "reason",
+          "target"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "unavailable",
+              "not_recorded"
+            ]
+          },
+          "reasonCode": {
+            "type": "string",
+            "enum": [
+              "proof_available",
+              "event_provenance_mismatch",
+              "handling_not_started",
+              "proof_not_recorded",
+              "proof_unavailable"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "target": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "agentId",
+                  "sessionId",
+                  "runId"
+                ],
+                "properties": {
+                  "agentId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "sessionId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "runId": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "ArchiveWorkflowEventDetailResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "event",
+          "handlingProof"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "event": {
+            "$ref": "#/components/schemas/ArchiveWorkflowEvent"
+          },
+          "handlingProof": {
+            "$ref": "#/components/schemas/ArchiveWorkflowHandlingProof"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskWorkflowWait": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "taskId": {
+            "type": "string"
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "workflow": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "headSha": {
+            "type": "string"
+          },
+          "checkpoint": {
+            "type": "string"
+          },
+          "runAttempt": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2147483647
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "waiting",
+              "matched",
+              "resumed",
+              "skipped"
+            ],
+            "description": "Resumed means canonical continuation admitted, not success. outcome records the eventual canonical result separately."
+          },
+          "reasonCode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "registeredAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "matchedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "resumedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "finishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "source": {
+            "type": "object",
+            "properties": {
+              "agentId": {
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "runId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "agentId",
+              "sessionId",
+              "runId"
+            ],
+            "additionalProperties": false
+          },
+          "trigger": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "repository": {
+                    "type": "string"
+                  },
+                  "workflow": {
+                    "type": "string"
+                  },
+                  "runId": {
+                    "type": "string"
+                  },
+                  "headSha": {
+                    "type": "string"
+                  },
+                  "conclusion": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  },
+                  "completedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "runAttempt": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "id",
+                  "repository",
+                  "workflow",
+                  "runId",
+                  "runAttempt",
+                  "headSha",
+                  "conclusion",
+                  "url",
+                  "completedAt"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "continuation": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "agentId": {
+                    "type": "string"
+                  },
+                  "sessionId": {
+                    "type": "string"
+                  },
+                  "runId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "agentId",
+                  "sessionId",
+                  "runId"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "outcome": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "Exact canonical task execution receipt after completion/reconciliation, not publication proof."
+          }
+        },
+        "required": [
+          "id",
+          "taskId",
+          "agentId",
+          "sessionId",
+          "repository",
+          "workflow",
+          "runId",
+          "headSha",
+          "checkpoint",
+          "runAttempt",
+          "status",
+          "reasonCode",
+          "reason",
+          "registeredAt",
+          "matchedAt",
+          "resumedAt",
+          "finishedAt",
+          "source",
+          "trigger",
+          "continuation",
+          "outcome"
+        ],
+        "additionalProperties": false,
+        "description": "Durable task checkpoint and exact GitHub target. Source comes from the runtime; trigger is signed external data, not authority. Terminal snapshots remain readable."
+      },
+      "TaskWorkflowWaitListResponse": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "waits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskWorkflowWait"
+            }
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "waits",
+          "hasMore",
+          "nextCursor"
+        ],
+        "additionalProperties": false
+      },
+      "ArchiveRunExecution": {
+        "type": "object",
+        "required": [
+          "status",
+          "reasonCode",
+          "reason",
+          "source"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "running",
+              "completed",
+              "failed",
+              "cancelled",
+              "interrupted",
+              "superseded",
+              "not_recorded"
+            ]
+          },
+          "reasonCode": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "runtime_receipt",
+              "assistant_metadata",
+              "continuity_state",
+              "not_recorded"
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "description": "Runtime execution facts, independent of tool history and outcome verification. Only an exact persisted active continuity head establishes running. Missing terminal state is not a failed run."
+      },
+      "ArchiveToolHistory": {
+        "type": "object",
+        "required": [
+          "total",
+          "completed",
+          "failed",
+          "pending",
+          "unknown"
+        ],
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "completed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unknown": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false,
+        "description": "Counts of canonical session tool records, after strong call-ID correlation. Failed attempts remain historical failures, not proof of unfinished work or recovery. Unknown means a result or its explicit outcome is not recorded. Trace-only supplemental records are not counted."
+      },
+      "ArchiveRunSummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "runId",
+          "agentId",
+          "sessionId",
+          "status",
+          "execution",
+          "toolHistory",
+          "counts"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "agentName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ArchiveRunStatus"
+          },
+          "execution": {
+            "$ref": "#/components/schemas/ArchiveRunExecution"
+          },
+          "toolHistory": {
+            "$ref": "#/components/schemas/ArchiveToolHistory"
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "lastActivityAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "objective": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "route": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          },
+          "counts": {
+            "$ref": "#/components/schemas/ArchiveRunCounts"
+          }
+        },
+        "additionalProperties": false,
+        "description": "Compact canonical list projection. Execution and toolHistory match detail, without loading traces, tool output, response prose, or detail packets."
       }
     },
     "securitySchemes": {

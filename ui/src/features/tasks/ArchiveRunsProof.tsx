@@ -2,8 +2,15 @@ import { minionOutcome } from '../../app/minionOutcome';
 import { useEffect, useRef, useState, type SyntheticEvent } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { markdownPlugins, MarkdownImage, MarkdownTable } from '../../app/markdownTables';
-import type { ArchiveRunDetail } from '../../app/api';
+import { ProofOutcomeCheck, outcomeMarkdown, publicReleaseCheck } from './ProofOutcomeCheck';
+import type {
+  ArchiveRunDetail,
+  ArchiveRunSummary,
+  ArchiveVerification,
+  WorkflowCompletionEvent,
+} from '../../app/api';
 import { archiveRepository, type ArchiveRepository } from './archiveRepository';
+import type { EventKey, ProofKey } from './archiveTypes';
 import { ProviderRequestHistory } from './ProviderRequestHistory';
 
 function date(value?: string | null) {
@@ -15,7 +22,7 @@ function date(value?: string | null) {
         parsed,
       );
 }
-function duration(run: ArchiveRunDetail) {
+function duration(run: ArchiveRunSummary) {
   if (!run.startedAt || !run.completedAt) return '—';
   const ms = new Date(run.completedAt).getTime() - new Date(run.startedAt).getTime();
   return Number.isFinite(ms) && ms >= 0
@@ -25,25 +32,139 @@ function duration(run: ArchiveRunDetail) {
     : '—';
 }
 
-type ArchiveRunStatusPresentation = { label: string; detail?: string };
+function runListTitle(run: ArchiveRunSummary) {
+  const objective = run.objective?.trim().replace(/\s+/g, ' ');
+  if (!objective || objective === run.runId) return 'No objective recorded';
+  // The button's accessible name should be an excerpt too, not the whole message.
+  const excerpt = Array.from(objective).slice(0, 140).join('');
+  return excerpt === objective ? objective : `${excerpt.trimEnd()}…`;
+}
 
-const archiveRunStatus: Record<ArchiveRunDetail['status'], ArchiveRunStatusPresentation> = {
-  completed: { label: 'Completed' },
-  warning: { label: 'Warning' },
-  failed: { label: 'Failed' },
-  unverified: {
-    label: 'Unverified',
-    detail:
-      'A final answer was recorded, but no terminal receipt was captured. Treat this outcome as unverified.',
-  },
-  incomplete: {
-    label: 'Incomplete',
-    detail: 'Neither a final answer nor a terminal receipt was captured for this run.',
-  },
-};
-
-function statusInfo(status: ArchiveRunDetail['status']) {
-  return archiveRunStatus[status];
+function executionInfo(run: ArchiveRunSummary) {
+  const status = run.execution?.status ?? 'not_recorded';
+  const labels = {
+    running: 'Running',
+    completed: 'Completed',
+    failed: 'Failed',
+    cancelled: 'Cancelled',
+    interrupted: 'Interrupted',
+    superseded: 'Superseded',
+    not_recorded: 'Not recorded',
+  };
+  return {
+    label: labels[status],
+    status,
+    reason: run.execution?.reason || 'This archive does not include a canonical execution record.',
+  };
+}
+function toolHistoryText(run: ArchiveRunSummary) {
+  const history = run.toolHistory;
+  if (!history) return 'Tool results not summarized';
+  if (!history.total) return 'No tool activity recorded';
+  return (
+    [
+      history.failed > 0 &&
+        `${history.failed} failed ${history.failed === 1 ? 'attempt' : 'attempts'}`,
+      history.completed > 0 && `${history.completed} completed`,
+      history.pending > 0 &&
+        `${history.pending} ${run.execution?.status === 'running' ? 'awaiting result' : 'result not recorded'}`,
+      history.unknown > 0 && `${history.unknown} unknown`,
+    ]
+      .filter(Boolean)
+      .join(' · ') || `${history.total} tool activities`
+  );
+}
+function verificationHint(run: ArchiveRunSummary) {
+  const count = run.counts.verifications;
+  return count
+    ? `${count} verification ${count === 1 ? 'record' : 'records'}`
+    : 'No verification recorded';
+}
+function verificationInfo(run: ArchiveRunDetail) {
+  const items = run.evidence.verifications;
+  const checks = items.map(publicReleaseCheck).filter((check) => !!check);
+  const other = items.filter((item) => !publicReleaseCheck(item));
+  const failures = other.filter((item) => item.status === 'failed').length;
+  if (!checks.length)
+    return {
+      label: `${verificationHint(run)}${failures ? ` · ${failures} failed` : ''}`,
+      status: failures ? 'failed' : 'not_recorded',
+      detail: items.length ? 'See recorded evidence below.' : '',
+    };
+  const statuses = ['mismatch', 'unverified', 'verified'] as const;
+  const label = [
+    ...statuses.map((status) => {
+      const count = checks.filter((check) => check.status === status).length;
+      return count ? `${count} ${status}` : '';
+    }),
+    other.length &&
+      `${other.length} other ${other.length === 1 ? 'record' : 'records'}${failures ? ` · ${failures} failed` : ''}`,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+  return {
+    label,
+    status: checks.some((c) => c.status === 'mismatch')
+      ? 'mismatch'
+      : failures
+        ? 'failed'
+        : checks.some((c) => c.status === 'unverified')
+          ? 'unverified'
+          : other.length
+            ? 'not_recorded'
+            : 'verified',
+    detail: other.length
+      ? 'Recorded checks and evidence · details below'
+      : 'Public release checks · details below',
+  };
+}
+function RunActivity({ run }: { run: ArchiveRunSummary }) {
+  return (
+    <p className="proof-run-hints">
+      {[
+        duration(run) !== '—' && duration(run),
+        verificationHint(run),
+        run.toolHistory?.total && `Tools: ${toolHistoryText(run)}`,
+      ]
+        .filter(Boolean)
+        .join(' · ')}
+    </p>
+  );
+}
+function RunSummary({ run }: { run: ArchiveRunDetail }) {
+  const execution = executionInfo(run),
+    verification = verificationInfo(run);
+  return (
+    <dl className="proof-run-summary" aria-label="Run summary">
+      <div>
+        <dt>Execution</dt>
+        <dd>
+          <strong className={`proof-status-badge proof-status-${execution.status}`}>
+            {execution.label}
+          </strong>
+          <p>{execution.reason}</p>
+        </dd>
+      </div>
+      <div>
+        <dt>Verification</dt>
+        <dd>
+          <strong className={`proof-summary-verification proof-status-${verification.status}`}>
+            {verification.label}
+          </strong>
+          {verification.detail && <p>{verification.detail}</p>}
+        </dd>
+      </div>
+      <div>
+        <dt>Tool history</dt>
+        <dd>
+          <strong>{toolHistoryText(run)}</strong>
+          {!!(run.toolHistory?.failed || run.toolHistory?.pending || run.toolHistory?.unknown) && (
+            <p>Recorded attempts, not an open-work list.</p>
+          )}
+        </dd>
+      </div>
+    </dl>
+  );
 }
 type ChildVerification = NonNullable<ArchiveRunDetail['subagents'][number]['verification']>;
 const childVerificationStatus: Record<
@@ -74,11 +195,38 @@ async function copyText(text: string) {
   textarea.remove();
   return copied;
 }
+function workflowLabel(event: WorkflowCompletionEvent) {
+  return [
+    `GitHub conclusion: ${event.conclusion || 'Not recorded'}`,
+    [
+      event.workflow || event.repository,
+      event.runId
+        ? `#${event.runId}${event.runAttempt ? ` · attempt ${event.runAttempt}` : ''}`
+        : '',
+    ]
+      .filter(Boolean)
+      .join(' '),
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
+function missingOutcome(run: ArchiveRunDetail) {
+  return run.workflowEvent && !run.evidence.verifications.some((item) => item.outcomeCheck)
+    ? 'No outcome check recorded.'
+    : undefined;
+}
 function proofMarkdown(run: ArchiveRunDetail) {
-  const evidence = (title: string, items: ArchiveRunDetail['evidence']['observations']) =>
-    items.length
-      ? `### ${title}\n${items.map((item) => `- **${item.status}** ${item.text}`).join('\n')}`
-      : `### ${title}\n_No ${title.toLowerCase()} recorded._`;
+  const evidence = (title: string, items: ArchiveVerification[], note?: string) =>
+    [
+      `### ${title}`,
+      ...items.map((item) => {
+        const check = title === 'Verification' ? publicReleaseCheck(item) : undefined;
+        return check ? outcomeMarkdown(check) : `- **${item.status}** ${item.text}`;
+      }),
+      note ? `_${note}_` : !items.length ? `_No ${title.toLowerCase()} recorded._` : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
   const timeline = run.timeline.length
     ? run.timeline
         .map(
@@ -90,27 +238,37 @@ function proofMarkdown(run: ArchiveRunDetail) {
   return [
     `# ${run.objective || run.runId}`,
     `- Agent: ${run.agentName || run.agentId}`,
-    `- Status: ${statusInfo(run.status).label}`,
+    `- ${run.workflowEvent ? 'Burrow handling / execution' : 'Execution'}: ${executionInfo(run).label}`,
+    `- Execution reason: ${executionInfo(run).reason}`,
+    `- Verification: ${verificationInfo(run).label}`,
+    `- Tool history: ${toolHistoryText(run)}`,
+    run.workflowEvent ? `- ${workflowLabel(run.workflowEvent)}` : '',
     `- Started: ${date(run.startedAt)}`,
     `- Completed: ${date(run.completedAt)}`,
     `- Duration: ${duration(run)}`,
     `- Decision: ${run.decision || 'No terminal decision'}`,
     '',
     run.request ? `## Request\n\n${run.request}` : '',
-    run.finalAnswer ? `## Final outcome\n\n${run.finalAnswer}` : '',
+    run.finalAnswer ? `## Agent response\n\n${run.finalAnswer}` : '',
     '## Counts',
     `- Observations: ${run.counts.observations}`,
     `- Changes: ${run.counts.changes}`,
     `- Verifications: ${run.counts.verifications}`,
-    `- Unresolved: ${run.counts.unresolved}`,
+    `- Recorded issues: ${run.counts.unresolved}`,
     `- Tool activity: ${run.counts.toolActivities}`,
     `- Minions: ${run.counts.subagents}`,
     '',
     evidence('Actions / changes', run.evidence.changes),
     '',
-    evidence('Verification', run.evidence.verifications),
+    evidence('Verification', run.evidence.verifications, missingOutcome(run)),
     '',
-    evidence('Unresolved', run.evidence.unresolved),
+    evidence(
+      'Recorded issues',
+      run.evidence.unresolved,
+      run.evidence.unresolved.length
+        ? 'Recorded during this run; may include earlier failed attempts.'
+        : undefined,
+    ),
     '',
     '## Timeline',
     timeline,
@@ -124,9 +282,11 @@ function proofMarkdown(run: ArchiveRunDetail) {
 function EvidenceList({
   title,
   items,
+  note,
 }: {
   title: string;
-  items: ArchiveRunDetail['evidence']['observations'];
+  items: ArchiveVerification[];
+  note?: string;
 }) {
   return (
     <section className="proof-section">
@@ -136,16 +296,28 @@ function EvidenceList({
       </h3>
       {items.length ? (
         <ul>
-          {items.map((item, index) => (
-            <li key={`${item.text}-${index}`}>
-              <strong className={`proof-status proof-status-${item.status}`}>{item.status}</strong>
-              <span>{item.text}</span>
-            </li>
-          ))}
+          {items.map((item, index) => {
+            const check = title === 'Verification' ? publicReleaseCheck(item) : undefined;
+            return (
+              <li key={`${item.text}-${index}`}>
+                {check ? (
+                  <ProofOutcomeCheck check={check} />
+                ) : (
+                  <>
+                    <strong className={`proof-status proof-status-${item.status}`}>
+                      {item.status}
+                    </strong>
+                    <span>{item.text}</span>
+                  </>
+                )}
+              </li>
+            );
+          })}
         </ul>
-      ) : (
-        <p className="proof-muted">No {title.toLowerCase()} recorded.</p>
-      )}
+      ) : null}
+      {note || !items.length ? (
+        <p className="proof-muted">{note ?? `No ${title.toLowerCase()} recorded.`}</p>
+      ) : null}
     </section>
   );
 }
@@ -154,6 +326,7 @@ function FullToolEvidence({
   repository = archiveRepository,
 }: {
   run: ArchiveRunDetail;
+  onOpenEvent?: (event: EventKey) => void;
   repository?: ArchiveRepository;
 }) {
   const request = useRef<AbortController | null>(null);
@@ -216,11 +389,26 @@ function FullToolEvidence({
     </details>
   );
 }
+function TriggeringEventButton({
+  event,
+  onOpenEvent,
+}: {
+  event: EventKey;
+  onOpenEvent: (event: EventKey) => void;
+}) {
+  return (
+    <button type="button" className="archive-copy-button" onClick={() => onOpenEvent(event)}>
+      Open triggering event
+    </button>
+  );
+}
 function ProofDetail({
+  onOpenEvent,
   run,
   repository = archiveRepository,
 }: {
   run: ArchiveRunDetail;
+  onOpenEvent?: (event: EventKey) => void;
   repository?: ArchiveRepository;
 }) {
   const compression = run.context?.compression;
@@ -234,10 +422,19 @@ function ProofDetail({
     <div className="archive-proof-detail">
       <header className="proof-detail-header">
         <div>
-          <span className="eyebrow">
-            {run.agentName || run.agentId} · {statusInfo(run.status).label}
-          </span>
+          <span className="eyebrow">{run.agentName || run.agentId}</span>
           <h2>{run.objective || run.runId}</h2>
+          {run.workflowEvent && (
+            <p className="proof-workflow-result archive-related-record">
+              <span>{workflowLabel(run.workflowEvent)}</span>
+              {run.workflowEvent.id && onOpenEvent && (
+                <TriggeringEventButton
+                  event={{ agentId: run.agentId, id: run.workflowEvent.id }}
+                  onOpenEvent={onOpenEvent}
+                />
+              )}
+            </p>
+          )}
           <p>
             {date(run.startedAt)} → {date(run.completedAt)} · {duration(run)} ·{' '}
             {run.decision || 'No terminal decision'}
@@ -257,20 +454,9 @@ function ProofDetail({
                 ? 'Copy failed'
                 : 'Copy proof'}
           </button>
-          <span className={`proof-status-badge proof-status-${run.status}`}>
-            {statusInfo(run.status).label}
-          </span>
         </div>
       </header>
-      {statusInfo(run.status).detail ? (
-        <section
-          className="proof-status-notice"
-          aria-label={`${statusInfo(run.status).label} run status`}
-        >
-          <strong>{statusInfo(run.status).label}</strong>
-          <p>{statusInfo(run.status).detail}</p>
-        </section>
-      ) : null}
+      <RunSummary run={run} />
       {run.request ? (
         <section className="proof-final">
           <h3>Your request</h3>
@@ -284,7 +470,7 @@ function ProofDetail({
       ) : null}
       {run.finalAnswer ? (
         <section className="proof-final">
-          <h3>Final outcome</h3>
+          <h3>Agent response</h3>
           <ReactMarkdown
             remarkPlugins={markdownPlugins}
             components={{ table: MarkdownTable, img: MarkdownImage }}
@@ -297,21 +483,32 @@ function ProofDetail({
         {Object.entries({
           Observations: run.counts.observations,
           Changes: run.counts.changes,
-          Verifications: run.counts.verifications,
-          Unresolved: run.counts.unresolved,
-          'Tool activity': run.counts.toolActivities,
           Minions: run.counts.subagents,
-        }).map(([label, count]) => (
-          <div key={label}>
-            <strong>{count}</strong>
-            <span>{label}</span>
-          </div>
-        ))}
+        })
+          .filter(([, count]) => count > 0)
+          .map(([label, count]) => (
+            <div key={label}>
+              <strong>{count}</strong>
+              <span>{label}</span>
+            </div>
+          ))}
       </div>
       <div className="proof-evidence-grid">
         <EvidenceList title="Actions / changes" items={run.evidence.changes} />
-        <EvidenceList title="Verification" items={run.evidence.verifications} />
-        <EvidenceList title="Unresolved" items={run.evidence.unresolved} />
+        <EvidenceList
+          title="Verification"
+          items={run.evidence.verifications}
+          note={missingOutcome(run)}
+        />
+        <EvidenceList
+          title="Recorded issues"
+          items={run.evidence.unresolved}
+          note={
+            run.evidence.unresolved.length
+              ? 'Recorded during this run; may include earlier failed attempts.'
+              : undefined
+          }
+        />
       </div>
       <FullToolEvidence repository={repository} key={occurrenceKey(run)} run={run} />
       <ProviderRequestHistory
@@ -441,10 +638,9 @@ function ProofDetail({
   );
 }
 
-const occurrenceKey = (run: ArchiveRunDetail) =>
-  JSON.stringify([run.agentId, run.sessionId, run.runId]);
+const occurrenceKey = (run: ProofKey) => JSON.stringify([run.agentId, run.sessionId, run.runId]);
 
-function mergeOccurrences(current: ArchiveRunDetail[], incoming: ArchiveRunDetail[]) {
+function mergeOccurrences(current: ArchiveRunSummary[], incoming: ArchiveRunSummary[]) {
   const seen = new Set(current.map(occurrenceKey));
   return [
     ...current,
@@ -457,34 +653,39 @@ function mergeOccurrences(current: ArchiveRunDetail[], incoming: ArchiveRunDetai
   ];
 }
 
-export function ArchiveRunsProof({
-  selectedAgent,
-  search,
-  repository = archiveRepository,
-}: {
+type ProofSelection = ProofKey & { eventId?: string };
+type ProofShelfProps = {
   selectedAgent: string;
   search: string;
   repository?: ArchiveRepository;
-}) {
-  const detailRequest = useRef<AbortController | null>(null);
+  initialProof?: ProofSelection;
+  onOpenEvent?: (event: EventKey) => void;
+};
+export function ArchiveRunsProof(props: ProofShelfProps) {
+  return <ProofShelf key={props.selectedAgent} {...props} />;
+}
+function ProofShelf({
+  selectedAgent,
+  search,
+  repository = archiveRepository,
+  initialProof,
+  onOpenEvent,
+}: ProofShelfProps) {
+  const readerRef = useRef<HTMLElement>(null);
+  const [linkedEntry] = useState(Boolean(initialProof));
+  useEffect(() => {
+    if (linkedEntry) readerRef.current?.focus();
+  }, [linkedEntry]);
   const moreRequest = useRef<AbortController | null>(null);
-  const [runs, setRuns] = useState<ArchiveRunDetail[]>([]);
+  const [runs, setRuns] = useState<ArchiveRunSummary[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [moreLoading, setMoreLoading] = useState(false);
   const [moreError, setMoreError] = useState('');
-  const [selected, setSelected] = useState<ArchiveRunDetail | null>(null);
+  const [selected, setSelected] = useState<ProofSelection | undefined>(initialProof);
   const [loading, setLoading] = useState(true);
-  const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState('');
-  const [detailError, setDetailError] = useState('');
   const query = search.trim();
-  useEffect(() => {
-    setSelected(null);
-    setDetailLoading(false);
-    setDetailError('');
-    return () => detailRequest.current?.abort();
-  }, [selectedAgent, repository]);
   useEffect(() => {
     const abort = new AbortController();
     setLoading(true);
@@ -542,29 +743,6 @@ export function ArchiveRunsProof({
         if (!abort.signal.aborted) setMoreLoading(false);
       });
   };
-  const open = (run: ArchiveRunDetail) => {
-    detailRequest.current?.abort();
-    const abort = new AbortController();
-    detailRequest.current = abort;
-    setSelected(run);
-    setDetailError('');
-    setDetailLoading(true);
-    repository
-      .loadRun(run.runId, run.agentId, abort.signal, run.sessionId)
-      .then((detail) => {
-        if (abort.signal.aborted) return;
-        if (occurrenceKey(detail) !== occurrenceKey(run))
-          throw new Error('Run details did not match the selected session.');
-        setSelected(detail);
-      })
-      .catch((cause) => {
-        if (!abort.signal.aborted)
-          setDetailError(cause instanceof Error ? cause.message : 'Could not open this run.');
-      })
-      .finally(() => {
-        if (!abort.signal.aborted) setDetailLoading(false);
-      });
-  };
   return (
     <div className="archive-split-view archive-proof-view">
       <section className="archive-results-pane" aria-label="Archive proof runs">
@@ -606,27 +784,34 @@ export function ArchiveRunsProof({
                   type="button"
                   className={`archive-session-card proof-run-card${selected && occurrenceKey(selected) === occurrenceKey(run) ? ' selected' : ''}`}
                   key={occurrenceKey(run)}
-                  onClick={() => open(run)}
+                  aria-pressed={!!selected && occurrenceKey(selected) === occurrenceKey(run)}
+                  onClick={() =>
+                    setSelected({
+                      runId: run.runId,
+                      agentId: run.agentId,
+                      sessionId: run.sessionId,
+                    })
+                  }
                 >
                   <div className="archive-session-main">
                     <div className="archive-session-meta">
                       <span>{run.agentName || run.agentId}</span>
                       <span>{date(run.completedAt || run.startedAt)}</span>
                     </div>
-                    <h3>{run.objective || run.runId}</h3>
-                    <p>
-                      {statusInfo(run.status).label} · {duration(run)} · {run.counts.toolActivities}{' '}
-                      tool activities · {run.counts.unresolved} unresolved
-                    </p>
+                    <h3>{runListTitle(run)}</h3>
+                    <RunActivity run={run} />
                   </div>
                   <div className="archive-session-side">
-                    <strong className={`proof-status-text proof-status-${run.status}`}>
-                      {statusInfo(run.status).label}
-                    </strong>
-                    <span>
-                      {run.counts.observations + run.counts.changes + run.counts.verifications}{' '}
-                      evidence
+                    <span className={`proof-status-text proof-status-${executionInfo(run).status}`}>
+                      {executionInfo(run).label}
                     </span>
+                    {run.counts.observations + run.counts.changes + run.counts.verifications >
+                      0 && (
+                      <span>
+                        {run.counts.observations + run.counts.changes + run.counts.verifications}{' '}
+                        evidence
+                      </span>
+                    )}
                   </div>
                 </button>
               ))
@@ -644,29 +829,14 @@ export function ArchiveRunsProof({
           ) : null}
         </div>
       </section>
-      <section className="archive-reader-pane">
+      <section className="archive-reader-pane" aria-label="Run proof" tabIndex={-1} ref={readerRef}>
         {selected ? (
-          <div className="archive-content-body archive-reader-body">
-            {detailLoading ? (
-              <section className="archive-empty-state">
-                <div className="archive-empty-mark">⌁</div>
-                <div>
-                  <h3>Opening proof.</h3>
-                  <p>Reading the run evidence.</p>
-                </div>
-              </section>
-            ) : detailError ? (
-              <section className="archive-empty-state archive-error">
-                <div className="archive-empty-mark">!</div>
-                <div>
-                  <h3>Could not open this run.</h3>
-                  <p>{detailError}</p>
-                </div>
-              </section>
-            ) : (
-              <ProofDetail repository={repository} run={selected} />
-            )}
-          </div>
+          <ProofReader
+            key={JSON.stringify([occurrenceKey(selected), selected.eventId])}
+            target={selected}
+            repository={repository}
+            onOpenEvent={onOpenEvent}
+          />
         ) : (
           <section className="archive-empty-state archive-reader-placeholder">
             <div className="archive-empty-mark">⌁</div>
@@ -677,6 +847,84 @@ export function ArchiveRunsProof({
           </section>
         )}
       </section>
+    </div>
+  );
+}
+
+function ProofReader({
+  target,
+  repository,
+  onOpenEvent,
+}: {
+  target: ProofSelection;
+  repository: ArchiveRepository;
+  onOpenEvent: ProofShelfProps['onOpenEvent'];
+}) {
+  const [run, setRun] = useState<ArchiveRunDetail | null>(null);
+  const [error, setError] = useState('');
+  const [retry, setRetry] = useState(0);
+  useEffect(() => {
+    const abort = new AbortController();
+    setRun(null);
+    setError('');
+    repository
+      .loadRun(target.runId, target.agentId, abort.signal, target.sessionId)
+      .then((detail) => {
+        if (abort.signal.aborted) return;
+        if (!detail || occurrenceKey(detail) !== occurrenceKey(target))
+          throw new Error('Run details did not match the selected session.');
+        if (target.eventId && detail.workflowEvent?.id !== target.eventId)
+          throw new Error('This run does not match the triggering event.');
+        setRun(detail);
+      })
+      .catch((cause: unknown) => {
+        if (!abort.signal.aborted)
+          setError(
+            cause instanceof Error && 'status' in cause && cause.status === 404
+              ? 'This run is no longer in the archive.'
+              : cause instanceof Error
+                ? cause.message
+                : 'Could not read the run evidence.',
+          );
+      });
+    return () => abort.abort();
+  }, [repository, target, retry]);
+  return (
+    <div className="archive-content-body archive-reader-body">
+      {run ? (
+        <ProofDetail run={run} repository={repository} onOpenEvent={onOpenEvent} />
+      ) : error ? (
+        <section className="archive-empty-state archive-error" role="alert">
+          <div className="archive-empty-mark">!</div>
+          <div>
+            <h3>Could not open this run.</h3>
+            <p>{error}</p>
+            <span className="archive-related-record">
+              <button
+                type="button"
+                className="archive-copy-button"
+                onClick={() => setRetry((value) => value + 1)}
+              >
+                Retry
+              </button>
+              {target.eventId && onOpenEvent && (
+                <TriggeringEventButton
+                  event={{ agentId: target.agentId, id: target.eventId }}
+                  onOpenEvent={onOpenEvent}
+                />
+              )}
+            </span>
+          </div>
+        </section>
+      ) : (
+        <section className="archive-empty-state" role="status">
+          <div className="archive-empty-mark">⌁</div>
+          <div>
+            <h3>Opening proof.</h3>
+            <p>Reading the run evidence.</p>
+          </div>
+        </section>
+      )}
     </div>
   );
 }

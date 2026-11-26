@@ -88,6 +88,8 @@ export type ContinuityCardGroup = {
 export type ArchiveWorkflowEvent = {
   id: string;
   watchId: string;
+  taskWaitId?: string | null;
+  taskId?: string | null;
   repository: string;
   workflow: string;
   runId: string;
@@ -107,6 +109,17 @@ export type ArchiveWorkflowEvent = {
   createdAt: string;
   startedAt?: string | null;
   finishedAt?: string | null;
+};
+
+export type EventKey = Pick<ArchiveWorkflowEvent, 'agentId' | 'id'>;
+export type ProofKey = { agentId: string; sessionId: string; runId: string };
+export type WorkflowEventDetail = {
+  ok: true;
+  event: ArchiveWorkflowEvent;
+  handlingProof: { reasonCode: string; reason: string } & (
+    | { status: 'available'; target: ProofKey }
+    | { status: 'unavailable' | 'not_recorded'; target: null }
+  );
 };
 
 // Archive Dreams groups are complete server projections, never regrouped diary pages.
