@@ -1,4 +1,5 @@
 import { PostgresTaskWorkflowWaitStore } from './postgres-task-workflow-wait-store.mjs';
+import { PostgresWorkflowFollowThroughStore } from './postgres-workflow-follow-through-store.mjs';
 import path from 'node:path';
 import { PostgresAgentRunFeed } from './postgres-agent-run-feed.mjs';
 import { createSessionRecallBackfillWorker } from './postgres-session-recall-backfill.mjs';
@@ -41,6 +42,8 @@ import PostgresUiAuthSecretStore from './postgres-ui-auth-secret-store.mjs';
 import PostgresOtelSettingsStore from './postgres-otel-settings-store.mjs';
 import PostgresRetentionSettingsStore from './postgres-retention-settings-store.mjs';
 import { PostgresModGenerationStore } from './postgres-mod-generation-store.mjs';
+import { PostgresModMinionStore } from './postgres-mod-minion-store.mjs';
+import { PostgresModFollowThroughStore } from './postgres-mod-follow-through-store.mjs';
 import { PostgresModExternalTurnStore } from './postgres-mod-external-turn-store.mjs';
 import PostgresWorkingMemoryRetentionSettingsStore from './postgres-working-memory-retention-settings-store.mjs';
 
@@ -86,6 +89,8 @@ export async function createPostgresApplication({
     mcp: new PostgresMcpSettingsStore({ ...common, key: encryptionKey }),
     tasks: new PostgresTaskBoardStore({ ...common, ...(clock ? { clock } : {}) }),
     generations: new PostgresModGenerationStore({ ...common, ...(clock ? { clock } : {}) }),
+    minions: new PostgresModMinionStore({ ...common, ...(clock ? { clock } : {}) }),
+    followThrough: new PostgresModFollowThroughStore(common),
     externalTurns: new PostgresModExternalTurnStore({ ...common, ...(clock ? { clock } : {}) }),
     scheduledJobs: new PostgresScheduledJobStore({ ...common, ...(clock ? { clock } : {}) }),
     dreamSettings: new PostgresDreamSettingsStore(common),
@@ -107,10 +112,13 @@ export async function createPostgresApplication({
     chatInputs: new PostgresChatInputStore({ ...common, ...(clock ? { clock } : {}) }),
     completionEvents: new PostgresCompletionEventStore(common),
     taskWorkflowWaits: new PostgresTaskWorkflowWaitStore(common),
+    workflowFollowThrough: new PostgresWorkflowFollowThroughStore(common),
     completionEventSettings: new PostgresCompletionEventSettingsStore({ ...common, key: encryptionKey, ...(clock ? { clock } : {}) }),
     conversations: new PostgresSessionStore({ ...common, ...(clock ? { clock } : {}) }),
     };
     stores.brainEmbeddings = new PostgresBrainEmbeddings({ pool: sharedPool, models: stores.models, logger });
+    stores.completionEvents.workflowFollowThroughWake = () => stores.workflowFollowThrough.publish();
+    stores.followThrough.workflowFollowThrough = stores.workflowFollowThrough;
     stores.brains.embeddings = stores.brainEmbeddings;
     stores.conversationEmbeddings = new PostgresConversationEmbeddings({ pool: sharedPool, models: stores.models, settings: stores.brainEmbeddings, logger });
     stores.brainEmbeddings.conversations = stores.conversationEmbeddings;

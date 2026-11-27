@@ -29,6 +29,10 @@ import { createDreamMemoryPreviewService } from '../src/dream-memory-preview.mjs
 
 import { isInternalContextSession } from '../src/model-context-boundary.mjs';
 import { createModGenerationDispatcher } from '../src/mod-generations.mjs';
+import { createModFollowThroughRunner } from '../src/mod-follow-through-runner.mjs';
+import { createWorkflowFollowThroughRunner } from '../src/workflow-follow-through-runner.mjs';
+import { createModMinionDispatcher } from '../src/mod-minions.mjs';
+import { createModMinionBridgeRuntime } from '../src/mod-minion-bridge-runtime.mjs';
 import { createModTextGenerator } from '../src/mod-capabilities.mjs';
 import { migrateLegacyExecutionProviderApproval } from '../src/execution-provider-approval.mjs';
 import { createCoreApiDispatcher, coreApiCaller } from '../src/core-api-dispatch.mjs';
@@ -147,7 +151,7 @@ import { createObservabilityRoutes } from './ui/observability-routes.mjs';
 import { createScheduledChannelRoutes } from './ui/scheduled-channel-routes.mjs';
 import { createAuthRoutes } from './ui/auth-routes.mjs';
 import { createChatRoutes } from './ui/chat-routes.mjs';
-import { cleanupMods, createModRoute, discoverMods } from '../src/mod-runtime.mjs';
+import { createModRoute, discoverMods } from '../src/mod-runtime.mjs';
 import { inspectManagedSkills } from '../src/managed-skills.mjs';
 import { createModManagement } from '../src/mod-management.mjs';
 import { createModDistribution, createModManagementRoute } from '../src/mod-distribution.mjs';
@@ -250,6 +254,10 @@ await postgresApplication.stores.forge.reconcileAbandonedRuntimeJobs(runtimeOwne
 await postgresApplication.stores.tasks.reconcileInterruptedExecutions();
 await postgresApplication.stores.scheduledJobs.markMissedRuns();
 const generationDispatcher = createModGenerationDispatcher({ logger: serverLogger, store: postgresApplication.stores.generations, generateText: createModTextGenerator({ models: postgresApplication.stores.models }) });
+const minionBridgeRuntime = createModMinionBridgeRuntime({ stores: postgresApplication.stores, runtimeRoot, executionProviders, telemetry: otelRuntime, logger: serverLogger });
+let modLifecycle = null;
+const minionDispatcher = createModMinionDispatcher({ logger: serverLogger, store: postgresApplication.stores.minions, resolveCatalog: minionBridgeRuntime.catalog, execute: minionBridgeRuntime.execute,
+  getHosts: () => modLifecycle?.getMods().filter(mod => mod.host).map(mod => ({ ownerModId: mod.id, host: mod.host })) || [] });
 const {
   modelConnections, startClaudeCodeLoginApi, claudeCodeLoginStatus,
   submitClaudeCodeLoginApi, cancelClaudeCodeLoginApi, importClaudeCodeLoginApi,
@@ -291,6 +299,8 @@ chatSession.configureChatInputRunner(chatInputRunner);
 const chatInputs = createChatInputService({ stores: postgresApplication.stores, activeRuns: activeChatRuns, runner: chatInputRunner, resolveAgentRuntime });
 const completionEventRunner = createCompletionEventRunner({ executeTask: executeBoardTask, store: postgresApplication.stores.completionEvents, stores: postgresApplication.stores, resolveAgentRuntime, rootDir: projectRoot, registerActiveRun: registerRuntimeActiveRun, telemetry: otelRuntime });
 postgresApplication.stores.taskWorkflowWaits.wake = () => completionEventRunner.wake();
+const followThroughRunner = createModFollowThroughRunner({ stores: postgresApplication.stores, rootDir: projectRoot, resolveAgentRuntime, telemetry: otelRuntime, logger: serverLogger });
+const workflowFollowThroughRunner = createWorkflowFollowThroughRunner({ stores: postgresApplication.stores, rootDir: projectRoot, resolveAgentRuntime, telemetry: otelRuntime, logger: serverLogger });
 const externalTurnDispatcher = createModExternalTurnDispatcher({ logger: serverLogger, store: postgresApplication.stores.externalTurns, stores: postgresApplication.stores, resolveAgentRuntime, rootDir: projectRoot, registerActiveRun: registerRuntimeActiveRun, telemetry: otelRuntime });
 const NODE_GOBLIN_OTEL_CONFIGURATION_REASONS = new Set([
   'provider_configuration_unsupported', 'configuration_failed',
@@ -1761,12 +1771,12 @@ const coreApi = createCoreApiDispatcher({
     sessionId: actor?.caller.sessionId, runId: actor?.caller.runId,
   }, { component: 'api' }),
 });
-const modLoadOptions = { coreApi, logger: serverLogger, modAuthority, modManagement: modManagementCapability, onExecutionProviderActivated: async modId => { if (modId === 'node-goblin') await applyOtelConfigurationToNodeGoblins(); }, stores: postgresApplication.stores, modStoreFactory: postgresApplication.modStoreFactory, enabledModIds: postgresApplication.enabledModIds, modCatalogWriter: postgresApplication.modCatalogWriter, runtimeRoot: modsRuntimeRoot, executionProviders, resolveAgentRuntime, scheduledJobScheduler: scheduler(), externalTurnDispatcher, generationDispatcher, runtimeDiagnostics, activeAgentRuns: activeChatRuns, pendingHttpRuns: () => completionDispatch?.pendingHttpRuns() || [], resolveAgentWorkspaceRoot: async (id) => {
+const modLoadOptions = { coreApi, logger: serverLogger, modAuthority, modManagement: modManagementCapability, onExecutionProviderActivated: async modId => { if (modId === 'node-goblin') await applyOtelConfigurationToNodeGoblins(); }, stores: postgresApplication.stores, modStoreFactory: postgresApplication.modStoreFactory, enabledModIds: postgresApplication.enabledModIds, modCatalogWriter: postgresApplication.modCatalogWriter, runtimeRoot: modsRuntimeRoot, executionProviders, resolveAgentRuntime, scheduledJobScheduler: scheduler(), externalTurnDispatcher, generationDispatcher, minionDispatcher, runtimeDiagnostics, activeAgentRuns: activeChatRuns, pendingHttpRuns: () => completionDispatch?.pendingHttpRuns() || [], resolveAgentWorkspaceRoot: async (id) => {
   const agent = await agentsStore().get(id);
   if (!agent) throw new Error('agent_not_found');
   return agentRuntimeContext({ runtimeState: (await runtimeConfig()).runtimeState, agent }).agentWorkspaceRoot;
 } };
-const modLifecycle = createModLifecycleService({
+modLifecycle = createModLifecycleService({
   modLoadOptions, logger: serverLogger,
   getManagedSkillRoot: async () => path.join((await runtimeConfig()).runtimeState.workspaceRoot, 'global', 'managed-skills'),
   managedSkillSyncIntervalMs: Math.max(60_000, Number(process.env.BURROW_MANAGED_SKILL_SYNC_INTERVAL_MS || 6 * 60 * 60 * 1000)),
@@ -2037,7 +2047,7 @@ const closeRuntimeResources = createCoordinatedShutdown({
     httpClosePromise = new Promise(resolve => server.close(() => resolve()));
     server.closeIdleConnections?.();
   },
-  producers: () => [openaiResetScheduler, archiveReadProducer, skillSyncProducer, forgeProducer, managedSkillSynchronizer, modDistributionProducer, completionEventRunner, chatInputRunner, externalTurnDispatcher, generationDispatcher, requestLifecycle, startupLifecycle, scheduledJobScheduler, dreamCycleScheduler, tiddleScheduler, retentionScheduler, installStagingCleanupScheduler, recoveryContinuationScheduler, versionRefreshProducer],
+  producers: () => [openaiResetScheduler, archiveReadProducer, skillSyncProducer, forgeProducer, managedSkillSynchronizer, modDistributionProducer, completionEventRunner, followThroughRunner, workflowFollowThroughRunner, chatInputRunner, externalTurnDispatcher, generationDispatcher, minionDispatcher, requestLifecycle, startupLifecycle, scheduledJobScheduler, dreamCycleScheduler, tiddleScheduler, retentionScheduler, installStagingCleanupScheduler, recoveryContinuationScheduler, versionRefreshProducer],
   beforeDrain: async () => {
     try {
       await recordActiveRunInterruptions({ stores: postgresApplication.stores, activeRuns: activeChatRuns, resolveAgentRuntime, reason: shutdownReason });
@@ -2130,6 +2140,8 @@ server.listen(port, host, () => {
     if (shuttingDown) return;
     startCodexClientVersionRefresh();
   }
+  followThroughRunner.start();
+  workflowFollowThroughRunner.start();
   console.log(`Burrow UI listening on http://${host}:${port}`);
   // Recovery uses the same durable per-session queue and runtime turn path as
   // ordinary chat. It starts only after the listener is live, and a queue claim

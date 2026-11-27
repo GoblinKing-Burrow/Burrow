@@ -116,6 +116,37 @@ export function createExecutionProviderRegistry() {
       return unregister;
     },
     get(providerId) { return controllers.get(String(providerId || '')) || null; },
+    async discoverHosts() {
+      const hosts = [];
+      const errors = [];
+      for (const [providerId, controller] of controllers) {
+        if (typeof controller.listHosts !== 'function') {
+          errors.push({ providerId, error: 'remote_host_listing_unsupported' });
+          continue;
+        }
+        let rows;
+        try { rows = await controller.listHosts(); }
+        catch (error) {
+          const code = String(error?.code || error?.message || '');
+          errors.push({ providerId, error: /^remote_host_listing_(?:unsupported|unavailable|timeout|send_failed|failed|invalid)$/.test(code)
+            ? code : 'remote_host_listing_failed' });
+          continue;
+        }
+        if (!Array.isArray(rows) || rows.some(row => !row || typeof row.id !== 'string' || !row.id.trim() || row.id.length > 240
+          || (row.name != null && (typeof row.name !== 'string' || row.name.length > 240)))) {
+          errors.push({ providerId, error: 'remote_host_listing_invalid' });
+          continue;
+        }
+        for (const row of rows) {
+          hosts.push({ providerId, id: row.id,
+            name: typeof row.name === 'string' && row.name ? row.name : row.id });
+        }
+      }
+      hosts.sort((a, b) => a.providerId.localeCompare(b.providerId) || a.id.localeCompare(b.id));
+      errors.sort((a, b) => a.providerId.localeCompare(b.providerId));
+      return { hosts, errors };
+    },
+    async listHosts() { return (await this.discoverHosts()).hosts; },
     async describeHost(providerId, targetId) {
       const controller = controllers.get(requiredId(providerId, 'provider_id'));
       if (!controller || typeof controller.describeHost !== 'function') return null;

@@ -186,6 +186,8 @@ async function runAskChatUnserialized({
   externalTurnMetadata = null,
   completionEvent = null,
   taskWorkflowWait = null,
+  followThrough = null, // Internal return; never derived from request fields.
+  workflowFollowThrough = null, // Trusted isolated continuation, never request data.
   chatInput = null,
   // Trusted server-side context for a participant in an operator group room.
   // The room transcript is prompt context, not the participant's private session.
@@ -337,6 +339,7 @@ async function runAskChatUnserialized({
     recoveryPolicy,
     requireRecoveryClaim: recoveryTurn,
     expectedResetGeneration: chatInput?.generation,
+    expectedFollowThroughOrigin: followThrough,
     chatInputId: chatInput?.id,
     // An internally delivered agent message is persisted first so it enters
     // the recipient prompt. Its source run is trusted, bounded provenance—not
@@ -468,7 +471,12 @@ async function runAskChatUnserialized({
     agentRuntime: agentRuntime || { agentId: runtimeState.agentId, agent: { id: runtimeState.agentId } },
     sessionId: historySessionId, route: sharedRoute, resolveAgentRuntime, signal: normalizedArgs.abort_signal,
   });
-  const executionContext = createRuntimeExecutionContext({ groupChannelContext, sharedContextContinuation: sharedContinuation, minionDepth, minionProfiles, agentMessageReplyTo, stores, runtimeState, resolvedSessionId, conversationId, continuityScope, agentRuntime, resolveAgentRuntime, runAgentReply, resolvedWorkingRoot, resolvedTarget, dataRoot, executionBoundaries, mcpTools, mcpConnections, parentRunId: resolvedRunId, traceContext: telemetryRun ? telemetry.traceContextForRun?.(resolvedRunId) : null, telemetry: telemetryRun ? telemetry : null, abortSignal: normalizedArgs.abort_signal || null, skillOverrides: scopedSkillsConfig });
+  const executionContext = createRuntimeExecutionContext({ workflowFollowThrough, followThroughOrigin: !groupChannelContext && !contextBoundary && !modAgent &&
+    ['operator-chat', 'chat', 'queue_next'].includes(turnSourceName) &&
+    isOperatorRuntimeTurn({ source: turnSourceName, incomingAgentMessage, externalTurnMetadata, completionEvent }) ?
+    { resetGeneration: Number(priorSession.metadata?.resetGeneration || 0) }
+    : workflowFollowThrough && workflowFollowThrough.executionSessionId === resolvedSessionId && workflowFollowThrough.executionRunId === resolvedRunId
+      ? { resetGeneration: Number(priorSession.metadata?.resetGeneration || 0), waitOnly: true } : null, groupChannelContext, sharedContextContinuation: sharedContinuation, minionDepth, minionProfiles, agentMessageReplyTo, stores, runtimeState, resolvedSessionId, conversationId, continuityScope, agentRuntime, resolveAgentRuntime, runAgentReply, resolvedWorkingRoot, resolvedTarget, dataRoot, executionBoundaries, mcpTools, mcpConnections, parentRunId: resolvedRunId, traceContext: telemetryRun ? telemetry.traceContextForRun?.(resolvedRunId) : null, telemetry: telemetryRun ? telemetry : null, abortSignal: normalizedArgs.abort_signal || null, skillOverrides: scopedSkillsConfig });
   // Native child sessions never fall through to Burrow planning or tools.
   const codexFollowup = await runCodexSessionFollowup({ stores, executionContext,
     agentId: runtimeState.agentId, sessionId: resolvedSessionId, runId: resolvedRunId,
@@ -586,7 +594,7 @@ async function runAskChatUnserialized({
   // to the recorded activity. Agent-delivery ingress already persisted its
   // attributed source message before invoking this recipient run.
   // Startup recovery has a durable manifest, not a new operator turn.
-  if (!incomingAgentMessage && !recoveryTurn) {
+  if (!incomingAgentMessage && !recoveryTurn && !followThrough && !workflowFollowThrough) {
     const earlyContinuationPlan = explicitContinue
       ? buildContinuationPlan({ item: activeWorkItem, requestedItemId, sessionId: resolvedSessionId, args: normalizedArgs, workspaceFiles })
       : null;
@@ -677,12 +685,12 @@ async function runAskChatUnserialized({
   const result = await persistPlainChatResult({
     stores, agentId: runtimeState.agentId, sessionRoot, dataRoot, logger, command, message, sessionId: resolvedSessionId, priorSession, route, selectedSkills: route.skills.selected.map((skill) => skill.id), prompt, contextEngine: turnContext, contextCompression, intent, session, workspaceRoot: resolvedWorkingRoot, artifactWorkspaceRoot: runtimeState.agentWorkspaceRoot, subjectScope: verifiedSubjectScope, backgroundWork: trackedBackgroundWork, modelTurn, turnPlan, plannerObservability, routeDecision, canonicalTurnEnvelope, runtimeTurn, subagents, structuredSubagents, extraEyesReview, fileDeicticResolution: deicticFiles, finalWorkingContext, commitTerminalResult,
     afterCommitBeforeTraceTerminal: async (committedResult) => {
-      if (modAgent || recoveryTurn || !committedResult?.ok || committedResult.decision !== 'answered' || !committedResult.answerText) return;
+      if (modAgent || recoveryTurn || workflowFollowThrough || !committedResult?.ok || committedResult.decision !== 'answered' || !committedResult.answerText) return;
       // Tiddle residue is advisory and must never turn a completed chat response
       // into a failure. Record it before terminal.json so the marker remains the
       // final trace write and completed traces stay retention-eligible.
       try {
-        const residue = await appendTiddleResidueAsync({ metadataStore: stores.metadata, agentId: runtimeState.agentId, scope: continuityScope, sessionId: resolvedSessionId, conversationId: conversationId || resolvedSessionId, runId: logger.runId, message, userAt: turnStartedAt, operatorInput: !incomingAgentMessage && operatorPreferenceTurn({ source: turnSource, externalTurn: externalTurnMetadata, completionEvent }), answerText: committedResult.answerText, toolResults: committedResult?.proposalExecution?.tools || [] });
+        const residue = await appendTiddleResidueAsync({ metadataStore: stores.metadata, agentId: runtimeState.agentId, scope: continuityScope, sessionId: resolvedSessionId, conversationId: conversationId || resolvedSessionId, runId: logger.runId, message, userAt: turnStartedAt, operatorInput: !incomingAgentMessage && !followThrough && operatorPreferenceTurn({ source: turnSource, externalTurn: externalTurnMetadata, completionEvent }), answerText: committedResult.answerText, toolResults: committedResult?.proposalExecution?.tools || [] });
         await logger.event('tiddle-residue-recorded', { rollingContinuity: true, residue: residue ? { ref: residue.ref, scope: residue.scope } : null });
       } catch (error) {
         await logger.event('tiddle-residue-recorded', { rollingContinuity: true, error: String(error?.message || error) });
